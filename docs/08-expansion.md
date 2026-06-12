@@ -128,6 +128,10 @@ way gate-supply is (spend only `availableForWork`, keep `OPERATING_RESERVE`, nev
   logs — the **least-used probes are the expansion candidates** (sending them barely dents X1-PP30
   coverage). Keep the high-traffic probes (gate `I63`, producers `F51`/`D43`, ore market, contract
   destinations) in place.
+- **This tracking runs continuously** (`probe_sampler.sh` → `probe_util.csv`, a snapshot every 30 min),
+  so we're not measuring from scratch when the gate opens — there's already a maintained, timestamped
+  ranking of which probes are idle enough to redeploy. **That lets us seed the new system faster with
+  under-used assets we already own** rather than waiting to buy fresh probes.
 - Send **idle traders/haulers** (parked under `PARK_MIN_NET`, or low realized net/min) — never pull a
   ship off a fat active lane. Keep enough hulls in X1-PP30 to sustain its own trading + any remaining
   gate/contract work.

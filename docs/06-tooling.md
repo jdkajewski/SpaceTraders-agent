@@ -76,9 +76,16 @@ from the API, compares them to the three candidate models, and derives the `fuel
 `time = round(dist × k / speed) + 15` constants that get baked into `bot2.mjs` (`legFuel`/`chooseMode`).
 Hits the API to measure real travel; a one-time/occasional tuning pass, not part of the steady loop.
 
-### `probe_util.mjs` — market-utility ranker
-Ranks markets/waypoints by how often they appear in the logs (a cheap proxy for usefulness) — **zero
-API**, pure log analysis.
+### `probe_util.mjs` — probe-utilization ranker (expansion pre-staging)
+Ranks the 27 market-scout probes by **how little we actually trade at the market each one is parked on**,
+combining (1) the live probe→waypoint station (API) with (2) a usage score = count of trade-context log
+lines that reference each waypoint (**log analysis**). Essential markets (gate `I63`, producers
+`F51`/`D43`, ore source, contract sinks) carry a `KEEP` reason; low-traffic probes (`hits < 100`) are
+flagged `<< EXPANSION CANDIDATE`. `node probe_util.mjs --csv >> probe_util.csv` appends a timestamped
+snapshot, and **`probe_sampler.sh` runs that every 30 min** to build a time-series. The point: we
+**continuously track probe usage so that the moment the gate opens we already have a ranked list of idle
+probes to peel off and seed the next system** — redeploying assets that are doing little here instead of
+waiting to buy new ones (see `08-expansion.md` §3).
 
 ### `market_diff` + `snap_markets` + `calib` together
 The "tune the model" toolkit: snapshot → diff to see depletion/recovery; calibrate flight costs.
