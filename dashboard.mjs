@@ -368,19 +368,22 @@ function setPage(n) { page = n; if (n === 2) { state.log.follow = true; } body.s
 for (let n = 1; n <= 5; n++) screen.key([String(n)], () => setPage(n));
 screen.key(['q', 'C-c'], () => process.exit(0));
 screen.key(['r'], () => pollApi(true));
-screen.key(['up', 'k'], () => { body.scroll(-1); if (page === 2) state.log.follow = body.getScrollPerc() >= 99; screen.render(); });
-screen.key(['down', 'j'], () => { body.scroll(1); if (page === 2) state.log.follow = body.getScrollPerc() >= 99; screen.render(); });
-screen.key(['g'], () => { body.setScroll(0); if (page === 2) state.log.follow = false; screen.render(); });
-screen.key(['S-g', 'G'], () => { body.setScrollPerc(100); if (page === 2) state.log.follow = true; screen.render(); });
+screen.key(['up', 'k'], () => { if (page === 2) state.log.follow = false; body.scroll(-1); screen.render(); });
+screen.key(['down', 'j'], () => { body.scroll(1); if (page === 2) state.log.follow = body.getScrollPerc() >= 100; screen.render(); });
+screen.key(['g'], () => { if (page === 2) state.log.follow = false; body.setScroll(0); screen.render(); });
+screen.key(['S-g', 'G'], () => { if (page === 2) state.log.follow = true; body.setScrollPerc(100); screen.render(); });
 function paginate(delta) {
   if (page === 4) { mkIdx += delta; renderAll(); }
   else if (page === 5) { svIdx += delta; renderAll(); }
-  else { body.scroll(delta * 5); if (page === 2) state.log.follow = body.getScrollPerc() >= 99; screen.render(); }
+  else { if (page === 2 && delta < 0) state.log.follow = false; body.scroll(delta * 10); if (page === 2) state.log.follow = body.getScrollPerc() >= 100; screen.render(); }
 }
 screen.key(['pageup'], () => paginate(-1));
 screen.key(['pagedown'], () => paginate(1));
 screen.key(['left', 'h'], () => { if (page === 4 || page === 5) paginate(-1); });
 screen.key(['right', 'l'], () => { if (page === 4 || page === 5) paginate(1); });
+// mouse wheel: scroll the body (and break log-follow when scrolling up)
+body.on('wheelup', () => { if (page === 2) state.log.follow = false; body.scroll(-3); screen.render(); });
+body.on('wheeldown', () => { body.scroll(3); if (page === 2) state.log.follow = body.getScrollPerc() >= 100; screen.render(); });
 
 // ---- boot ----
 if (process.env.DASH_PAGE) page = Number(process.env.DASH_PAGE) || 1;
