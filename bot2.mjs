@@ -160,6 +160,14 @@ const GATE_CREDIT_FLOOR = Number(process.env.GATE_CREDIT_FLOOR || 1_500_000);   
 const GATE_CREDIT_RESUME_GAP = Number(process.env.GATE_CREDIT_RESUME_GAP || 250_000);
 const GATE_CREDIT_RESUME = Number(process.env.GATE_CREDIT_RESUME || (GATE_CREDIT_FLOOR + GATE_CREDIT_RESUME_GAP));
 const GATE_SUPPLY_MAX_UNITS = Number(process.env.GATE_SUPPLY_MAX_UNITS || 0);     // 0 = up to free cargo capacity
+// [GATE_FUEL_CARGO] When a gate-bound leg can't be flown on a single tank, the tank-only router detours through a
+// FUEL market (extra hop). If the hauler has spare cargo slots (the per-trip material buy is usually tradeVolume-
+// capped, leaving the hold half-empty) and the current source market sells FUEL, instead carry FUEL in those idle
+// slots and fly the (often more direct) fuel-cargo route, topping the tank from cargo before each dry leg. Material
+// ALWAYS has priority — only slots left AFTER the material buy are ever used, and we only divert when it actually
+// saves a hop. Mostly inert in a compact system (every gate leg fits one tank) — its real value is far sources and
+// seeding a new system. Default OFF.
+const GATE_FUEL_CARGO = process.env.GATE_FUEL_CARGO === '1';
 const GATE_PRICE_CEIL_FACTOR = Number(process.env.GATE_PRICE_CEIL_FACTOR || 2.0); // per-material: skip sources pricier than cheapest×this ("only when cheap")
 // [GATE] Absolute per-material price cap: pause buying a gate material when its price exceeds this, so we don't
 // overpay during a spike — wait for mining/restock to cool it. Format "FAB_MATS:3200,ADVANCED_CIRCUITRY:7000".
@@ -1084,6 +1092,46 @@ function planGateFill(remaining, claims, markets, { free, headroom, slippage, ce
   return buys;
 }
 
+// [GATE_FUEL_CARGO] Drive a gate-bound hull to `dest`, using carried FUEL to bridge dry legs when that saves a
+// fuel-market detour. Returns true if it took the ship to dest (caller skips its own goTo); false → caller should
+// goTo normally. Only ever uses cargo slots left free AFTER the material buy, and only diverts when it cuts a hop.
+async function goToGateWithFuelCargo(shipSym, dest, markets) {
+  let ship = await getShip(shipSym);
+  const from = ship.nav.waypointSymbol;
+  if (from === dest && ship.nav.status !== 'IN_TRANSIT') return true;     // already at the gate
+  const cap = ship.fuel.capacity || 0;
+  if (cap <= 0) return false;                                             // probes / fuel-less hulls
+  if (D(from, dest) <= Math.floor(cap * 0.97)) return false;             // one-tank leg → carrying fuel adds nothing
+  const tankPath = planRoute(from, dest, cap, markets);                   // tank-only route (detours via fuel markets)
+  const fcPath = planRouteFuelCargo(from, dest, cap, markets);            // bridge dry legs with carried fuel
+  if (!fcPath) return false;
+  if (tankPath && fcPath.length >= tankPath.length) return false;        // no hop saved → not worth the slots
+  const mk = markets[from];
+  const fuelGood = mk && (mk.tradeGoods || []).find((g) => g.symbol === 'FUEL');
+  if (!fuelGood) return false;                                            // can't buy fuel here → let normal detour handle it
+  try { await refuel(shipSym); } catch {}                                 // top the tank from the market first (no slots used)
+  ship = await getShip(shipSym);
+  const free = ship.cargo.capacity - (ship.cargo.units || 0);
+  if (free <= 0) return false;
+  // Fuel needed beyond a full tank, in cargo units (1 FUEL cargo unit ≈ 100 tank), + 1 per extra hop for refuel rounding.
+  const totalDist = fcPath.reduce((s, wp, i) => s + D(i === 0 ? from : fcPath[i - 1], wp), 0);
+  const minNeed = Math.ceil(Math.max(0, totalDist - Math.floor(cap * 0.97)) / 100);
+  const want = minNeed + Math.max(0, fcPath.length - 1);
+  if (minNeed <= 0) return false;
+  const carry = Math.min(want, free);
+  if (carry < minNeed) return false;                                      // not enough spare slots to bridge → normal detour
+  try { await buy(shipSym, 'FUEL', carry, Math.round((fuelGood.purchasePrice || 500) * 2)); }
+  catch (e) { log(`⛽ ${shipSym.slice(-3)} gate fuel-cargo buy ERR: ${e.message}`); return false; }
+  log(`⛽ ${shipSym.slice(-3)} carrying ${carry} FUEL to bridge ${from.slice(-3)}→${dest.slice(-3)} via ${fcPath.map((p) => p.slice(-3)).join('→')} (${fcPath.length} hops vs ${tankPath ? tankPath.length : '∞'} tank-only)`);
+  await haulWithFuelCargo(shipSym, fcPath);
+  return true;
+}
+// Gate-haul wrapper: fuel-cargo route when enabled + beneficial, else the normal refuel-hop goTo.
+async function gateGoTo(shipSym, dest, markets) {
+  if (GATE_FUEL_CARGO && await goToGateWithFuelCargo(shipSym, dest, markets)) return;
+  await goTo(shipSym, dest);
+}
+
 async function gateSupplyTrip(shipSym, ship, markets) {
   const g = gateCache;
   if (!gateSupplyActive()) return false;
@@ -1097,7 +1145,7 @@ async function gateSupplyTrip(shipSym, ship, markets) {
       const tot = heldNeeded.reduce((s, i) => s + i.units, 0);
       perShip[shipSym].last = `SUPPLY_GATE(held) ${tot}u`;
       log(`⛏ ${shipSym.slice(-3)} delivering held ${tot}u [${heldNeeded.map((i) => `${i.units} ${i.symbol}`).join(', ')}] → ${g.wp.slice(-3)} (buy paused)`);
-      await goTo(shipSym, g.wp);
+      await gateGoTo(shipSym, g.wp, markets);
       await supplyHeldToGate(shipSym, heldNeeded.map((i) => i.symbol));
       return true;
     }
@@ -1125,7 +1173,7 @@ async function gateSupplyTrip(shipSym, ship, markets) {
       const tot = heldNeeded.reduce((s, i) => s + i.units, 0);
       perShip[shipSym].last = `SUPPLY_GATE(held) ${tot}u`;
       log(`⛏ ${shipSym.slice(-3)} delivering held ${tot}u [${heldNeeded.map((i) => `${i.units} ${i.symbol}`).join(', ')}] → ${g.wp.slice(-3)} (no new buys)`);
-      await goTo(shipSym, g.wp);
+      await gateGoTo(shipSym, g.wp, markets);
       await supplyHeldToGate(shipSym, heldNeeded.map((i) => i.symbol));
       return true;
     }
@@ -1153,7 +1201,7 @@ async function gateSupplyTrip(shipSym, ship, markets) {
         catch (e) { log(`${shipSym.slice(-3)} gate buy ERR ${b.units} ${b.sym}@${wp.slice(-3)}: ${e.message}`); }
       }
     }
-    await goTo(shipSym, g.wp);                                        // one trip to the gate
+    await gateGoTo(shipSym, g.wp, markets);                          // one trip to the gate (fuel-cargo when enabled+useful)
     try { await api('POST', `/my/ships/${shipSym}/dock`); } catch {}  // construction/supply requires DOCKED (goTo leaves us in orbit)
     const inv = (await api('GET', `/my/ships/${shipSym}`)).data.cargo.inventory;
     for (const sym of Object.keys(reserved)) {

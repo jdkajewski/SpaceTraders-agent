@@ -74,6 +74,7 @@ production launch where it differs from the code default.
 | `GATE_HAULERS` | none | Ships pinned to gate-supply, excluded from trade pool while gate unbuilt. |
 | `GATE_PROTECT` | ON | Forbid profit-trading gate materials / sourcing out of gate producers. |
 | `GATE_PROTECT_MATERIALS` | `FAB_MATS,ADVANCED_CIRCUITRY,QUANTUM_STABILIZERS` | The protected/needed materials list. |
+| `GATE_FUEL_CARGO` | OFF (`0`) | When a gate-bound leg can't be flown on one tank, carry FUEL in the *spare* slots left after the material buy and fly the more-direct fuel-cargo route (refuel-from-cargo on dry legs) instead of detouring through a fuel market. Material always has priority; only diverts when it saves a hop. Inert in a compact fuel-everywhere system (X1-PP30) — value is far sources / seeding a new system. |
 
 ## Orphan gate cargo
 

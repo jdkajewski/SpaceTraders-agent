@@ -146,6 +146,25 @@ which needs its **imports** stocked. So feeding a producer the inputs it imports
 lower gate-material price. That's the rationale for the **input-feed** subsystem (§5) — only
 worthwhile for inputs you can supply *profitably*.
 
+### 2d. Fuel-cargo bridging — `GATE_FUEL_CARGO` (default OFF)
+
+A gate hauler usually buys a `tradeVolume`-capped material batch (e.g. 43 of an 80-slot hold), so the
+hold is half-empty on every run. When the leg to the gate (or back) can't be flown on a single tank,
+the normal router **detours through a fuel market** (an extra hop). With `GATE_FUEL_CARGO=1`, the
+hauler instead loads **FUEL into those idle slots** at the source and flies the more-direct
+**fuel-cargo route** (`planRouteFuelCargo` → `haulWithFuelCargo`), topping the tank **from cargo**
+before each dry leg (`refuelFromCargo`).
+
+Guards (so it never hurts): **material has priority** — only slots left *after* the material buy are
+used; it only diverts when the fuel-cargo route has **fewer hops** than the tank-only route; it only
+loads fuel if the **source sells FUEL**; and it carries just enough (route deficit ÷ 100, +1 per hop
+for refuel rounding), capped by free slots — if the slots can't cover the deficit it falls back to the
+normal detour. Fuel quantity math: 1 FUEL cargo unit ≈ 100 tank units.
+
+> **Mostly inert in X1-PP30**, where nearly every waypoint (including the gate I63) sells fuel, so the
+> tank-only route never detours and every gate leg fits one tank. Its real payoff is **far/sparse
+> sources** and **seeding a new system** after the gate opens (long jumps, scarce fuel).
+
 ---
 
 ## 3. The mining colony (park-and-ferry)
