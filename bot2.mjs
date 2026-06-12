@@ -141,6 +141,12 @@ const MINE_MAX_SURVEYORS = Number(process.env.MINE_MAX_SURVEYORS || 3);    // ca
 const MINE_MAX_DRONES = Number(process.env.MINE_MAX_DRONES || 4);          // cap total mining drones (existing 2 + room for more if extraction-bound)
 const MINE_EXPAND_CREDIT_FLOOR = Number(process.env.MINE_EXPAND_CREDIT_FLOOR || 600_000); // keep ≥ this cash before buying a colony ship
 const MINE_EXPAND_SCAN_MS = Number(process.env.MINE_EXPAND_SCAN_MS || 600_000);           // expansion-manager scan cadence
+// [MINE_MIGRATE] When the colony's rock gets mined out, relocate to a fresh rock with the same deposit instead of
+// extracting near-zero yields forever. Depletion is read from the waypoint's `modifiers`: CRITICAL_LIMIT (nearly
+// out, yields falling) → STRIPPED (exhausted). We migrate on STRIPPED always, and proactively on CRITICAL_LIMIT
+// IF a healthy alternative rock exists. Default OFF → enabling is a deliberate restart decision.
+const MINE_MIGRATE = process.env.MINE_MIGRATE === '1';
+const MINE_MIGRATE_SCAN_MS = Number(process.env.MINE_MIGRATE_SCAN_MS || 300_000);         // colony-rock depletion scan cadence
 const CREDIT_TARGET = Number(process.env.CREDIT_TARGET || 0);   // 0 = dynamic (compute the cost-to-expand)
 const DYNAMIC_TARGET = !process.env.CREDIT_TARGET;             // override with CREDIT_TARGET env to pin it
 const SLIPPAGE_FACTOR = Number(process.env.SLIPPAGE_FACTOR || 1.5);   // big material buys move price
@@ -1439,17 +1445,29 @@ const MINE_CATALOG = {
 const REFINE_IN = 30, REFINE_OUT = 10;     // game constant: 30 ore → 10 refined per refine action (60s cd)
 const mineActive = new Set();              // shipSyms currently on a mine-feed trip
 let asteroidCache = null;                  // { TRAIT: [wp,...] } — also injects asteroid coords into the router
+// [MINE_MIGRATE] Rocks we've abandoned because they were mined out (STRIPPED, or CRITICAL_LIMIT with a healthy
+// alternative). Excluded from every asteroid pick so the colony never re-selects an exhausted rock.
+const depletedSites = new Set();
+// Waypoint `modifiers` that signal mining depletion (per the SpaceTraders waypoint model).
+const DEPLETION_MODS = new Set(['STRIPPED', 'CRITICAL_LIMIT']);
+// Fetch a waypoint's current modifier symbols (depletion state lives here, NOT in traits). [] on any error.
+async function waypointMods(wp) {
+  try { return ((await api('GET', `/systems/${SYSTEM}/waypoints/${wp}`)).data?.modifiers || []).map((m) => m.symbol); }
+  catch { return []; }
+}
 
-// Discover asteroids once: index by deposit trait (skip STRIPPED) and inject coords so D()/planRoute work
-// (asteroids aren't markets, so they're absent from coords.csv).
+// Discover asteroids: index by deposit trait and inject coords so D()/planRoute work (asteroids aren't markets, so
+// they're absent from coords.csv). Skip rocks that are already mined out — flagged either by a STRIPPED modifier
+// reported by the API or by depletedSites (rocks MINE_MIGRATE has abandoned this run).
 async function loadAsteroids() {
   if (asteroidCache) return asteroidCache;
   const cache = {};
   for (let page = 1; page <= 5; page++) {
     let r; try { r = await api('GET', `/systems/${SYSTEM}/waypoints?type=ASTEROID&limit=20&page=${page}`); } catch { break; }
     for (const w of r.data || []) {
-      if (w.x != null && coords[w.symbol] == null) coords[w.symbol] = [w.x, w.y];
-      if (w.traits.some((t) => t.symbol === 'STRIPPED')) continue;
+      if (w.x != null && coords[w.symbol] == null) coords[w.symbol] = [w.x, w.y];   // always inject coords (router needs them even for stripped rocks)
+      const mods = (w.modifiers || []).map((m) => m.symbol);
+      if (mods.includes('STRIPPED') || depletedSites.has(w.symbol)) continue;       // mined out → not a candidate
       for (const t of w.traits) if (/DEPOSIT/.test(t.symbol)) (cache[t.symbol] ||= []).push(w.symbol);
     }
     if (!r.data || r.data.length < 20) break;
@@ -1460,8 +1478,14 @@ async function loadAsteroids() {
 function nearestAsteroid(fromWp, trait) {
   const list = (asteroidCache && asteroidCache[trait]) || [];
   let best = null, bd = Infinity;
-  for (const wp of list) { const d = D(fromWp, wp); if (d < bd) { bd = d; best = wp; } }
+  for (const wp of list) { if (depletedSites.has(wp)) continue; const d = D(fromWp, wp); if (d < bd) { bd = d; best = wp; } }
   return best;
+}
+// [MINE_MIGRATE] The deposit trait a rock is indexed under (so we re-pick a same-deposit replacement). Falls back
+// to COMMON_METAL_DEPOSITS (the colony's default rock type) when the cache doesn't know the rock.
+function depositOfSite(site) {
+  if (asteroidCache) for (const [trait, list] of Object.entries(asteroidCache)) if (list.includes(site)) return trait;
+  return 'COMMON_METAL_DEPOSITS';
 }
 // [MINE_FEED] Calibration log — one JSON line per extract/refine/feed so target good / asteroid / batch / survey
 // ROI can be tuned from real yields (consumed by the auto-calibration stage; v2 will persist this to the DB).
@@ -1682,6 +1706,17 @@ function colonySite(markets, fromWp) {
   mineSite = nearestAsteroid(prod || fromWp, 'COMMON_METAL_DEPOSITS');   // richest-rock selection is a calibration upgrade
   return mineSite;
 }
+// [MINE_MIGRATE] Move a colony hull onto the (possibly newly-chosen) site. If the hull is sitting on a rock we've
+// since abandoned, log the redirect — this is the arrival-time turnaround for a ship that was in transit to the old
+// rock when migration happened (it can't be turned mid-flight, so it's redirected the moment it lands). No-op when
+// already on site. fuel-preflights the leg, then navigates.
+async function goToColonySite(shipSym, ship, markets, site) {
+  if (ship.nav.waypointSymbol === site) return ship;
+  if (depletedSites.has(ship.nav.waypointSymbol)) log(`🪐 ${shipSym.slice(-3)} redirect ${ship.nav.waypointSymbol.slice(-3)}→${site.slice(-3)} (rock mined out)`);
+  await fuelTopUp(shipSym, ship, markets, D(ship.nav.waypointSymbol, site) + 30);
+  await safeGoTo(shipSym, site);
+  return await getShip(shipSym);
+}
 async function jettison(shipSym, sym, units) {
   try { await api('POST', `/my/ships/${shipSym}/jettison`, { symbol: sym, units }); logMine({ ev: 'jettison', sym, units, ship: shipSym.slice(-3) }); }
   catch (e) { /* non-fatal */ }
@@ -1721,7 +1756,7 @@ async function refinerTrip(shipSym, ship, markets) {
   const site = colonySite(markets, ship.nav.waypointSymbol);
   if (!site) return false;
   refinerSym = shipSym;
-  if (ship.nav.waypointSymbol !== site) { await fuelTopUp(shipSym, ship, markets, D(ship.nav.waypointSymbol, site) + 30); await safeGoTo(shipSym, site); ship = await getShip(shipSym); }
+  ship = await goToColonySite(shipSym, ship, markets, site);
   registerColony(shipSym, ship);
   perShip[shipSym].last = `REFINE @ ${site.slice(-3)}`;
 
@@ -1797,7 +1832,7 @@ async function droneTrip(shipSym, ship, markets) {
   await loadAsteroids();
   const site = colonySite(markets, ship.nav.waypointSymbol);
   if (!site) return false;
-  if (ship.nav.waypointSymbol !== site) { await fuelTopUp(shipSym, ship, markets, D(ship.nav.waypointSymbol, site) + 30); await safeGoTo(shipSym, site); ship = await getShip(shipSym); }
+  ship = await goToColonySite(shipSym, ship, markets, site);
   registerColony(shipSym, ship);
   perShip[shipSym].last = `MINE @ ${site.slice(-3)}`;
   // hand ore + direct F51 minerals to the SINK: the funnel (shared ore bin) if one exists, else the refiner.
@@ -1824,7 +1859,7 @@ async function surveyorTrip(shipSym, ship, markets) {
   await loadAsteroids();
   const site = colonySite(markets, ship.nav.waypointSymbol);
   if (!site) return false;
-  if (ship.nav.waypointSymbol !== site) { await fuelTopUp(shipSym, ship, markets, D(ship.nav.waypointSymbol, site) + 30); await safeGoTo(shipSym, site); ship = await getShip(shipSym); }
+  ship = await goToColonySite(shipSym, ship, markets, site);
   registerColony(shipSym, ship);
   perShip[shipSym].last = `SURVEY @ ${site.slice(-3)}`;
   const sd = await surveyOnce(shipSym);
@@ -1841,7 +1876,7 @@ async function funnelTrip(shipSym, ship, markets) {
   await loadAsteroids();
   const site = colonySite(markets, ship.nav.waypointSymbol);
   if (!site) return false;
-  if (ship.nav.waypointSymbol !== site) { await fuelTopUp(shipSym, ship, markets, D(ship.nav.waypointSymbol, site) + 30); await safeGoTo(shipSym, site); ship = await getShip(shipSym); }
+  ship = await goToColonySite(shipSym, ship, markets, site);
   registerColony(shipSym, ship);
   funnelSym = shipSym;
   perShip[shipSym].last = `FUNNEL @ ${site.slice(-3)} (${ship.cargo.units}/${ship.cargo.capacity})`;
@@ -2484,9 +2519,10 @@ function record(shipSym, net, label) {
 
 let lastStatusAt = 0;
 const plannedRoutes = {};   // [TABLE] shipSym -> {from, path:[hops], at} captured by goTo for the fleet table's route column
+const fleetRoutes = {};     // [ROUTE] short ship id (last 3) -> full multihop route string, refreshed by fleetTable() for the dashboard
 function writeStatus() {
   if (now() - lastStatusAt < 4000) return; lastStatusAt = now();
-  const ships = Object.entries(perShip).map(([s, v]) => ({ ship: s.slice(-3), net: v.net, projected: v.projected || 0, lanes: v.lanes, doing: v.last }));
+  const ships = Object.entries(perShip).map(([s, v]) => ({ ship: s.slice(-3), net: v.net, projected: v.projected || 0, lanes: v.lanes, doing: v.last, route: fleetRoutes[s.slice(-3)] || null }));
   const inFlightProjected = ships.reduce((a, s) => a + (s.projected || 0), 0);   // expected net of trades currently mid-flight
   fs.writeFileSync(here('./bot-status.json'), JSON.stringify({ updated: new Date().toISOString(), phase: currentPhase.name, phaseDesc: currentPhase.desc, runNet: totalNet, inFlightProjected, projectedTotal: totalNet + inFlightProjected, lanesRun, goal: expansionTarget, goalBreakdown: targetBreakdown, credits: cachedCredits, reserve: OPERATING_RESERVE, committed, growthBudget: growthBudget(), gate: { exists: gateCache.exists, built: gateCache.built, known: gateCache.known, remaining: gateCache.remaining, haulers: [...GATE_HAULERS], supplying: gateSupplyActive() && gateCreditOk(), buyPaused: gateBuyPaused, creditFloor: GATE_CREDIT_FLOOR, creditResume: GATE_CREDIT_RESUME }, inputFeed: { enabled: INPUT_FEED, active: inputFeedActive(), feeders: [...INPUT_FEEDERS], busy: [...inputActiveFeeders].map((s) => s.slice(-3)) }, mineFeed: { enabled: MINE_FEED, feeders: [...MINE_FEEDERS], busy: [...mineActive].map((s) => s.slice(-3)), good: MINE_GOOD || 'auto', site: mineSite, refiner: refinerSym && refinerSym.slice(-3), transport: [...MINE_TRANSPORT] }, ships }, null, 1));
   const rows = ships.sort((a, b) => b.net - a.net).map((s) => `| ${s.ship} | ${s.net.toLocaleString()} | ${(s.projected || 0) ? '+' + s.projected.toLocaleString() : '—'} | ${s.lanes} | ${s.doing} |`).join('\n');
@@ -2537,10 +2573,8 @@ async function fleetTable() {
         ship: s.symbol.slice(-3), role: tableRoleOf(s), status: s.nav.status, loc: SH(s.nav.waypointSymbol),
         route: routeStr(s), fuel: s.fuel.capacity ? `${s.fuel.current}/${s.fuel.capacity}` : '—', cargo: cargoStr(s), eta: etaStr(s),
       }));
-      const hdr = `${pad('SHIP', 4)} ${pad('ROLE', 9)} ${pad('STATUS', 11)} ${pad('LOC', 5)} ${pad('ROUTE', 20)} ${pad('FUEL', 9)} ${pad('CARGO', 20)} ETA`;
-      const lines = rows.sort((a, b) => a.role.localeCompare(b.role) || a.ship.localeCompare(b.ship))
-        .map((r) => `${pad(r.ship, 4)} ${pad(r.role, 9)} ${pad(r.status, 11)} ${pad(r.loc, 5)} ${pad(r.route, 20)} ${pad(r.fuel, 9)} ${pad(r.cargo, 20)} ${r.eta}`);
-      log(`\n📋 FLEET (${rows.length} hulls) — run net +${totalNet.toLocaleString()}\n${hdr}\n${lines.join('\n')}`);
+      // [ROUTE] stash each ship's full multihop route for writeStatus()/the dashboard (replaces the old 📋 FLEET log table)
+      for (const r of rows) fleetRoutes[r.ship] = r.route;
     } catch (e) { log('fleetTable:', e.message); }
   }
 }
@@ -2683,6 +2717,46 @@ async function mineExpandManager() {
   }
 }
 
+// [MINE_MIGRATE] Watch the colony's rock for depletion and relocate when it's mined out. Depletion is read from the
+// waypoint's `modifiers`: migrate on STRIPPED always, and proactively on CRITICAL_LIMIT when a healthy alternative
+// rock with the same deposit exists. Migration just invalidates the cached site/asteroid list + stale surveys; the
+// colony role loops (refiner/drones/surveyor/funnel) re-pick the nearest non-depleted rock on their next cycle and
+// relocate there. In-transit hulls can't be turned mid-flight (no API cancel) — they're redirected on arrival.
+async function mineMigrateManager() {
+  if (!MINE_MIGRATE) return;
+  await sleep(30_000);                                    // let the colony pick + reach its first rock
+  while (!stop) {
+    try {
+      if (MINE_FEED && !gateCache.built && mineSite) {
+        const site = mineSite;
+        const mods = await waypointMods(site);
+        const stripped = mods.includes('STRIPPED');
+        const critical = mods.includes('CRITICAL_LIMIT');
+        if (stripped || critical) {
+          const dep = depositOfSite(site);
+          await loadAsteroids();
+          const alt = (asteroidCache[dep] || []).find((w) => w !== site && !depletedSites.has(w));
+          if (alt) {
+            depletedSites.add(site);
+            mineSurveys = mineSurveys.filter((s) => s.symbol !== site);   // drop stale surveys for the dead rock
+            mineSite = null;                                              // colony role loops re-pick next cycle
+            asteroidCache = null;                                         // force a fresh modifier-aware reload
+            await loadAsteroids();
+            const prod = MINE_PRODUCER || findProducerWp(marketCache.data || {}, 'FAB_MATS');
+            const next = nearestAsteroid(prod || site, dep);
+            let inflight = [];
+            try { inflight = (await getAllShips()).filter((s) => s.nav.status === 'IN_TRANSIT' && s.nav.route?.destination?.symbol === site).map((s) => s.symbol.slice(-3)); } catch {}
+            log(`🪐 MINE_MIGRATE ${site.slice(-3)} ${stripped ? 'STRIPPED' : 'CRITICAL_LIMIT'} → relocating colony to ${next ? next.slice(-3) : '??'}${inflight.length ? ` (redirect on arrival: ${inflight.join(',')})` : ''}`);
+          } else if (stripped) {
+            log(`🪐 MINE_MIGRATE ${site.slice(-3)} STRIPPED but no healthy alternative rock — staying (reduced yield)`);
+          }
+        }
+      }
+    } catch (e) { log(`🪐 MINE_MIGRATE ERR ${e.message}`); }
+    await sleep(MINE_MIGRATE_SCAN_MS);
+  }
+}
+
 // [RULE: keep-fleet-alive] supervise each worker — if one throws, log and restart it after a short backoff instead
 // of letting the rejection bubble up and kill every other ship. Hoisted to module scope so a dynamically-bought hull
 // (MINE_EXPAND) can be given its own supervised worker via launchWorker without double-spawning an existing one.
@@ -2716,7 +2790,7 @@ async function main() {
   // [RULE: keep-fleet-alive] supervise hoisted to module scope (see above). Register initial hulls so MINE_EXPAND
   // never double-spawns one, and keep their supervised promises in `tasks` so Promise.all keeps the process alive.
   const tasks = traders.map((s) => { launchedWorkers.add(s.symbol); return supervise(s.symbol); });
-  tasks.push(contractManager(), targetWatch(), fleetTable(), mineExpandManager());
+  tasks.push(contractManager(), targetWatch(), fleetTable(), mineExpandManager(), mineMigrateManager());
   const stopWatch = (async () => { while (!stop) { if (fs.existsSync(here('./STOP'))) { stop = true; break; } await sleep(3000); } })();
   await Promise.all([...tasks, stopWatch]);
   log(`AUTOTRADER stopped. run net +${totalNet.toLocaleString()} over ${lanesRun} lanes`);

@@ -38,13 +38,38 @@ in default and watch modes. Includes the monotonic-clock day-rollover hack (see 
 so multi-day timing survives log rollovers and restarts. `--live` opts into API enrichment. The
 canonical "what are contracts doing right now?" tool, safe to leave running.
 
+### `dashboard.mjs` — unified live TUI ⭐
+The all-in-one operator screen, built on **blessed** (screen-diffing, in-place updates — **no
+clear-screen flicker**, unlike the old `status.mjs --watch` / `mon3.mjs` refresh loops it replaces).
+Five keyboard-navigable pages:
+
+- **[1] Status** — header (agent · phase · run net · credits · lanes · clock), GATE construction
+  progress bars (live), MINING COLONY summary, and a colorized FLEET table showing the **full
+  multihop route** (e.g. `B6→H51→A4`) from the new `bot-status.json` `ships[].route` field, falling
+  back to the live nav leg until the bot repopulates it.
+- **[2] Logs** — live colorized scrollable tail of the active log (re-resolves `.current_log` so it
+  follows rotation/restart). Colors by marker (✔ 💰 ⛽ ⛏️ 🪐 🧭 🛰 🎯 ↺ ⚠ 🚚, `ctr✓`/`ctr?`, errors)
+  and highlights ship ids + credit deltas.
+- **[3] Contracts** — live `GET /my/contracts`: type, per-good delivery progress bars, deadlines,
+  accept/fulfill flags, and payments.
+- **[4] Markets** — paginated per-waypoint price tables from `markets.json` (buy/sell/volume/supply).
+- **[5] Surveys** — paginated recent `survey` events from `mine-history.jsonl` (asteroid, size, ship,
+  deposits, freshness) — the only place surveys are visible since the API doesn't list them.
+
+Keys: `1`-`5` switch page · `↑`/`↓` scroll · `PgUp`/`PgDn` or `←`/`→` paginate (Markets/Surveys) ·
+`g`/`G` top/bottom · `r` force API refresh · `q`/`Ctrl-C` quit. Local files are polled every ~1.5s and
+the log tailed continuously; the live API (agent/ships/contracts/gate) refreshes ~every 25s with
+429-aware retry. Env: `BOT_DIR`, `ST_TOKEN`, optional `DASH_PAGE` (initial page). Launch via
+`node dashboard.mjs` or `./monloop.sh`.
+
 ### `status.mjs` — point-in-time snapshot
 Reads `bot-status.json` (+ other local artifacts) for fleet, phase, credits, gate progress, totals.
-Local-first; minimal/no API.
+Local-first; minimal/no API. The one-shot/`--json` modes remain; for a live view use `dashboard.mjs`
+(it supersedes `status.mjs --watch`).
 
-### `mon3.mjs` — live dashboard
-Rolling dashboard view (refreshing) built mostly from local files plus small live deltas. The
-day-to-day "is the bot healthy?" screen.
+### `mon3.mjs` — live dashboard (legacy)
+Rolling dashboard view (refreshing) built mostly from local files plus small live deltas. Superseded
+by `dashboard.mjs` for day-to-day monitoring.
 
 ### `health.mjs` — deeper health probe
 More thorough check that **does** hit the API for live fleet/agent state — use sparingly while the bot
@@ -129,8 +154,9 @@ prod.
 
 | I want to… | Run | API? |
 |---|---|---|
+| Live all-in-one dashboard | `node dashboard.mjs` / `./monloop.sh` | ~25s polls |
 | See contract progress | `node contracts.mjs` (add `--watch`) | none |
-| Glance at overall status | `node status.mjs` / `node mon3.mjs` | minimal |
+| Glance at overall status | `node status.mjs` (one-shot) / `dashboard.mjs` (live) | minimal |
 | Track true net worth | `node networth.mjs` | none/minimal |
 | Deep health check | `node health.mjs` | **yes** (sparingly) |
 | See market movement | `node snap_markets.mjs` then `node market_diff.mjs` | snap=yes |
@@ -140,3 +166,17 @@ prod.
 > Stopping: `touch STOP` triggers the graceful drain (workers finish their current trip, then exit);
 > see [`02 §6`](02-architecture.md). A hard `kill <PID>` is safe too thanks to intent + run-stats
 > persistence, but `STOP` avoids stranding in-flight cargo.
+
+---
+
+## `bot-status.json` `ships[].route` field
+
+`writeStatus()` emits one entry per ship under `ships[]`: `{ ship, net, projected, lanes, doing,
+route }`. The **`route`** field (string, e.g. `"B6→H51→A4"`, or `null`) is the ship's **full
+multihop route** — the planned `from → …hops… → dest` chain, not just the current leg. It is captured
+by the bot's `fleetTable()` loop (which already computes `routeStr()` from `plannedRoutes`) into a
+shared `fleetRoutes` map and merged into each `ships[]` entry on write. The dashboard's FLEET table
+reads it, falling back to the live nav origin→destination leg when `route` is `null` (e.g. right
+after a restart, before the route loop has run). Removing the old periodic `📋 FLEET` log table from
+the bot did **not** affect this — the loop still runs to keep `fleetRoutes` fresh; it just no longer
+logs the table (the dashboard renders the fleet now).

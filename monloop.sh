@@ -1,8 +1,5 @@
 #!/bin/bash
+# Launch the unified live TUI dashboard (replaces the old mon3 refresh loop and `status.mjs --watch`).
+# Pages: 1 Status · 2 Logs · 3 Contracts · 4 Markets · 5 Surveys. Keys: 1-5, arrows/PgUp/PgDn, q to quit.
 cd "$(dirname "$0")"
-for i in $(seq 1 40); do
-  echo "===== $(date '+%H:%M:%S') ====="
-  node mon3.mjs 2>&1
-  echo
-  sleep 180
-done
+exec node dashboard.mjs "$@"
