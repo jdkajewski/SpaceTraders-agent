@@ -443,6 +443,32 @@ drives it to the asteroid — there is no separate ferry step (which would race 
 > blind buy-to-cap-now: it tops up slowly, only while affordable and the gate is unbuilt, and you can watch each buy
 > in the log before the next scan.
 
+## 8b. Colony migration on rock depletion — `mineMigrateManager()` (default OFF, `MINE_MIGRATE=1`)
+
+Asteroids get **mined out**. Depletion is reported by the waypoint's `modifiers` (NOT its `traits`): a rock first
+gains `CRITICAL_LIMIT` (nearly out, yields falling), then `STRIPPED` (exhausted — extractions return almost
+nothing on a long cooldown). Before this manager, `mineSite` was memoized **once** and `loadAsteroids()` only
+checked `traits` for `STRIPPED`, so the colony would happily extract a dead rock at near-zero yield forever.
+
+**What it does** (scan every `MINE_MIGRATE_SCAN_MS`, default 5 min, only while `MINE_FEED` on and the gate is
+unbuilt): fetch the active colony rock's `modifiers`. If `STRIPPED` (always) or `CRITICAL_LIMIT` (only when a
+healthy alternative rock with the **same deposit** exists), it relocates the colony:
+
+- adds the rock to `depletedSites` (excluded from every future asteroid pick),
+- drops that rock's stale surveys from the shared pool,
+- clears `mineSite` + the asteroid cache so the next pick is fresh and modifier-aware.
+
+The colony role loops (refiner / drones / surveyor / funnel) and the solo mine-feed haulers re-pick the nearest
+non-depleted rock on their **next cycle** and relocate there automatically — no explicit ferry. If a rock is
+`STRIPPED` but it's the **only** one of its deposit type, the colony stays put (reduced yield beats no rock).
+
+**In-transit redirect.** A ship already `IN_TRANSIT` (including a slow DRIFT) toward the old rock **cannot be turned
+mid-flight** — SpaceTraders rejects a new `navigate` while in transit and has no cancel. So the redirect happens the
+instant it **arrives** at the now-dead rock: every colony trip routes through `goToColonySite()`, which sees the
+hull sitting on a `depletedSites` rock, logs `🪐 <ship> redirect <old>→<new> (rock mined out)`, and sends it
+straight to the new site instead of mining. `loadAsteroids()` also now reads `modifiers` (skips `STRIPPED`) and
+honours `depletedSites`, and `nearestAsteroid()` skips depleted rocks.
+
 ## 9. Universal fuel-cargo & range-aware contracts — `goToWithFuelCargo()` / `haulGoTo()` (default OFF, `FUEL_CARGO=1`)
 
 §2d introduced fuel-as-cargo for **gate** haulers. `FUEL_CARGO=1` generalizes that to **every** haul and uses the
