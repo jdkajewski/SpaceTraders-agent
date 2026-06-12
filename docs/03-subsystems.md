@@ -150,8 +150,12 @@ worthwhile for inputs you can supply *profitably*.
 
 ## 3. The mining colony (park-and-ferry)
 
-Enabled by `MINE_FEED=1`. The colony mines F51's feed minerals (so the gate's FAB price stays cheap)
-and sells unusable ore for cash. Roles are **auto-detected by capability** (`mineRoleOf`, ~L1453–1465)
+Enabled by `MINE_FEED=1`. **Its primary purpose is to drive down the cost of gate materials, not to
+turn a profit.** By mining F51's feed minerals (IRON, COPPER, SILICON, QUARTZ) it keeps F51 well-fed,
+which holds its `FAB_MATS` export price low — and FAB is where most of the gate spend goes, so cheaper
+FAB buys move the gate far more than the mining cash itself does. It *is* a mildly positive lane on its
+own (unusable COPPER/IRON ore is sold raw at H59 for cash), but treat that profit as a bonus on top of
+the cost-suppression goal. Roles are **auto-detected by capability** (`mineRoleOf`, ~L1453–1465)
 so freshly-bought hulls slot in with no config. While the gate is unbuilt, mining-capable hulls are
 pinned to their role and excluded from trading.
 
