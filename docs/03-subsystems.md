@@ -442,3 +442,38 @@ drives it to the asteroid — there is no separate ferry step (which would race 
 > **"If needed" = the four gates working together** (gate-unbuilt · budget floor · caps · one-per-scan). There is no
 > blind buy-to-cap-now: it tops up slowly, only while affordable and the gate is unbuilt, and you can watch each buy
 > in the log before the next scan.
+
+## 9. Universal fuel-cargo & range-aware contracts — `goToWithFuelCargo()` / `haulGoTo()` (default OFF, `FUEL_CARGO=1`)
+
+§2d introduced fuel-as-cargo for **gate** haulers. `FUEL_CARGO=1` generalizes that to **every** haul and uses the
+same idea to stop rejecting reachable contracts.
+
+### 9a. Fuel in the spare slots, on any haul
+A hauler rarely fills its hold (a `tradeVolume`-capped buy is often half the capacity). When a leg can't be flown on
+one tank, the tank-only router **detours through a fuel market** (an extra hop). `haulGoTo()` (used by the trade
+delivery leg and the contract source/deliver legs) instead calls `goToWithFuelCargo()`: top the tank at the source,
+load **FUEL into the slots left after the goods**, and fly the more-direct fuel-cargo route (`planRouteFuelCargo` →
+`haulWithFuelCargo`, topping the tank from cargo before each dry leg).
+
+It only triggers when it **saves a hop** vs the tank route and the source sells FUEL — so on a fuel-dense lane it is
+inert, but on a **long leg with a small tank** it removes a refuel stop (e.g. a cap-300 shuttle on a 900+ unit hop:
+4 fuel-cargo hops vs 5 tank-only).
+
+### 9b. Goods always outrank carried fuel (`shedSpareFuel`)
+Fuel is the lowest-priority cargo. `goToWithFuelCargo(dest, { reserveUnits })` keeps `reserveUnits` slots free for
+goods that will be bought at/after the destination, so fuel never crowds out cargo. And before sourcing goods after a
+fuel-cargo arrival, `shedSpareFuel()` reclaims the slots: **burn the carried fuel into the tank** (`refuelFromCargo`),
+then **sell** it if the market buys FUEL, else **jettison** the remainder. Net effect: carried fuel is used or shed
+the moment a profitable good needs the slot.
+
+### 9c. Range-aware contract gate (`contractSrcReachable`)
+The contract eligibility gate used a flat straight-line cap (`CONTRACT_MAX_SRC_DIST=500`) as a stand-in for range —
+so a ship 600–900 out was hard-rejected even when fuel-aware routing could reach the source. With `FUEL_CARGO` on,
+`contractSrcReachable()` accepts a far source when a refuel-aware route reaches it within `CONTRACT_MAX_HOPS` (`6`):
+first the tank multi-hop route (`planRoute`), else the fuel-in-cargo route (`planRouteFuelCargo`). The net-margin gate
+is then **costed on the real route** (`routeCost` for both legs, not the straight line), so only far runs that are
+genuinely profitable are claimed — and the hop cap still prevents chasing a contract across the system.
+
+> **All four pieces are behind `FUEL_CARGO` (default OFF)** and independent of `GATE_FUEL_CARGO`. Enabling is a
+> deliberate restart decision; like the gate version it is largely inert in a compact fuel-everywhere system and pays
+> off most on far sources, small-tank long hauls, and seeding a new system after the gate opens.

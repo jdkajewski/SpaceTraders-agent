@@ -168,6 +168,16 @@ const GATE_SUPPLY_MAX_UNITS = Number(process.env.GATE_SUPPLY_MAX_UNITS || 0);   
 // saves a hop. Mostly inert in a compact system (every gate leg fits one tank) — its real value is far sources and
 // seeding a new system. Default OFF.
 const GATE_FUEL_CARGO = process.env.GATE_FUEL_CARGO === '1';
+// [FUEL_CARGO] Universal generalization of GATE_FUEL_CARGO: on ANY haul (trade delivery, contract source/deliver),
+// when a leg can't be flown on one tank and the hold has spare slots AFTER the goods, carry FUEL in those slots and
+// fly the more-direct fuel-cargo route (refuel-from-cargo on dry legs) instead of detouring through a fuel market.
+// Goods ALWAYS outrank carried fuel: fuel only uses post-goods free slots, and at a buy point any leftover carried
+// fuel is burned into the tank then sold/jettisoned to reclaim the slot (shedSpareFuel). Also relaxes the contract
+// sourcing distance gate: a far source counts as eligible when a refuel-aware route (tank or fuel-in-cargo) reaches
+// it within CONTRACT_MAX_HOPS (the net-margin gate, costed on the real route, still rejects unprofitable far runs).
+// Default OFF → enabling is a deliberate restart decision.
+const FUEL_CARGO = process.env.FUEL_CARGO === '1';
+const CONTRACT_MAX_HOPS = Number(process.env.CONTRACT_MAX_HOPS || 6);   // when FUEL_CARGO relaxes the contract distance gate, cap refuel-route length so we never chase a contract across endless hops
 const GATE_PRICE_CEIL_FACTOR = Number(process.env.GATE_PRICE_CEIL_FACTOR || 2.0); // per-material: skip sources pricier than cheapest×this ("only when cheap")
 // [GATE] Absolute per-material price cap: pause buying a gate material when its price exceeds this, so we don't
 // overpay during a spike — wait for mining/restock to cool it. Format "FAB_MATS:3200,ADVANCED_CIRCUITRY:7000".
@@ -688,6 +698,20 @@ const isForced = (ci) => CONTRACT_FORCE.has(ci.good) || contractAutoForced.has(c
 const CONTRACT_BEST_SHIP = process.env.CONTRACT_BEST_SHIP !== '0';
 const CONTRACT_REELECT_MARGIN = Number(process.env.CONTRACT_REELECT_MARGIN || 40);  // only switch owners if a candidate is closer to source by > this (dist units)
 
+// [FUEL_CARGO] Contract sourcing range check. Legacy: straight-line distance must be ≤ CONTRACT_MAX_SRC_DIST.
+// With FUEL_CARGO on, a farther source still counts as reachable when a refuel-aware route gets there within
+// CONTRACT_MAX_HOPS — either the tank-only multi-hop route (planRoute, refuels at fuel markets) or, failing that,
+// the fuel-in-cargo route (planRouteFuelCargo, bridges dry legs from carried fuel). The profitability (net-margin)
+// gate still applies and is costed on the real route, so this only ADMITS far runs that are actually worth it.
+function contractSrcReachable(here, srcWp, fuelCap, markets) {
+  if (D(here, srcWp) <= CONTRACT_MAX_SRC_DIST) return true;
+  if (!FUEL_CARGO) return false;
+  const tank = planRoute(here, srcWp, fuelCap, markets);
+  if (tank && tank.length <= CONTRACT_MAX_HOPS) return true;
+  const fc = planRouteFuelCargo(here, srcWp, fuelCap, markets);
+  return !!(fc && fc.length <= CONTRACT_MAX_HOPS);
+}
+
 // [CONTRACT] Elect the best available hull to source `ci` — the eligible, idle, empty hull CLOSEST to the
 // cheapest source that still clears the margin floor. Returns { ship, src, dist } or null when none qualify.
 function electContractOwner(ci, markets, ships) {
@@ -707,10 +731,14 @@ function electContractOwner(ci, markets, ships) {
     if ((s.cargo?.units || 0) > 0) continue;                       // carrying cargo — leave it on its lane
     const here = s.nav?.waypointSymbol;
     const dist = D(here, src.wp);
-    if (dist > CONTRACT_MAX_SRC_DIST) continue;
+    if (!contractSrcReachable(here, src.wp, s.fuel?.capacity || 0, markets)) continue;
     if (!isForced(ci)) {                                           // forced clears skip the margin gate
       const units = Math.min(ci.units, s.cargo.capacity);
-      const net = (ci.pay || 0) - units * src.px - (dist + D(src.wp, ci.dest)) * CONTRACT_FUEL_PX;
+      // far runs are multi-hop → cost fuel on the real refuel-aware route, not the straight line
+      const fuelCr = (FUEL_CARGO && dist > CONTRACT_MAX_SRC_DIST)
+        ? routeCost(here, src.wp, s).fuelCr + routeCost(src.wp, ci.dest, s).fuelCr
+        : (dist + D(src.wp, ci.dest)) * CONTRACT_FUEL_PX;
+      const net = (ci.pay || 0) - units * src.px - fuelCr;
       const minMargin = Math.max(CONTRACT_MIN_MARGIN, Math.round(CONTRACT_MIN_MARGIN_PCT * (ci.pay || 0)));
       if (net < minMargin) continue;
     }
@@ -876,10 +904,14 @@ function contractWorthIt(shipSym, ship, ci, markets) {
   if (!src || src.wp === ci.dest) { if (DBG_CONTRACT) log(`ctr? ${shipSym.slice(-3)} ${ci.good} NO-SRC (src=${src?.wp || 'none'} dest=${ci.dest})`); return null; }
   const here = ship.nav.waypointSymbol;
   const srcLeg = D(here, src.wp);
-  if (srcLeg > CONTRACT_MAX_SRC_DIST) { if (DBG_CONTRACT) log(`ctr? ${shipSym.slice(-3)} ${ci.good} TOO-FAR srcLeg=${srcLeg} (${here.slice(-3)}→${src.wp.slice(-3)}) cap=${CONTRACT_MAX_SRC_DIST}`); return null; }
+  if (!contractSrcReachable(here, src.wp, ship.fuel?.capacity || 0, markets)) { if (DBG_CONTRACT) log(`ctr? ${shipSym.slice(-3)} ${ci.good} TOO-FAR srcLeg=${srcLeg} (${here.slice(-3)}→${src.wp.slice(-3)}) cap=${CONTRACT_MAX_SRC_DIST}${FUEL_CARGO ? ' (no fuel-route ≤'+CONTRACT_MAX_HOPS+' hops)' : ''}`); return null; }
   const units = Math.min(ci.units, ship.cargo.capacity);
   const tripDist = srcLeg + D(src.wp, ci.dest);
-  const net = (ci.pay || 0) - units * src.px - tripDist * CONTRACT_FUEL_PX;
+  // far runs are multi-hop → cost fuel on the real refuel-aware route, not the straight line
+  const fuelCr = (FUEL_CARGO && srcLeg > CONTRACT_MAX_SRC_DIST)
+    ? routeCost(here, src.wp, ship).fuelCr + routeCost(src.wp, ci.dest, ship).fuelCr
+    : tripDist * CONTRACT_FUEL_PX;
+  const net = (ci.pay || 0) - units * src.px - fuelCr;
   // Buffer: hold out for a slight profit (don't claim at bare breakeven). Floor scales with contract size.
   const minMargin = Math.max(CONTRACT_MIN_MARGIN, Math.round(CONTRACT_MIN_MARGIN_PCT * (ci.pay || 0)));
   if (net < minMargin) { if (DBG_CONTRACT) log(`ctr? ${shipSym.slice(-3)} ${ci.good} THIN net=${Math.round(net)} < floor ${minMargin} (pay=${ci.pay} cost=${units * src.px} src=${src.wp.slice(-3)}@${src.px} units=${units})`); return null; }
@@ -909,7 +941,7 @@ async function contractRunnerTrip(shipSym, ship, markets) {
     if (isForced(ci)) {
       // forced clear: ignore the margin floor, but still avoid a cross-galaxy DRIFT (require a near source).
       const src = cheapestContractSrc(markets, ci.good, ci.dest);
-      if (!src || src.wp === ci.dest || D(ship.nav.waypointSymbol, src.wp) > CONTRACT_MAX_SRC_DIST) return false;
+      if (!src || src.wp === ci.dest || !contractSrcReachable(ship.nav.waypointSymbol, src.wp, ship.fuel?.capacity || 0, markets)) return false;
       if (DBG_CONTRACT) log(`ctr⚡ ${shipSym.slice(-3)} FORCE ${ci.good} src ${src.wp.slice(-3)}@${src.px} (margin gate bypassed)`);
     } else {
       const plan = contractWorthIt(shipSym, ship, ci, markets);
@@ -927,7 +959,8 @@ async function contractRunnerTrip(shipSym, ship, markets) {
       const fresh = await getMarkets();
       const src = cheapestContractSrc(fresh, ci.good, ci.dest);
       if (src && src.wp !== ci.dest) {
-        await goTo(shipSym, src.wp);
+        await haulGoTo(shipSym, src.wp, fresh, { reserveUnits: want - have });   // far source → fuel-in-cargo bridge; keep room for the buy
+        if (FUEL_CARGO) await shedSpareFuel(shipSym);                            // reclaim slots from any leftover carried fuel before sourcing
         // Re-check ownership AFTER the (possibly long, multi-hop) sourcing leg. The central election may have
         // reassigned this contract to a closer idle hull while we traveled (this ship set itself owner before the
         // trip, but contractManager can overwrite it). If we're empty AND no longer the owner, don't double-buy —
@@ -968,7 +1001,7 @@ async function contractRunnerTrip(shipSym, ship, markets) {
     if (have <= 0) { perShip[shipSym].last = `CONTRACT ${ci.good} (no source now)`; await sleep(IDLE_WAIT_MS); return true; }
     // 2) haul to the delivery point and deliver what we have (partial OK)
     perShip[shipSym].last = `CONTRACT ${ci.good} ${have}u→${ci.dest.slice(-3)}`;
-    await goTo(shipSym, ci.dest);
+    await haulGoTo(shipSym, ci.dest, marketCache.data || {});   // spare slots (after the contract good + ride-alongs) carry bridging fuel
     // [MULTI-GOOD] Sell the ride-alongs here (their shared sink) regardless of the contract's outcome below.
     if (rideAlongs.length) {
       let rideNet = 0;
@@ -1095,10 +1128,10 @@ function planGateFill(remaining, claims, markets, { free, headroom, slippage, ce
 // [GATE_FUEL_CARGO] Drive a gate-bound hull to `dest`, using carried FUEL to bridge dry legs when that saves a
 // fuel-market detour. Returns true if it took the ship to dest (caller skips its own goTo); false → caller should
 // goTo normally. Only ever uses cargo slots left free AFTER the material buy, and only diverts when it cuts a hop.
-async function goToGateWithFuelCargo(shipSym, dest, markets) {
+async function goToWithFuelCargo(shipSym, dest, markets, opts = {}) {
   let ship = await getShip(shipSym);
   const from = ship.nav.waypointSymbol;
-  if (from === dest && ship.nav.status !== 'IN_TRANSIT') return true;     // already at the gate
+  if (from === dest && ship.nav.status !== 'IN_TRANSIT') return true;     // already at the destination
   const cap = ship.fuel.capacity || 0;
   if (cap <= 0) return false;                                             // probes / fuel-less hulls
   if (D(from, dest) <= Math.floor(cap * 0.97)) return false;             // one-tank leg → carrying fuel adds nothing
@@ -1111,8 +1144,9 @@ async function goToGateWithFuelCargo(shipSym, dest, markets) {
   if (!fuelGood) return false;                                            // can't buy fuel here → let normal detour handle it
   try { await refuel(shipSym); } catch {}                                 // top the tank from the market first (no slots used)
   ship = await getShip(shipSym);
-  const free = ship.cargo.capacity - (ship.cargo.units || 0);
-  if (free <= 0) return false;
+  const reserve = Math.max(0, opts.reserveUnits || 0);                    // slots to keep free for goods picked up later / at the destination
+  const free = ship.cargo.capacity - (ship.cargo.units || 0) - reserve;
+  if (free <= 0) return false;                                            // no spare slots after the goods → normal detour
   // Fuel needed beyond a full tank, in cargo units (1 FUEL cargo unit ≈ 100 tank), + 1 per extra hop for refuel rounding.
   const totalDist = fcPath.reduce((s, wp, i) => s + D(i === 0 ? from : fcPath[i - 1], wp), 0);
   const minNeed = Math.ceil(Math.max(0, totalDist - Math.floor(cap * 0.97)) / 100);
@@ -1121,14 +1155,20 @@ async function goToGateWithFuelCargo(shipSym, dest, markets) {
   const carry = Math.min(want, free);
   if (carry < minNeed) return false;                                      // not enough spare slots to bridge → normal detour
   try { await buy(shipSym, 'FUEL', carry, Math.round((fuelGood.purchasePrice || 500) * 2)); }
-  catch (e) { log(`⛽ ${shipSym.slice(-3)} gate fuel-cargo buy ERR: ${e.message}`); return false; }
+  catch (e) { log(`⛽ ${shipSym.slice(-3)} fuel-cargo buy ERR: ${e.message}`); return false; }
   log(`⛽ ${shipSym.slice(-3)} carrying ${carry} FUEL to bridge ${from.slice(-3)}→${dest.slice(-3)} via ${fcPath.map((p) => p.slice(-3)).join('→')} (${fcPath.length} hops vs ${tankPath ? tankPath.length : '∞'} tank-only)`);
   await haulWithFuelCargo(shipSym, fcPath);
   return true;
 }
 // Gate-haul wrapper: fuel-cargo route when enabled + beneficial, else the normal refuel-hop goTo.
 async function gateGoTo(shipSym, dest, markets) {
-  if (GATE_FUEL_CARGO && await goToGateWithFuelCargo(shipSym, dest, markets)) return;
+  if ((GATE_FUEL_CARGO || FUEL_CARGO) && await goToWithFuelCargo(shipSym, dest, markets)) return;
+  await goTo(shipSym, dest);
+}
+// Universal haul wrapper: any trade/contract leg that should use fuel-in-cargo when FUEL_CARGO is on. `opts.reserveUnits`
+// keeps that many slots free for goods to be loaded at/after the destination (so fuel never crowds out cargo).
+async function haulGoTo(shipSym, dest, markets, opts = {}) {
+  if (FUEL_CARGO && await goToWithFuelCargo(shipSym, dest, markets, opts)) return;
   await goTo(shipSym, dest);
 }
 
@@ -1643,6 +1683,20 @@ async function fuelTopUp(shipSym, ship, markets, need) {
 }
 // Refuel a ship from FUEL units already in its OWN cargo (how the tender refuels parked/scouting miners).
 async function refuelFromCargo(shipSym) { try { await api('POST', `/my/ships/${shipSym}/refuel`, { fromCargo: true }); return true; } catch { return false; } }
+// [FUEL_CARGO] At a buy point, reclaim slots held by leftover carried FUEL so goods always win: first burn fuel
+// into the tank (refuelFromCargo), then sell the rest if this market buys FUEL, else jettison. No-op when not
+// carrying any FUEL cargo. Called right before sourcing goods after a fuel-cargo arrival.
+async function shedSpareFuel(shipSym) {
+  let ship = await getShip(shipSym);
+  if (cargoUnits(ship, 'FUEL') <= 0) return;
+  await refuelFromCargo(shipSym).catch(() => {});                 // absorb what the tank can take (frees those slots)
+  ship = await getShip(shipSym);
+  if (cargoUnits(ship, 'FUEL') <= 0) return;
+  try { await sell(shipSym, 'FUEL'); } catch {}                   // recoup credits if this market buys fuel
+  ship = await getShip(shipSym);
+  const left = cargoUnits(ship, 'FUEL');
+  if (left > 0) await jettison(shipSym, 'FUEL', left);            // last resort: dump so the slot is free for goods
+}
 // Register a colony hull's location + fuel so the tender can find low ones to top up.
 function registerColony(shipSym, ship) { colonyShips[shipSym] = { wp: ship.nav.waypointSymbol, fuel: ship.fuel.current, cap: ship.fuel.capacity }; }
 const bestSiteSurvey = (site) => bestSurveyFor(site, 'COPPER_ORE') || bestSurveyFor(site, 'IRON_ORE') || bestSurveyFor(site, 'SILICON_CRYSTALS') || bestSurveyFor(site, 'QUARTZ_SAND');
@@ -1939,7 +1993,8 @@ async function runContract(shipSym, cc) {
   // re-pick source from a fresh market read (cache may be stale)
   const fresh = await getMarkets();
   const src = cheapestContractSrc(fresh, cc.good, cc.dest) || { wp: cc.src, px: cc.px };
-  await goTo(shipSym, src.wp);                          // refuel-hop if the source is far
+  await haulGoTo(shipSym, src.wp, fresh, { reserveUnits: cc.units });   // far source → fuel-in-cargo bridge; keep room for the buy
+  if (FUEL_CARGO) await shedSpareFuel(shipSym);                         // reclaim slots from leftover carried fuel before sourcing
   // contracts justify paying up — generous cap so we actually source it
   await buy(shipSym, cc.good, cc.units, Math.round(src.px * 1.8));
   const have = (await getShip(shipSym)).cargo.inventory.find((i) => i.symbol === cc.good)?.units || 0;
@@ -1948,7 +2003,7 @@ async function runContract(shipSym, cc) {
     if (have > 0) { try { await sell(shipSym, cc.good); } catch {} }
     throw new Error(`under-sourced ${cc.good} ${have}/${cc.units}`);
   }
-  await goTo(shipSym, cc.dest);                         // refuel-hop to the (possibly far) delivery point
+  await haulGoTo(shipSym, cc.dest, fresh);             // refuel-hop to the (possibly far) delivery point; spare slots carry bridging fuel
   await deliver(shipSym, cc.id, cc.good, cc.units);
   await fulfill(shipSym, cc.id);
   // sell any surplus we bought
@@ -2365,7 +2420,7 @@ async function worker(shipSym) {
         // can resume this exact leg (with cost basis) instead of stranding the goods. Ride-alongs share
         // the sink, so they ride in intent.extras and are replayed at the same sellWp on resume.
         saveIntent(shipSym, { phase: 'HAULING', good: lane.sym, units: bought, buyWp: lane.buyWp, sellWp: lane.sellWp, costBasis: b.spent || 0, extras: rideAlongs });
-        await goTo(shipSym, lane.sellWp);                                // refuel-hop to sink
+        await haulGoTo(shipSym, lane.sellWp, markets);                  // refuel-hop to sink; spare slots after goods carry bridging fuel
         const s = await sell(shipSym, lane.sym);
         realizedNet = (s.got || 0) - (b.spent || 0);
         for (const r of rideAlongs) {                                   // sell each ride-along at the shared sink

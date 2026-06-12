@@ -93,7 +93,8 @@ production launch where it differs from the code default.
 | `CONTRACT_REELECT_MARGIN` | `40` | Only switch owners if a candidate is closer to source by > this (anti-latch). |
 | `CONTRACT_MIN_MARGIN` | `1000` | Min net (payout − source − fuel) before claiming. |
 | `CONTRACT_MIN_MARGIN_PCT` | `0.04` | Min margin as a fraction of payout. |
-| `CONTRACT_MAX_SRC_DIST` | `500` | Don't source if cheapest market is farther than this. |
+| `CONTRACT_MAX_SRC_DIST` | `500` | Straight-line cap: don't source if cheapest market is farther than this **unless** `FUEL_CARGO` is on and a refuel-aware route reaches it within `CONTRACT_MAX_HOPS` (see Universal fuel-cargo). |
+| `CONTRACT_MAX_HOPS` | `6` | When `FUEL_CARGO` relaxes the distance gate, cap the refuel-route length (tank-hop or fuel-in-cargo) so we never chase a contract across endless hops. |
 | `CONTRACT_FUEL_PX` | `2` | Rough cr/fuel for the contract profitability estimate. |
 | `CONTRACT_FORCE` | none | Bypass the margin gate for these goods (still distance-gated) — banked-`onAccepted` trick. |
 | `CONTRACT_AUTOFORCE_MINS` | `20` | If the active contract stays continuously **unclaimed** (no owner) this many minutes, auto-force it (margin gate bypassed) so the closest hull clears it and frees the slot. `0` disables (manual `CONTRACT_FORCE` only). |
@@ -145,6 +146,21 @@ production launch where it differs from the code default.
 | `MINE_MAX_DRONES` | `4` | Cap on total mining drones (existing 2 + room for 2). Bought after the surveyor cap is met. |
 | `MINE_EXPAND_CREDIT_FLOOR` | `600000` | Never buy if it would drop credits below this. Buys also gated by `growthBudget`. |
 | `MINE_EXPAND_SCAN_MS` | `600000` | Expansion-manager scan cadence (≈10 min); at most one hull per scan. |
+
+## Universal fuel-cargo (default OFF)
+
+Generalizes `GATE_FUEL_CARGO` to **every** haul (trade delivery, contract source/deliver) and relaxes the contract distance gate. See `03-subsystems.md` §9.
+
+| Var | Default | Controls |
+|---|---|---|
+| `FUEL_CARGO` | OFF (`0`) | Master switch. On any haul where a leg can't be flown on one tank, carry FUEL in the slots left **after** the goods and fly the more-direct fuel-cargo route (refuel-from-cargo on dry legs) instead of detouring through a fuel market. Also relaxes the contract sourcing distance gate (far-but-reachable sources become eligible). |
+| `CONTRACT_MAX_HOPS` | `6` | Cap on the refuel-route length when `FUEL_CARGO` admits a far contract source. |
+
+Behaviour notes:
+- **Goods always win.** Fuel only uses post-goods free slots. At a buy point, leftover carried fuel is burned into the tank, then sold (if the market buys FUEL) or jettisoned to reclaim the slot — never blocks sourcing.
+- **Only diverts when it saves a hop** vs the tank-only route, and only when the source sells FUEL.
+- **Range-aware contracts.** A source beyond `CONTRACT_MAX_SRC_DIST` is still eligible when a refuel-aware route (tank multi-hop or fuel-in-cargo) reaches it within `CONTRACT_MAX_HOPS`; the net-margin gate (costed on the real route) still rejects unprofitable far runs.
+- Independent of `GATE_FUEL_CARGO`; either flag enables the gate-haul path.
 
 ## Ops / display
 
