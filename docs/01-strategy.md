@@ -149,6 +149,7 @@ From the decision log / checkpoints, the live progression has been roughly:
 - **Portal open (future):** once the gate completes, seed the next system cell — the franchise/cell
   expansion model described in `EXPANSION-DESIGN.md`.
 
-> **Honest ROI note from the operators:** the mining colony is *marginal* (B9 is distant and
-> low-value); its main value is keeping FAB cheap and monetizing ore. Cheap-FAB **buying** has
-> historically driven the gate more than mining has.
+> **Honest ROI note from the operators:** the mining colony is only a *mildly* profitable lane on its
+> own (B9 is distant and low-value) — its real job is **cost suppression, not profit**: keeping F51's
+> FAB price cheap so gate buying is cheaper, while monetizing leftover ore on the side. Cheap-FAB
+> **buying** has historically driven the gate more than the mining profit itself has.
