@@ -18,6 +18,11 @@
 import fs from 'fs';
 import blessed from 'blessed';
 
+// blessed crashes while compiling xterm-256color's `Setulc` (set-underline-color) terminfo capability. Remap to an
+// equivalent 256-color terminfo that doesn't declare it — keeps full color, dodges the crash. Override via DASH_TERM.
+if (process.env.DASH_TERM) process.env.TERM = process.env.DASH_TERM;
+else if (/^xterm-256color$/.test(process.env.TERM || '')) process.env.TERM = 'screen-256color';
+
 const BOT_DIR = process.env.BOT_DIR || '/Users/danielkajewski/.copilot/session-state/18a148a9-5032-4a86-9f91-34d8680cdcfd/files';
 const botFile = (f) => `${BOT_DIR}/${f}`;
 const BASE = 'https://api.spacetraders.io/v2';
