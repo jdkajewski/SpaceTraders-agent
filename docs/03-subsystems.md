@@ -474,6 +474,23 @@ first the tank multi-hop route (`planRoute`), else the fuel-in-cargo route (`pla
 is then **costed on the real route** (`routeCost` for both legs, not the straight line), so only far runs that are
 genuinely profitable are claimed — and the hop cap still prevents chasing a contract across the system.
 
-> **All four pieces are behind `FUEL_CARGO` (default OFF)** and independent of `GATE_FUEL_CARGO`. Enabling is a
+### 9d. Universal `goTo` DRIFT-avoidance + fuel-less-origin loading
+The two pieces above are wired into specific trade/contract call sites via `haulGoTo()`. To cover **everything else**
+— mining tenders, surveyors, freshly-bought colony hulls (`MINE_EXPAND`), any role that calls `goTo` directly —
+`goTo()` itself now falls back to `goToWithFuelCargo()` (when `FUEL_CARGO` is on) the moment its tank-only route is
+infeasible (`planRoute` returns `null`, i.e. the next leg would be a multi-hour DRIFT). DRIFT remains, but only as a
+genuine last resort. This makes the fuel-aware/multi-hop behavior **universal across all expansions and transport**.
+
+`goToWithFuelCargo()` also no longer requires the **origin** to sell fuel: if the current waypoint is fuel-less (e.g. a
+shipyard), it hops to the nearest fuel market **within one tank** first (`loadWp`), tops tank + cargo there, then
+bridges the dry leg. A `goTo(loadWp)` hop is always ≤ one tank, so there is no recursion.
+
+> **Hard limit (by design):** fuel-in-cargo can only bridge a leg that is itself ≤ one tank — carried fuel just refills
+> the tank between hops. If the destination is islanded **>1 tank from every other waypoint** (true of most asteroids
+> in X1-PP30, e.g. `B9` is 84+ from its nearest neighbour and 198 from fuel), no fuel logic can avoid the DRIFT, and a
+> **zero-cargo surveyor** can't carry bridging fuel at all. Reaching such a rock is a **one-time** DRIFT bring-up cost;
+> the hull then parks at the rock and big-tank transports do the hauling, so it is a sunk cost, not a recurring drain.
+
+> **All of §9 is behind `FUEL_CARGO` (default OFF)** and independent of `GATE_FUEL_CARGO`. Enabling is a
 > deliberate restart decision; like the gate version it is largely inert in a compact fuel-everywhere system and pays
 > off most on far sources, small-tank long hauls, and seeding a new system after the gate opens.

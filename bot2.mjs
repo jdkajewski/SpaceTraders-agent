@@ -1130,15 +1130,28 @@ function planGateFill(remaining, claims, markets, { free, headroom, slippage, ce
 // goTo normally. Only ever uses cargo slots left free AFTER the material buy, and only diverts when it cuts a hop.
 async function goToWithFuelCargo(shipSym, dest, markets, opts = {}) {
   let ship = await getShip(shipSym);
-  const from = ship.nav.waypointSymbol;
-  if (from === dest && ship.nav.status !== 'IN_TRANSIT') return true;     // already at the destination
+  const origin = ship.nav.waypointSymbol;
+  if (origin === dest && ship.nav.status !== 'IN_TRANSIT') return true;   // already at the destination
   const cap = ship.fuel.capacity || 0;
   if (cap <= 0) return false;                                             // probes / fuel-less hulls
-  if (D(from, dest) <= Math.floor(cap * 0.97)) return false;             // one-tank leg → carrying fuel adds nothing
-  const tankPath = planRoute(from, dest, cap, markets);                   // tank-only route (detours via fuel markets)
-  const fcPath = planRouteFuelCargo(from, dest, cap, markets);            // bridge dry legs with carried fuel
+  if (D(origin, dest) <= Math.floor(cap * 0.97)) return false;           // one-tank leg → carrying fuel adds nothing
+  // Where can we LOAD fuel into the hold? The current waypoint if it sells fuel; otherwise the nearest fuel-selling
+  // node within one tank. This lets a freshly-bought colony hull sitting at a fuel-less shipyard hop to an adjacent
+  // fuel market, top tank + cargo, then bridge a long dry leg to the mine/asteroid instead of a multi-hour DRIFT.
+  const sellsFuel = (wp) => { const m = markets[wp]; return !!(m && (m.tradeGoods || []).find((g) => g.symbol === 'FUEL')); };
+  let loadWp = origin;
+  if (!sellsFuel(origin)) {
+    let best = null, bd = Infinity;
+    for (const f of fuelNodes(markets)) { if (!coords[f] || f === origin) continue; const d = D(origin, f); if (d <= Math.floor(cap * 0.97) && d < bd) { bd = d; best = f; } }
+    if (!best) return false;                                              // no fuel within range → let normal detour/DRIFT handle it
+    loadWp = best;
+  }
+  const tankPath = planRoute(loadWp, dest, cap, markets);                 // tank-only route from the load point
+  const fcPath = planRouteFuelCargo(loadWp, dest, cap, markets);          // bridge dry legs with carried fuel
   if (!fcPath) return false;
   if (tankPath && fcPath.length >= tankPath.length) return false;        // no hop saved → not worth the slots
+  if (loadWp !== origin) await goTo(shipSym, loadWp);                      // hop to the fuel market first (within one tank)
+  const from = (await getShip(shipSym)).nav.waypointSymbol;               // now at the load point
   const mk = markets[from];
   const fuelGood = mk && (mk.tradeGoods || []).find((g) => g.symbol === 'FUEL');
   if (!fuelGood) return false;                                            // can't buy fuel here → let normal detour handle it
@@ -1966,7 +1979,13 @@ async function goTo(shipSym, dest) {
   let ship = await getShip(shipSym);
   if (ship.nav.waypointSymbol === dest && ship.nav.status !== 'IN_TRANSIT') { delete plannedRoutes[shipSym]; return; }
   const path = planRoute(ship.nav.waypointSymbol, dest, ship.fuel.capacity, marketCache.data || {});
-  if (!path) { plannedRoutes[shipSym] = { from: ship.nav.waypointSymbol, path: [dest], at: now() }; await navigate(shipSym, dest, chooseMode(D(ship.nav.waypointSymbol, dest), ship).mode); return; }
+  if (!path) {
+    // Tank-only route infeasible (a long dry leg with no in-range fuel node) → this would DRIFT. When fuel-cargo is
+    // enabled, bridge the dry leg with FUEL carried in the hold first (covers freshly-bought colony hulls + any far
+    // transport leg) — only DRIFT as the genuine last resort.
+    if (FUEL_CARGO && await goToWithFuelCargo(shipSym, dest, marketCache.data || {})) return;
+    plannedRoutes[shipSym] = { from: ship.nav.waypointSymbol, path: [dest], at: now() }; await navigate(shipSym, dest, chooseMode(D(ship.nav.waypointSymbol, dest), ship).mode); return;
+  }
   plannedRoutes[shipSym] = { from: ship.nav.waypointSymbol, path: [...path], at: now() };   // [TABLE] remember the full planned route for the fleet table
   if (path.length > 1) log(`${shipSym} routing ${ship.nav.waypointSymbol.slice(-3)}→${dest.slice(-3)} via ${path.map((p) => p.slice(-3)).join('→')} (refuel-hop)`);
   for (const hop of path) {
