@@ -113,6 +113,34 @@ const VALUE_OF_TIME = Number(process.env.VALUE_OF_TIME || 100); // cr/sec — BU
                                                                // 100 ≈ near break-even, slight fuel-conserving lean.
 const MARKET_TTL_MS = 75_000;      // shared market cache lifetime
 const IDLE_WAIT_MS = 12_000;       // worker wait when no lane available
+
+// ===================== [REPAIR] ship maintenance =====================
+// SpaceTraders ships have two health axes: condition (0..1) = performance wear (drags speed / raises fuel use,
+// fully restored by repair) and integrity (0..1) = structural life (NOT restored by repair beyond a point; at 0
+// the hull is DESTROYED). `POST /my/ships/{s}/repair` (must be DOCKED at a SHIPYARD; `GET` returns a quote)
+// restores condition. Two race-free tiers, BOTH run inside the ship's own worker loop (never an external manager
+// driving someone else's hull): (1) OPPORTUNISTIC — when the ship is already sitting at a shipyard and is worn,
+// top it up (zero detour); (2) FORCED — if integrity is critically low, divert to the nearest shipyard and repair
+// so we never LOSE a hull mid-route. Budget: a repair only spends growthBudget (never the reserve) and is capped
+// per repair by REPAIR_MAX_COST. Default OFF → enabling is a deliberate restart decision.
+const REPAIR = process.env.REPAIR === '1';
+const REPAIR_COND_MIN = Number(process.env.REPAIR_COND_MIN || 0.85);       // opportunistic: repair when min condition < this
+const REPAIR_INTEG_FORCE = Number(process.env.REPAIR_INTEG_FORCE || 0.5);  // forced divert when min integrity < this
+const REPAIR_MAX_COST = Number(process.env.REPAIR_MAX_COST || 100_000);    // skip a repair whose quote exceeds this (safety)
+
+// ===================== [MINE_EXPAND] minor mining-colony expansion =====================
+// Grow the park-and-ferry mining colony by BUYING surveyors + mining drones in-system (X1-PP30 shipyards sell
+// SHIP_SURVEYOR ~$34k and SHIP_MINING_DRONE ~$45k). The colony's purpose is to keep F51 fed (silicon/quartz direct,
+// raw ore sold at H59) so FAB_MATS stays cheap and the gate completes — fresher surveys + more extraction directly
+// serve that. mineRoleOf() is capability-based, so a freshly-bought hull auto-slots into its role (SURVEYOR / DRONE)
+// with zero extra config; the only new work is the BUY + spawning its worker (the role loop then drives it to the
+// asteroid). Conservative: hard caps, gate-unbuilt only, funded ONLY from growthBudget above MINE_EXPAND_CREDIT_FLOOR.
+// Default OFF → enabling is a deliberate restart decision.
+const MINE_EXPAND = process.env.MINE_EXPAND === '1';
+const MINE_MAX_SURVEYORS = Number(process.env.MINE_MAX_SURVEYORS || 3);    // cap total survey hulls (existing 2 + room for 1 more if needed)
+const MINE_MAX_DRONES = Number(process.env.MINE_MAX_DRONES || 4);          // cap total mining drones (existing 2 + room for more if extraction-bound)
+const MINE_EXPAND_CREDIT_FLOOR = Number(process.env.MINE_EXPAND_CREDIT_FLOOR || 600_000); // keep ≥ this cash before buying a colony ship
+const MINE_EXPAND_SCAN_MS = Number(process.env.MINE_EXPAND_SCAN_MS || 600_000);           // expansion-manager scan cadence
 const CREDIT_TARGET = Number(process.env.CREDIT_TARGET || 0);   // 0 = dynamic (compute the cost-to-expand)
 const DYNAMIC_TARGET = !process.env.CREDIT_TARGET;             // override with CREDIT_TARGET env to pin it
 const SLIPPAGE_FACTOR = Number(process.env.SLIPPAGE_FACTOR || 1.5);   // big material buys move price
@@ -2123,6 +2151,11 @@ async function worker(shipSym) {
     try { ship = (await api('GET', `/my/ships/${shipSym}`)).data; } catch { await sleep(IDLE_WAIT_MS); continue; }
     const markets = await getMarkets();
 
+    // [REPAIR] Two-tier ship maintenance (default OFF). Runs in the ship's OWN loop so it never races an external
+    // manager for control. Forced (integrity critical) diverts to a shipyard; opportunistic (worn) only fires when
+    // already at one. Acted → re-loop with fresh state.
+    if (REPAIR) { try { const yards = await getShipyards(); if (await maybeRepair(shipSym, ship, yards)) continue; } catch (e) { log(`🔧 ${shipSym.slice(-3)} repair check ERR ${e.message}`); } }
+
     // [RECOVERY] Before any new work, resume/salvage cargo left by a crash or STOP mid-haul. EXCEPTION: mining
     // colony hulls intentionally HOLD cargo (refiner holds feed for the tender, drones hold ore, tender holds
     // FUEL+feed) — salvaging it would yank them off-station, so they skip recovery and let their role manage cargo.
@@ -2418,6 +2451,123 @@ async function targetWatch() {
   }
 }
 
+// ============================ [REPAIR + MINE_EXPAND] shipyards, repair, colony growth ============================
+// Discover the system's shipyards once (cached 10min): merge each yard's offerings into a { SHIP_TYPE: {wp, price} }
+// map (cheapest wp per type). `ships[]` carries live price; `shipTypes[]` lists types sold even when no example ship
+// is docked (price unknown until one is). Used by both repair (nearest shipyard) and mine-expand (where to buy).
+let shipyardCache = { at: 0, yards: {} };
+async function getShipyards(force = false) {
+  if (!force && shipyardCache.at && now() - shipyardCache.at < 600_000) return shipyardCache.yards;
+  const yards = {};
+  try {
+    const wps = (await api('GET', `/systems/${SYSTEM}/waypoints?limit=20&traits=SHIPYARD`)).data || [];
+    for (const w of wps) {
+      try {
+        const sy = (await api('GET', `/systems/${SYSTEM}/waypoints/${w.symbol}/shipyard`)).data;
+        for (const s of sy.ships || []) if (!yards[s.type] || s.purchasePrice < (yards[s.type].price ?? Infinity)) yards[s.type] = { wp: w.symbol, price: s.purchasePrice };
+        for (const t of sy.shipTypes || []) if (!yards[t.type]) yards[t.type] = { wp: w.symbol, price: null }; // sold here, price unknown until a ship is present
+      } catch {}
+    }
+  } catch {}
+  shipyardCache = { at: now(), yards };
+  return yards;
+}
+const shipyardWps = (yards) => [...new Set(Object.values(yards).map((y) => y.wp).filter(Boolean))];
+const isShipyardWp = (wp, yards) => shipyardWps(yards).includes(wp);
+function nearestShipyardWp(fromWp, yards) {
+  let best = null, bd = Infinity;
+  for (const wp of shipyardWps(yards)) { const d = D(fromWp, wp); if (d < bd) { bd = d; best = wp; } }
+  return best;
+}
+// min across the 3 wearable components; missing components default to healthy (1) so they never falsely trigger.
+const minCondition = (s) => Math.min(1, ...[s.frame?.condition, s.reactor?.condition, s.engine?.condition].filter((x) => x != null));
+const minIntegrity = (s) => Math.min(1, ...[s.frame?.integrity, s.reactor?.integrity, s.engine?.integrity].filter((x) => x != null));
+
+// Repair a ship that is DOCKED at a shipyard (caller must dock first). Quotes, budget/cap-gates, then repairs.
+// Spends only growthBudget (commit/uncommit so concurrent buys don't oversubscribe). Returns credits spent (0 = skipped).
+async function repairAt(shipSym) {
+  let cost = 0;
+  try { const q = (await api('GET', `/my/ships/${shipSym}/repair`)).data; cost = q.transaction?.totalPrice ?? q.transaction?.price ?? 0; }
+  catch (e) { log(`🔧 ${shipSym.slice(-3)} repair quote failed: ${e.message}`); return 0; }
+  if (cost <= 0) return 0;
+  if (cost > REPAIR_MAX_COST) { log(`🔧 ${shipSym.slice(-3)} repair quote ${cost.toLocaleString()} > cap ${REPAIR_MAX_COST.toLocaleString()} — skip`); return 0; }
+  if (cost > growthBudget()) { log(`🔧 ${shipSym.slice(-3)} repair ${cost.toLocaleString()} > growthBudget — defer`); return 0; }
+  commit(cost);
+  try { await api('POST', `/my/ships/${shipSym}/repair`); log(`🔧 ${shipSym.slice(-3)} repaired for ${cost.toLocaleString()}`); }
+  catch (e) { log(`🔧 ${shipSym.slice(-3)} repair failed: ${e.message}`); uncommit(cost); return 0; }
+  uncommit(cost);
+  await refreshCredits();
+  return cost;
+}
+// Two-tier repair, called early in each worker loop (the ship's own loop → race-free). Returns true if it acted
+// (caller should `continue` to re-read fresh state next cycle).
+async function maybeRepair(shipSym, ship, yards) {
+  if (!REPAIR || !shipyardWps(yards).length) return false;
+  const cond = minCondition(ship), integ = minIntegrity(ship);
+  const forced = integ < REPAIR_INTEG_FORCE, worn = cond < REPAIR_COND_MIN;
+  if (!forced && !worn) return false;
+  const wp = ship.nav.waypointSymbol, atYard = ship.nav.status !== 'IN_TRANSIT' && isShipyardWp(wp, yards);
+  if (!forced && worn && !atYard) return false;            // opportunistic only fires when ALREADY at a shipyard (no detour)
+  if (forced && !atYard) {                                  // forced: divert to nearest shipyard
+    const dest = nearestShipyardWp(wp, yards);
+    if (!dest) return false;
+    log(`🔧 ${shipSym.slice(-3)} integrity ${(integ * 100).toFixed(0)}% < ${(REPAIR_INTEG_FORCE * 100).toFixed(0)}% — diverting to shipyard ${dest.slice(-3)}`);
+    await goTo(shipSym, dest);
+  }
+  try { await api('POST', `/my/ships/${shipSym}/dock`); } catch {}   // repair requires DOCKED
+  const spent = await repairAt(shipSym);
+  return forced || spent > 0;
+}
+
+// Buy a colony ship at a shipyard (requires one of our hulls present at that waypoint — we keep probes at the
+// system shipyards). Returns the new ship symbol or null.
+async function buyMiningShip(shipType, wp) {
+  try {
+    const r = await api('POST', '/my/ships', { shipType, waypointSymbol: wp });
+    await refreshCredits();
+    return r.data?.ship?.symbol || null;
+  } catch (e) { log(`🪐 buy ${shipType} @ ${wp.slice(-3)} failed: ${e.message}`); return null; }
+}
+
+// Manager loop: grow the mining colony with surveyors (first) then drones, under hard caps, only while the gate is
+// unbuilt, funded purely from growthBudget above MINE_EXPAND_CREDIT_FLOOR. A bought hull is given its own supervised
+// worker (launchWorker); its capability-detected mining role then drives it to the asteroid — no explicit ferry here
+// (that would race the role loop for control of the ship).
+async function mineExpandManager() {
+  if (!MINE_EXPAND) return;
+  await sleep(20_000);                                     // let startup + first credit refresh settle
+  while (!stop) {
+    try {
+      if (MINE_FEED && !gateCache.built && gateCache.exists) {
+        await refreshCredits();
+        const all = await getAllShips();
+        const surveyors = all.filter((s) => hasMount(s, /SURVEYOR/)).length;
+        const drones = all.filter((s) => hasMount(s, /MINING_LASER/) && !hasMount(s, /SURVEYOR/)).length;
+        const yards = await getShipyards();
+        let want = null;
+        if (surveyors < MINE_MAX_SURVEYORS && yards.SHIP_SURVEYOR) want = 'SHIP_SURVEYOR';
+        else if (drones < MINE_MAX_DRONES && yards.SHIP_MINING_DRONE) want = 'SHIP_MINING_DRONE';
+        if (want) {
+          const yard = yards[want];
+          const price = yard.price || (want === 'SHIP_SURVEYOR' ? 40_000 : 50_000);   // estimate when no example ship is docked
+          if (price <= growthBudget() && cachedCredits - price >= MINE_EXPAND_CREDIT_FLOOR) {
+            const bought = await buyMiningShip(want, yard.wp);
+            if (bought) { log(`🪐 MINE_EXPAND bought ${want} ${bought.slice(-3)} @ ${yard.wp.slice(-3)} (surveyors ${surveyors}→, drones ${drones}→)`); launchWorker(bought); }
+          }
+        }
+      }
+    } catch (e) { log(`🪐 MINE_EXPAND ERR ${e.message}`); }
+    await sleep(MINE_EXPAND_SCAN_MS);
+  }
+}
+
+// [RULE: keep-fleet-alive] supervise each worker — if one throws, log and restart it after a short backoff instead
+// of letting the rejection bubble up and kill every other ship. Hoisted to module scope so a dynamically-bought hull
+// (MINE_EXPAND) can be given its own supervised worker via launchWorker without double-spawning an existing one.
+const launchedWorkers = new Set();
+const supervise = async (sym) => { while (!stop) { try { await worker(sym); return; } catch (e) { log(`${sym.slice(-3)} worker crashed: ${e.message} — restarting in 5s`); await sleep(5000); } } };
+function launchWorker(sym) { if (launchedWorkers.has(sym)) return; launchedWorkers.add(sym); supervise(sym); }
+
 async function main() {
   fs.rmSync(here('./STOP'), { force: true });
   await refreshCredits();
@@ -2441,11 +2591,10 @@ async function main() {
   fleetSize = traders.length;            // [PHASE] feed determinePhase before the loops/targetWatch start
   currentPhase = determinePhase();
   log(`🧭 phase ${currentPhase.name} — ${currentPhase.desc}`);
-  // [RULE: keep-fleet-alive] supervise each worker — if one throws, log and restart it after a short backoff
-  // instead of letting the rejection bubble to main().catch and kill every other ship. The fleet stays up.
-  const supervise = async (sym) => { while (!stop) { try { await worker(sym); return; } catch (e) { log(`${sym.slice(-3)} worker crashed: ${e.message} — restarting in 5s`); await sleep(5000); } } };
-  const tasks = traders.map((s) => supervise(s.symbol));
-  tasks.push(contractManager(), targetWatch(), fleetTable());
+  // [RULE: keep-fleet-alive] supervise hoisted to module scope (see above). Register initial hulls so MINE_EXPAND
+  // never double-spawns one, and keep their supervised promises in `tasks` so Promise.all keeps the process alive.
+  const tasks = traders.map((s) => { launchedWorkers.add(s.symbol); return supervise(s.symbol); });
+  tasks.push(contractManager(), targetWatch(), fleetTable(), mineExpandManager());
   const stopWatch = (async () => { while (!stop) { if (fs.existsSync(here('./STOP'))) { stop = true; break; } await sleep(3000); } })();
   await Promise.all([...tasks, stopWatch]);
   log(`AUTOTRADER stopped. run net +${totalNet.toLocaleString()} over ${lanesRun} lanes`);

@@ -126,6 +126,25 @@ production launch where it differs from the code default.
 | `MINE_CLOG_AT` | `32` | Only sell raw ore once the funnel holds ≥ this (else prefer refine→feed). |
 | `MINE_RAW_RELIEF` | ON | Relief-valve: sell raw ore at H59 when the funnel clogs. |
 
+## Ship repair (default OFF)
+
+| Var | Default | Controls |
+|---|---|---|
+| `REPAIR` | OFF (`0`) | Master switch for ship maintenance. Set `1` to enable opportunistic + forced repair. |
+| `REPAIR_COND_MIN` | `0.85` | Opportunistic: repair when min(frame/reactor/engine) **condition** < this *and* the ship is already docked at a shipyard (no detour). |
+| `REPAIR_INTEG_FORCE` | `0.5` | Forced: divert to the nearest shipyard and repair when min **integrity** < this (prevents losing a hull). |
+| `REPAIR_MAX_COST` | `100000` | Skip any single repair whose quote exceeds this (safety cap). Repairs spend only `growthBudget`, never the reserve. |
+
+## Mining-colony expansion (default OFF)
+
+| Var | Default | Controls |
+|---|---|---|
+| `MINE_EXPAND` | OFF (`0`) | Master switch. Buys colony ships only while `MINE_FEED` on **and the gate is unbuilt**. |
+| `MINE_MAX_SURVEYORS` | `3` | Cap on total survey-mount hulls (existing 2 + room for 1). Surveyors are bought first. |
+| `MINE_MAX_DRONES` | `4` | Cap on total mining drones (existing 2 + room for 2). Bought after the surveyor cap is met. |
+| `MINE_EXPAND_CREDIT_FLOOR` | `600000` | Never buy if it would drop credits below this. Buys also gated by `growthBudget`. |
+| `MINE_EXPAND_SCAN_MS` | `600000` | Expansion-manager scan cadence (≈10 min); at most one hull per scan. |
+
 ## Ops / display
 
 | Var | Default | Controls |

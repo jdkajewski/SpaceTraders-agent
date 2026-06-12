@@ -361,3 +361,65 @@ order:
 If truly boxed in (no route, no hauler, no staging hop), it **holds position** — it never
 salvage-sells protected gate cargo at a loss. Gated by `ORPHAN_GATE_DELIVERY` and `ORPHAN_MIN_UNITS`
 (a full hold always triggers, since it can't trade anyway).
+
+## 7. Ship repair — `maybeRepair()` / `repairAt()` (default OFF, `REPAIR=1`)
+
+Ships have two independent health axes:
+
+- **`condition`** (0..1) — *performance wear*. Drags engine speed and raises fuel burn. **Fully restored by
+  repair.** This is the common, creeping problem (a hard-worked hull sits at 54–62% within days).
+- **`integrity`** (0..1) — *structural life*. **Not restored** by routine repair beyond a point; at **0 the hull
+  is destroyed.** Decays much more slowly than condition.
+
+Repair (`POST /my/ships/{s}/repair`, must be **DOCKED at a SHIPYARD**; `GET` returns a quote) restores condition.
+The system's shipyards (A2 / C40 / H60 in X1-PP30) are discovered + cached for 10 min by `getShipyards()`.
+
+**Two tiers, both run inside the ship's OWN worker loop** (so repair never races an external manager for control of
+a hull):
+
+1. **Opportunistic** — when a ship is *already* sitting at a shipyard and `minCondition < REPAIR_COND_MIN` (default
+   0.85), top it up. Zero detour — it only fires when the stop is free.
+2. **Forced** — if `minIntegrity < REPAIR_INTEG_FORCE` (default 0.5), **divert** to the nearest shipyard and repair,
+   so we never lose a hull mid-route. (Integrity decays slowly, so this rarely fires — condition wear is the usual
+   trigger and it's handled opportunistically.)
+
+**Budget discipline:** a repair only spends `growthBudget()` (free cash above the operating reserve — never the
+reserve), uses `commit`/`uncommit` so concurrent buys don't oversubscribe, and is **capped per repair by
+`REPAIR_MAX_COST`** (default 100k). A quote over the cap, or over the available budget, is skipped/deferred.
+
+> `minCondition` / `minIntegrity` take the **min across frame/reactor/engine** — the worst component decides, since
+> that's what's actually dragging the ship.
+
+## 8. Minor mining-colony expansion — `mineExpandManager()` (default OFF, `MINE_EXPAND=1`)
+
+A slow, hard-capped manager loop that **grows the park-and-ferry mining colony** by buying ships in-system. Its
+purpose is the same as the colony's: keep F51 fed so **FAB_MATS stays cheap and the gate completes** — fresher
+surveys and more extraction directly serve that, and it's a modest profit lane besides.
+
+**When it considers a buy** (all must hold):
+
+- `MINE_EXPAND=1`, **and**
+- `MINE_FEED` on **and the gate is still unbuilt** (`gateCache.exists && !gateCache.built`) — once the gate
+  completes, expansion stops entirely.
+
+**What it buys** (priority, one hull per scan, scan every `MINE_EXPAND_SCAN_MS` ≈ 10 min):
+
+1. **Surveyors first** — if `count(survey-mount hulls) < MINE_MAX_SURVEYORS` (default **3**) → `SHIP_SURVEYOR`
+   (~$34k @ H60). Fresh, rich surveys make every drone's extraction more valuable.
+2. **Then drones** — else if `count(mining-laser, non-survey hulls) < MINE_MAX_DRONES` (default **4**) →
+   `SHIP_MINING_DRONE` (~$45k @ H60). More raw throughput when extraction is the bottleneck.
+3. Both caps met → buys nothing.
+
+> Caps are **targets, not increments** — they count *existing* hulls. With 2 surveyors + 2 drones today, the
+> defaults allow at most **+1 surveyor and +2 drones**, then it stops.
+
+**Affordability gates** (both must pass): price ≤ `growthBudget()`, **and** `credits − price ≥
+MINE_EXPAND_CREDIT_FLOOR` (default 600k). It never touches the operating reserve and never drops below the floor.
+
+**After a buy:** the new hull is handed its own supervised worker via `launchWorker()`. `mineRoleOf()` is
+**capability-based**, so the fresh ship auto-slots into SURVEYOR / DRONE with zero extra config, and its role loop
+drives it to the asteroid — there is no separate ferry step (which would race the role loop for control).
+
+> **"If needed" = the four gates working together** (gate-unbuilt · budget floor · caps · one-per-scan). There is no
+> blind buy-to-cap-now: it tops up slowly, only while affordable and the gate is unbuilt, and you can watch each buy
+> in the log before the next scan.
