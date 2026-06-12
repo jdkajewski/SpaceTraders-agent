@@ -84,6 +84,12 @@ cost = fuel × FUEL_PX  +  time × VALUE_OF_TIME
 
 - DRIFT burns flat 1 fuel (~free) but is ~10× slower; CRUISE burns `dist`; BURN burns `2×dist` but is
   fastest. A mode needing > 97% of the tank is skipped (3% margin absorbs coordinate/rounding drift).
+- **These per-mode coefficients are empirically calibrated at bring-up, not guessed.** Before/early in a
+  deployment, `calib.mjs` (see `06-tooling.md`) flies one real leg, captures the *actual* `fuel.consumed`
+  and arrival duration from the API, and derives the fuel-per-distance and `time = round(dist × k / speed) + 15`
+  constants — which are then baked into `legFuel()`/`chooseMode` (~L200–229). So the cost model reflects
+  the real engine instead of hand-picked numbers. (It's a one-time tuning pass, not re-run every boot;
+  only `FUEL_PX` below re-samples continuously.)
 - **`FUEL_PX` is live**, not hardcoded: the **median** market FUEL price ÷ 100 (1 market FUEL unit =
   100 ship-fuel), re-sampled every market refresh. Median is robust to one pumped market. Because fuel
   is genuinely cheap (~0.7 cr/unit), CRUISE/BURN almost always beat DRIFT — DRIFT only wins when the

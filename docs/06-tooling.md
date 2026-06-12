@@ -69,9 +69,12 @@ Diffs two **local** market snapshot files to show price/supply movement over tim
 Samples markets and writes a snapshot file. Reads the *waypoint list* from local `markets.json` first,
 then hits the API to sample — so it's API-using but minimizes calls. Run to feed `market_diff.mjs`.
 
-### `calib.mjs` — flight-model calibration
-Calibrates flight-mode coefficients (fuel/time per mode vs. engine speed) used by `chooseMode`. Hits
-the API to measure real travel; run rarely, offline-ish.
+### `calib.mjs` — flight-model calibration (bring-up step)
+Run **at the beginning of a deployment** to calibrate the flight-mode fuel/time coefficients used by
+`chooseMode`. It navigates a ship one real leg, captures the actual `fuel.consumed` and travel duration
+from the API, compares them to the three candidate models, and derives the `fuel/dist` and
+`time = round(dist × k / speed) + 15` constants that get baked into `bot2.mjs` (`legFuel`/`chooseMode`).
+Hits the API to measure real travel; a one-time/occasional tuning pass, not part of the steady loop.
 
 ### `probe_util.mjs` — market-utility ranker
 Ranks markets/waypoints by how often they appear in the logs (a cheap proxy for usefulness) — **zero
