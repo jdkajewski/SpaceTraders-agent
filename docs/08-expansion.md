@@ -96,8 +96,19 @@ mining colony, shipyards + what they sell). No trading until the new system is m
 
 ## 3. Choosing which ships to buy / send to expand
 
-`bot2.mjs` has **no purchase or refit code today** — it's all net-new, and budget-disciplined the same
-way gate-supply is (spend only `availableForWork`, keep `OPERATING_RESERVE`, never starve trading).
+> **Implemented (default-OFF) — `EXPAND_AUTOBUY=1`.** The expansion subsystem now grows the fleet, not
+> just reshuffles it. After `setupOutposts` has exhausted **idle ships first**, an auto-buy step fills the
+> remaining shortfall: (1) a **trader for any trader-starved outpost** (`traders < EXPAND_OUTPOST_TRADERS`),
+> picking the biggest/fastest hull the home shipyard sells (`EXPAND_TRADER_PREF`: heavy/refining freighter →
+> `LIGHT_HAULER` → shuttle), then (2) **probes toward 1:1 coverage** (`SHIP_PROBE` until a system's probe
+> count == its market count, or `EXPAND_PROBE_TARGET`). Hulls are bought at a **home shipyard** (our market
+> sensor probes sit there, satisfying the API's "ship present" rule) and migrated out by the existing 2-hop
+> state machine. Hard safety: FLOOR-guarded (`EXPAND_BUY_FLOOR`, never bankrupt), lifetime-capped
+> (`EXPAND_MAX_BUY_TRADERS` / `EXPAND_MAX_BUY_PROBES`), one attempt per `EXPAND_AUTOBUY_MS`. See the env table
+> at the end of §3 and `05-config-reference.md`.
+
+The policy below is the *design rationale* the auto-buy implements (budget-disciplined the same way
+gate-supply is: spend only surplus above the floor, keep `OPERATING_RESERVE`, never starve trading).
 
 **What the shipyards sell (X1-PP30 — A2 / C40 / H60):**
 
@@ -142,8 +153,21 @@ better whole hull. Whether the *target* system supports refits is unknown until 
 until then. (The v2 engine already has full outfitting — `outfittingPolicy.ts` — if expansion ever
 targets that codebase instead.)
 
-Env: `SHIP_BUY` (default 0) + per-type budget caps; `MULTI_SYSTEM` (default 0) gates the per-system
+Env: `EXPAND_AUTOBUY` (default 0) gates the auto-buy step; `MULTI_SYSTEM` (default 0) gates the per-system
 trade engine.
+
+**Auto-buy env (all default-safe):**
+
+| Var | Default | Meaning |
+|---|---|---|
+| `EXPAND_AUTOBUY` | `0` | Master gate for fleet auto-buy. |
+| `EXPAND_BUY_FLOOR` | `max(EXPAND_CREDIT_FLOOR+250k, 700k)` | Never let credits drop below this *after* a buy. |
+| `EXPAND_AUTOBUY_MS` | `90000` | Min interval between buy attempts (throttle). |
+| `EXPAND_MAX_BUY_TRADERS` | `8` | Lifetime cap on trader/hauler buys this run. |
+| `EXPAND_MAX_BUY_PROBES` | `24` | Lifetime cap on probe buys this run. |
+| `EXPAND_OUTPOST_TRADERS` | `1` | Target traders per outpost (set `2` for "1 hauler + 1 light"). |
+| `EXPAND_PROBE_TARGET` | `0` (= 1:1 with markets) | Per-system probe target cap. |
+| `EXPAND_TRADER_PREF` | `SHIP_HEAVY_FREIGHTER,SHIP_REFINING_FREIGHTER,SHIP_LIGHT_HAULER,SHIP_LIGHT_SHUTTLE,SHIP_COMMAND_FRIGATE` | Trader hull preference, best→worst. |
 
 ---
 
@@ -155,7 +179,7 @@ trade engine.
 | **E2** | One-time send + pin + **recon** (§2): send a couple probes through I63, scout the target system, write its findings doc. No trading yet. | low |
 | **E3** | Multi-system trade engine (§0 lifts): parameterize `coords`/`MARKET_WPS`/`getMarkets()` by system; scope lanes to the ship's resident system. | **high — core refactor** |
 | **E4** | New-system gate build: parameterize gate-supply + feed + mining onto the new system's producer/asteroid waypoints (recursion of the playbook). | high |
-| **E5** | In-system ship buying in the new system (§3): probes for coverage, a hauler for trade/gate. | medium |
+| **E5** | In-system ship buying in the new system (§3): probes for coverage, a hauler for trade/gate. **✅ DONE** — `EXPAND_AUTOBUY` (buys at home shipyard + migrates out; local-shipyard buying is a future optimization). | medium |
 
 **Open decisions (need user input before *executing*, not before coding E1):**
 

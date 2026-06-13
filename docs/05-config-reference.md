@@ -147,6 +147,22 @@ production launch where it differs from the code default.
 | `MINE_EXPAND_CREDIT_FLOOR` | `600000` | Never buy if it would drop credits below this. Buys also gated by `growthBudget`. |
 | `MINE_EXPAND_SCAN_MS` | `600000` | Expansion-manager scan cadence (≈10 min); at most one hull per scan. |
 
+## Inter-system expansion fleet auto-buy (default OFF)
+
+Grows the expansion fleet when idle ships can't fill outpost staffing/coverage. Existing idle ships are
+always used first (`setupOutposts`); auto-buy fills only the shortfall. See `08-expansion.md` §3.
+
+| Var | Default | Controls |
+|---|---|---|
+| `EXPAND_AUTOBUY` | OFF (`0`) | Master switch for fleet auto-buy (requires `AUTO_EXPAND=1`). |
+| `EXPAND_BUY_FLOOR` | `max(EXPAND_CREDIT_FLOOR+250k, 700k)` | Never buy if it would drop credits below this (hard no-bankrupt). |
+| `EXPAND_AUTOBUY_MS` | `90000` | Min interval between buy attempts (one hull per window, throttles retry on "no hull at shipyard"). |
+| `EXPAND_MAX_BUY_TRADERS` | `8` | Lifetime cap on trader/hauler buys this run. |
+| `EXPAND_MAX_BUY_PROBES` | `24` | Lifetime cap on probe buys this run. |
+| `EXPAND_OUTPOST_TRADERS` | `1` | Target traders per outpost; auto-buy buys haulers up to this when idle ships run out. Set `2` for "1 hauler + 1 light". |
+| `EXPAND_PROBE_TARGET` | `0` (=1:1 with markets) | Per-system probe target cap for coverage buys. |
+| `EXPAND_TRADER_PREF` | heavy→refining freighter→light hauler→shuttle→frigate | Trader hull preference (best cargo/range first). |
+
 ## Universal fuel-cargo (default OFF)
 
 Generalizes `GATE_FUEL_CARGO` to **every** haul (trade delivery, contract source/deliver) and relaxes the contract distance gate. See `03-subsystems.md` §9.
