@@ -681,6 +681,14 @@ function claimLane(ship, lanes, markets) {
 let contractClaim = null;        // {id,good,dest,units} awaiting a freighter
 let contractWorkingId = null;    // id currently being executed by ONE freighter (prevents dup-claim race)
 let activeContractInfo = null;   // {id,good,dest,units,pay} of the current active contract (for deliver-what-you-hold)
+// A contract whose delivery destination is OUTSIDE the home system can't be served by the single-system home
+// fleet (navigate refuses cross-system targets). Post-gate the faction starts offering contracts that deliver to
+// connected systems (e.g. X1-PP48-A17C); without this guard a home ship (often a mining tender) is elected and
+// loops forever on a 400 "outside the system" nav. We skip those for the home fleet (the cross-system expansion
+// hauler is the proper place to fulfil them — see expansion.mjs follow-up). Slot stays parked until its deadline.
+const sysOf = (wp) => (wp || '').split('-').slice(0, 2).join('-');
+const contractHomeDeliverable = (ci) => !!ci && sysOf(ci.dest) === SYSTEM;
+let warnedCrossSysContract = null;   // contract id we've already logged as cross-system (log once)
 let contractOwner = null;        // {id, ship}: the ONE ship currently committed to sourcing/hauling this contract
 const contractFails = new Map(); // id -> failure count (abandon after MAX_CONTRACT_FAILS)
 const MAX_CONTRACT_FAILS = 3;
@@ -740,6 +748,7 @@ function contractSrcReachable(here, srcWp, fuelCap, markets) {
 // [CONTRACT] Elect the best available hull to source `ci` — the eligible, idle, empty hull CLOSEST to the
 // cheapest source that still clears the margin floor. Returns { ship, src, dist } or null when none qualify.
 function electContractOwner(ci, markets, ships) {
+  if (!contractHomeDeliverable(ci)) return null;                 // cross-system dest → home fleet can't deliver
   const src = cheapestContractSrc(markets, ci.good, ci.dest);
   if (!src || src.wp === ci.dest) return null;
   const gateHaulPinned = GATE_SUPPLY && gateCache.exists && !gateCache.built;
@@ -843,7 +852,7 @@ async function contractManager() {
     // & fulfills it — banking the onAccepted payment and freeing the single slot for the next (often lucrative) one.
     try {
       const ci = activeContractInfo;
-      if (CONTRACT_AUTOFORCE_MINS > 0 && ci && ci.units > 0) {
+      if (CONTRACT_AUTOFORCE_MINS > 0 && ci && ci.units > 0 && contractHomeDeliverable(ci)) {
         const claimed = contractOwner && contractOwner.id === ci.id;   // some hull is committed to it
         if (claimed || isForced(ci)) {
           contractWedge = { id: null, since: 0 };                      // progressing or already forced → not wedged
@@ -926,6 +935,7 @@ function cheapestContractSrc(markets, good, dest = null) {
 // source a thin-margin good: the cheapest market must be within CONTRACT_MAX_SRC_DIST, and payout must beat
 // source cost + a rough fuel estimate by CONTRACT_MIN_MARGIN. Only relevant when the ship still needs to SOURCE.
 function contractWorthIt(shipSym, ship, ci, markets) {
+  if (!contractHomeDeliverable(ci)) return null;                 // cross-system dest → home fleet can't deliver
   const src = cheapestContractSrc(markets, ci.good, ci.dest);
   if (!src || src.wp === ci.dest) { if (DBG_CONTRACT) log(`ctr? ${shipSym.slice(-3)} ${ci.good} NO-SRC (src=${src?.wp || 'none'} dest=${ci.dest})`); return null; }
   const here = ship.nav.waypointSymbol;
@@ -953,6 +963,13 @@ function contractWorthIt(shipSym, ship, ci, markets) {
 async function contractRunnerTrip(shipSym, ship, markets) {
   const ci = activeContractInfo;
   if (!ci || ci.units <= 0) { if (DBG_CONTRACT && ship.cargo.capacity >= 40) log(`ctr? ${shipSym.slice(-3)} no-active-contract (ci=${ci ? ci.good + ':' + ci.units : 'null'})`); return false; }
+  // Cross-system delivery (e.g. an X1-PP48 dest after the gate opened): the home fleet can't navigate there, so
+  // never source/haul it — fall through to trading. Log once so the wedge is visible. (Fulfilment of these is the
+  // expansion hauler's job — TODO in expansion.mjs.) An already-held contract good is handled below via reconcile.
+  if (!contractHomeDeliverable(ci) && cargoUnits(ship, ci.good) <= 0) {
+    if (warnedCrossSysContract !== ci.id) { warnedCrossSysContract = ci.id; log(`⛔ contract ${ci.id.slice(-6)} ${ci.good}→${ci.dest} is CROSS-SYSTEM (${sysOf(ci.dest)}≠${SYSTEM}); home fleet can't deliver → slot parked until deadline (expansion-hauler fulfilment is the proper fix)`); }
+    return false;
+  }
   if (contractOwner && contractOwner.id === ci.id && contractOwner.ship !== shipSym) return false;  // another ship owns it
   let have = cargoUnits(ship, ci.good);
   const preElected = contractOwner && contractOwner.id === ci.id && contractOwner.ship === shipSym;
