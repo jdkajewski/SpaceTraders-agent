@@ -1459,18 +1459,23 @@ async function waypointMods(wp) {
 // Discover asteroids: index by deposit trait and inject coords so D()/planRoute work (asteroids aren't markets, so
 // they're absent from coords.csv). Skip rocks that are already mined out — flagged either by a STRIPPED modifier
 // reported by the API or by depletedSites (rocks MINE_MIGRATE has abandoned this run).
+// We scan every minable waypoint TYPE — plain ASTEROID *and* ENGINEERED_ASTEROID / ASTEROID_FIELD — because a much
+// closer engineered rock (e.g. CA5A, 75 from F51 vs B9 at 250) is otherwise never seen, stranding the colony far away.
+const ASTEROID_TYPES = ['ASTEROID', 'ENGINEERED_ASTEROID', 'ASTEROID_FIELD'];
 async function loadAsteroids() {
   if (asteroidCache) return asteroidCache;
   const cache = {};
-  for (let page = 1; page <= 5; page++) {
-    let r; try { r = await api('GET', `/systems/${SYSTEM}/waypoints?type=ASTEROID&limit=20&page=${page}`); } catch { break; }
-    for (const w of r.data || []) {
-      if (w.x != null && coords[w.symbol] == null) coords[w.symbol] = [w.x, w.y];   // always inject coords (router needs them even for stripped rocks)
-      const mods = (w.modifiers || []).map((m) => m.symbol);
-      if (mods.includes('STRIPPED') || depletedSites.has(w.symbol)) continue;       // mined out → not a candidate
-      for (const t of w.traits) if (/DEPOSIT/.test(t.symbol)) (cache[t.symbol] ||= []).push(w.symbol);
+  for (const type of ASTEROID_TYPES) {
+    for (let page = 1; page <= 5; page++) {
+      let r; try { r = await api('GET', `/systems/${SYSTEM}/waypoints?type=${type}&limit=20&page=${page}`); } catch { break; }
+      for (const w of r.data || []) {
+        if (w.x != null && coords[w.symbol] == null) coords[w.symbol] = [w.x, w.y];   // always inject coords (router needs them even for stripped rocks)
+        const mods = (w.modifiers || []).map((m) => m.symbol);
+        if (mods.includes('STRIPPED') || depletedSites.has(w.symbol)) continue;       // mined out → not a candidate
+        for (const t of w.traits) if (/DEPOSIT/.test(t.symbol)) (cache[t.symbol] ||= []).push(w.symbol);
+      }
+      if (!r.data || r.data.length < 20) break;
     }
-    if (!r.data || r.data.length < 20) break;
   }
   asteroidCache = cache;
   return asteroidCache;
