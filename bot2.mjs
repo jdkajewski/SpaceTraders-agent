@@ -359,12 +359,14 @@ function buildLanes(markets) {
   const goods = {};
   for (const [wp, m] of Object.entries(markets))
     for (const g of m.tradeGoods || []) (goods[g.symbol] = goods[g.symbol] || []).push({ wp, ...g });
-  // [FAB GUARD] waypoints that PRODUCE gate materials — never source profit lanes out of these (would spike the gate).
+  // [FAB GUARD] waypoints that PRODUCE still-needed gate materials — never source profit lanes out of these
+  // (would spike the gate). Completed materials are excluded so their producers/co-products trade freely again.
+  const activeMats = activeGateMaterials();
   const protectedWps = new Set();
-  if (GATE_PROTECT) for (const mat of GATE_PROTECT_MATERIALS) { const w = findProducerWp(markets, mat); if (w) protectedWps.add(w); }
+  if (GATE_PROTECT) for (const mat of activeMats) { const w = findProducerWp(markets, mat); if (w) protectedWps.add(w); }
   const best = {};
   for (const [sym, entries] of Object.entries(goods)) {
-    if (GATE_PROTECT && GATE_PROTECT_MATERIALS.has(sym)) continue;            // never profit-trade a gate material
+    if (GATE_PROTECT && activeMats.has(sym)) continue;                       // never profit-trade a still-needed gate material
     for (const b of entries) for (const s of entries) {
       if (GATE_PROTECT && protectedWps.has(b.wp)) continue;                   // don't buy OUT OF a gate-material producer market
       if (s.sellPrice <= b.purchasePrice || b.purchasePrice <= 0) continue;
@@ -393,12 +395,12 @@ function planRideAlongs(markets, lane, freeUnits, cashBudget, excludeSyms = null
   if (GATE_PROTECT && gateProducerWps(markets).has(lane.buyWp)) return [];
   const dstSell = {};
   for (const g of dst.tradeGoods || []) dstSell[g.symbol] = g;
+  const activeMats = activeGateMaterials();
   const cands = [];
   for (const g of src.tradeGoods || []) {
     if (g.symbol === lane.sym || !(g.purchasePrice > 0)) continue;
     if (excludeSyms && excludeSyms.has(g.symbol)) continue;                 // [DEDUP] don't stack onto goods already aboard
-    if (GATE_PROTECT && GATE_PROTECT_MATERIALS.has(g.symbol)) continue;     // never ride-along a gate material
-    if (GATE_PROTECT && GATE_PROTECT_MATERIALS.has(g.symbol)) continue;     // never ride-along a gate material
+    if (GATE_PROTECT && activeMats.has(g.symbol)) continue;                 // never ride-along a still-needed gate material
     const d = dstSell[g.symbol];
     if (!d || !(d.sellPrice > 0)) continue;
     const margin = d.sellPrice - g.purchasePrice;
@@ -490,6 +492,17 @@ let lastGate = { gateBuilt: false, gateCost: 0, gateUnits: 0 };
 // all hauling the same one. The server snapshot (every 30s) is authoritative and reconciles other
 // agents' contributions; supply trips also patch `remaining`/`built` immediately on success.
 let gateCache = { exists: false, wp: null, built: false, remaining: {}, known: false };
+// [FAB GUARD] The gate materials the build STILL needs (remaining > 0). The static GATE_PROTECT_MATERIALS list
+// also carries already-COMPLETED materials (e.g. ADVANCED_CIRCUITRY once its quota is filled). Guarding a
+// completed material's producer/inputs needlessly blocks unrelated trades — e.g. ELECTRONICS (a D43 input for
+// ADVANCED_CIRCUITRY) gets locked out of contracts long after the circuitry is done. Guard only what's still
+// needed vs the market. Unknown gate state → protect all (safe default); built → protect nothing.
+function activeGateMaterials() {
+  if (!GATE_PROTECT) return new Set();
+  if (!gateCache.known || !gateCache.exists) return new Set(GATE_PROTECT_MATERIALS);
+  if (gateCache.built) return new Set();
+  return new Set([...GATE_PROTECT_MATERIALS].filter((m) => (gateCache.remaining[m] || 0) > 0));
+}
 const gateClaims = new Map();   // tradeSymbol -> units reserved by in-flight supply trips
 const gateActiveSuppliers = new Set();   // shipSyms currently on a gate-supply trip (concurrency cap)
 const inputActiveFeeders = new Set();    // shipSyms currently on an input-feed trip (concurrency cap)
@@ -862,10 +875,11 @@ function cheapestSrc(markets, good, excludeWps = null) {
   return wp ? { wp, px, tv } : null;
 }
 
-// [FAB GUARD / CONTRACT] The waypoints that PRODUCE still-tracked gate materials (their EXPORT markets).
+// [FAB GUARD / CONTRACT] The waypoints that PRODUCE still-NEEDED gate materials (their EXPORT markets). Excludes
+// producers of already-completed materials so their markets/co-products are tradeable again.
 function gateProducerWps(markets) {
   const set = new Set();
-  if (GATE_PROTECT) for (const mat of GATE_PROTECT_MATERIALS) { const w = findProducerWp(markets, mat); if (w) set.add(w); }
+  if (GATE_PROTECT) for (const mat of activeGateMaterials()) { const w = findProducerWp(markets, mat); if (w) set.add(w); }
   return set;
 }
 
@@ -877,8 +891,8 @@ function cheapestContractSrc(markets, good, dest = null) {
   if (!CONTRACT_AVOID_GATE_PRODUCER || !GATE_PROTECT) return cheapestSrc(markets, good);
   const producers = gateProducerWps(markets);
   if (!producers.size) return cheapestSrc(markets, good);
-  // Is `good` a gate material or one of the producers' imported inputs?
-  let guarded = GATE_PROTECT_MATERIALS.has(good);
+  // Is `good` a still-needed gate material or one of those producers' imported inputs?
+  let guarded = activeGateMaterials().has(good);
   if (!guarded) for (const wp of producers) {
     const m = markets[wp]; if (!m) continue;
     if ((m.tradeGoods || []).some((g) => g.symbol === good && g.type === 'IMPORT')) { guarded = true; break; }
