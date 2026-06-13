@@ -55,6 +55,18 @@ export function createExpansion(ctx) {
   let jumpCooldownMin = Number(process.env.EXPAND_JUMP_COOLDOWN_MIN || 8.2);    // est. cross-system jump dead-time; LEARNED from real cooldowns
   const OP_OVERHEAD_MIN = Number(process.env.EXPAND_OP_OVERHEAD_MIN || 1.5);    // buy+sell market handling baked into every lane
 
+  // ---- OUTPOST FAN-OUT (default OFF) -----------------------------------------
+  // The hub target (PP48) is the ONLY system the home gate reaches. PP48's gate, in turn, connects to N fresh
+  // outer systems. An "outpost" is an outer system we colonize with a small resident crew (probes + 1 light
+  // trader) that 2-hops out (home→PP48→outer) and then trades PURELY LOCALLY in that fresh, uncongested market
+  // (the proven high-rate pattern). Same hard safety invariants: every jump/buy is FLOOR-guarded; any error parks
+  // the ship (recoverable). Fully additive — with EXPAND_OUTPOSTS unset the hub/home earner is byte-for-byte same.
+  const OUTPOSTS = [...listEnv('EXPAND_OUTPOSTS')];                              // e.g. "X1-DF86,X1-MB89" ('' = off)
+  const OUTPOST_PROBES = Number(process.env.EXPAND_OUTPOST_PROBES || 2);        // probes per outpost (live market data)
+  const OUTPOST_TRADERS = Number(process.env.EXPAND_OUTPOST_TRADERS || 1);      // local traders per outpost
+  const outposts = new Map();          // sys -> { sys, gateWp, markets:{}, marketWps:[], loaded:false }
+  let outpostsReady = false;
+
   let triggered = false;
   let triggerLogged = false;
   let target = null;                  // { sys, gateWp }
@@ -95,6 +107,37 @@ export function createExpansion(ctx) {
   }
   async function scanAllTargets() {
     for (const wp of tgtMarketWps) { if (!tgtMarkets[wp] || now() - tgtMarkets[wp].at > SCAN_TTL_MS) await scanMarket(wp); }
+  }
+
+  // ---- generic per-system bring-up (used by outposts; hub uses loadTargetSystem above) ----
+  async function loadSystemInto(op) {
+    if (op.loaded) return;
+    const wps = [];
+    for (let page = 1; page <= 10; page++) {
+      let batch;
+      try { batch = (await api('GET', `/systems/${op.sys}/waypoints?limit=20&page=${page}`)).data; }
+      catch (e) { log(`🛰 load ${op.sys} p${page} ERR ${e.message}`); break; }
+      if (!batch || !batch.length) break;
+      for (const w of batch) {
+        coords[w.symbol] = [w.x, w.y];
+        if ((w.traits || []).some((t) => t.symbol === 'MARKETPLACE')) wps.push(w.symbol);
+        if (w.type === 'JUMP_GATE' && !op.gateWp) op.gateWp = w.symbol;
+      }
+      if (batch.length < 20) break;
+    }
+    op.marketWps = wps;
+    op.loaded = true;
+    log(`🛰 outpost ${op.sys} mapped: ${wps.length} markets, gate ${op.gateWp ? id(op.gateWp) : '?'}`);
+  }
+  async function scanMarketInto(wp, op) {
+    try {
+      const m = (await api('GET', `/systems/${sysOf(wp)}/waypoints/${wp}/market`)).data;
+      if (m.tradeGoods || !op.markets[wp]) op.markets[wp] = { ...m, at: now() };  // never clobber priced data with a priceless far-scan
+      return m;
+    } catch { return null; }
+  }
+  async function scanAllInto(op) {
+    for (const wp of op.marketWps) { if (!op.markets[wp] || now() - op.markets[wp].at > SCAN_TTL_MS) await scanMarketInto(wp, op); }
   }
 
   // fuel-credits for a within-system trip on the tank; null if not tank-reachable (would DRIFT) → lane rejected
@@ -222,6 +265,77 @@ export function createExpansion(ctx) {
     return true;
   }
 
+  // generic FLOOR-guarded gate-to-gate jump: ensures orbit at fromGate (same-system nav), then jumps to toGate.
+  // returns 'jumped' | 'moving' | 'wait' (caller just returns after). Never throws.
+  async function jumpVia(sym, ship, fromGate, toGate, mkts) {
+    if (cooldownUntil.get(sym) > now()) { await sleep(Math.min(cooldownUntil.get(sym) - now() + 500, 30_000)); return 'wait'; }
+    if (ship.nav.waypointSymbol !== fromGate) { await goToSys(sym, fromGate, mkts); return 'moving'; }
+    if (ship.fuel.capacity > 0 && getCredits() - antimatterPx < FLOOR) {
+      log(`🛰 ${id(sym)} hold jump — credits ${Math.round(getCredits()).toLocaleString()} near floor ${FLOOR.toLocaleString()}`);
+      await sleep(SLEEP_MS); return 'wait';
+    }
+    try { await refuel(sym); } catch {}
+    try {
+      const d = await jump(sym, toGate);
+      if (d.transaction?.totalPrice > 0) antimatterPx = d.transaction.totalPrice;
+      if (d.cooldown?.remainingSeconds) { cooldownUntil.set(sym, now() + d.cooldown.remainingSeconds * 1000); jumpCooldownMin = d.cooldown.remainingSeconds / 60; }
+      return 'jumped';
+    } catch (e) {
+      const mm = /(\d+)\s*second/i.exec(e.message);
+      if (/cooldown/i.test(e.message) && mm) cooldownUntil.set(sym, now() + (+mm[1]) * 1000 + 500);
+      else { log(`🛰 ${id(sym)} jump ${id(fromGate)}→${id(toGate)} ERR ${e.message} — parking`); await sleep(SLEEP_MS); }
+      return 'wait';
+    }
+  }
+
+  // drive one outpost member: 2-hop migrate (home→PP48→outer) then trade/scan PURELY LOCAL in the outer system.
+  async function stepOutpost(sym, ship) {
+    const m = members.get(sym);
+    const op = outposts.get(m.opSys);
+    if (!op) { m.last = 'no outpost'; await sleep(SLEEP_MS); return; }
+    const cur = sysOf(ship.nav.waypointSymbol);
+    const hubSys = target ? target.sys : null;          // PP48
+    const hubGate = target ? target.gateWp : null;      // PP48 D18A
+
+    // ---- arrived at the outpost system → resident local trading ----
+    if (cur === op.sys) {
+      await loadSystemInto(op);
+      if (!op.gateWp) op.gateWp = ship.nav.waypointSymbol; // fallback: we jumped in via the gate
+      if (m.role === 'OUTPROBE') {
+        if (!m.scanned) m.scanned = new Set();
+        const todo = op.marketWps.filter((w) => !m.scanned.has(w));
+        if (!todo.length) { await scanAllInto(op); await sleep(PROBE_DWELL_MS); m.last = `scanning ${op.sys.slice(-4)} (all)`; return; }
+        const here = ship.nav.waypointSymbol; todo.sort((a, b) => D(here, a) - D(here, b));
+        const dest = todo[0];
+        try { await goToSys(sym, dest, op.markets); await scanMarketInto(dest, op); m.scanned.add(dest); log(`🛰 ${id(sym)} scanned ${id(dest)} @${op.sys.slice(-4)} (${m.scanned.size}/${op.marketWps.length})`); }
+        catch (e) { log(`🛰 ${id(sym)} scout ERR ${e.message}`); m.scanned.add(dest); }
+        await sleep(2000); return;
+      }
+      // OUTLIGHT: local buy-low/sell-high inside the outpost
+      await scanAllInto(op);
+      if (await dumpCargo(sym, ship, cur, op.markets)) return;
+      const lane = bestLane(ship, op.markets, cur, op.markets, cur, null);
+      if (!lane) {
+        const todo = op.marketWps.filter((w) => !op.markets[w] || now() - op.markets[w].at > SCAN_TTL_MS);
+        if (todo.length) { const here = ship.nav.waypointSymbol; todo.sort((a, b) => D(here, a) - D(here, b)); try { await goToSys(sym, todo[0], op.markets); await scanMarketInto(todo[0], op); } catch {} m.last = `scanning ${op.sys.slice(-4)} (no lane)`; return; }
+        m.last = `parked ${op.sys.slice(-4)} (no lane)`; await sleep(SLEEP_MS); return;
+      }
+      await runLane(sym, ship, lane, op.markets, op.markets, null);
+      return;
+    }
+
+    // ---- migration: home → PP48 (hop 1), then PP48 → outpost (hop 2) ----
+    if (!hubGate) { m.last = 'await hub'; await sleep(SLEEP_MS); return; }
+    if (cur === homeSystem) { m.last = `migrating → ${hubSys} (hop1)`; await jumpVia(sym, ship, gateWp(), hubGate, homeMarkets()); return; }
+    if (cur === hubSys) {
+      if (!op.gateWp) { await loadSystemInto(op); }     // need the outpost gate wp before hop 2
+      if (!op.gateWp) { m.last = 'await outpost gate'; await sleep(SLEEP_MS); return; }
+      m.last = `migrating → ${op.sys} (hop2)`;
+      await jumpVia(sym, ship, hubGate, op.gateWp, tgtMarkets); return;
+    }
+    m.last = `stray in ${cur}`; await sleep(SLEEP_MS);   // unexpected system → park (recoverable)
+  }
+
   async function stepProbe(sym, ship) {
     const cur = sysOf(ship.nav.waypointSymbol);
     if (cur === homeSystem && target.sys !== homeSystem) { await ensureAtTargetThenJump(sym, ship); return; }
@@ -327,6 +441,7 @@ export function createExpansion(ctx) {
     try {
       if (m.role === 'PROBE') await stepProbe(sym, ship);
       else if (m.role === 'LIGHT') await stepLight(sym, ship);
+      else if (m.role === 'OUTPROBE' || m.role === 'OUTLIGHT') await stepOutpost(sym, ship);
       else await stepHauler(sym, ship);
     } catch (e) { log(`🪐 ${id(sym)} expand step ERR ${e.message} — parking`); await sleep(SLEEP_MS); }
   }
@@ -360,8 +475,57 @@ export function createExpansion(ctx) {
     return members.size > 0;
   }
 
+  // assign small resident crews to each configured outer system (drawn from idle ships not used by the hub).
+  // Position-aware: a free ship ALREADY in an outpost system resumes that outpost (restart-safe, no reshuffle);
+  // remaining slots fill from idle ships at home/hub.
+  async function setupOutposts() {
+    if (!OUTPOSTS.length || outpostsReady) return;
+    let conns = [];
+    try { conns = (await api('GET', `/systems/${target.sys}/waypoints/${target.gateWp}/jump-gate`)).data?.connections || []; }
+    catch (e) { log(`🛰 outpost gate read ERR ${e.message} — will retry`); return; }
+    if (!conns.length) { log('🛰 hub gate has no connections yet — will retry outposts'); return; }
+    let all;
+    try { all = await getAllShips(); } catch (e) { log(`🛰 outpost fleet read ERR ${e.message}`); return; }
+    const isProbe = (s) => s.frame?.symbol === 'FRAME_PROBE';
+    const reserved = new Set();
+    for (const k of ['GATE_HAULERS', 'INPUT_FEEDERS', 'MINE_TRANSPORT', 'MINE_FUNNEL', 'MINE_BATCH', 'CONTRACT_RUNNER', 'NEGOTIATOR', 'CONTRACT_NEGOTIATOR', 'EXPAND_HAULERS', 'EXPAND_LIGHT', 'EXPAND_PROBES'])
+      for (const t of listEnv(k)) reserved.add(t);
+    const isReserved = (s) => [...reserved].some((t) => s.symbol === t || s.symbol.endsWith('-' + t));  // never poach a home-role ship
+    const free = (s) => !members.has(s.symbol) && !isReserved(s);
+    const isTrader = (s) => !isProbe(s) && s.cargo.capacity >= 20 && s.fuel.capacity >= 200 && !/MINING_LASER|SURVEYOR/.test(JSON.stringify(s.mounts || []));
+    const assign = (s, sys) => { const role = isProbe(s) ? 'OUTPROBE' : 'OUTLIGHT'; members.set(s.symbol, role === 'OUTPROBE' ? { role, opSys: sys, scanned: new Set() } : { role, opSys: sys }); launchWorker(s.symbol); return s.symbol.slice(-3) + (isProbe(s) ? ':P' : ':T'); };
+
+    for (const sys of OUTPOSTS) {
+      const gw = conns.find((c) => sysOf(c) === sys);
+      if (!gw) { log(`🛰 outpost ${sys} not among hub connections [${conns.map(sysOf).join(', ')}] — skip`); continue; }
+      outposts.set(sys, { sys, gateWp: gw, markets: {}, marketWps: [], loaded: false });
+    }
+    // pass 1 — resume ships already sitting in an outpost system
+    let probesLeft = {}, tradersLeft = {};
+    for (const sys of outposts.keys()) { probesLeft[sys] = OUTPOST_PROBES; tradersLeft[sys] = OUTPOST_TRADERS; }
+    const crews = {}; for (const sys of outposts.keys()) crews[sys] = [];
+    for (const s of all) {
+      if (!free(s)) continue; const sys = s.nav.systemSymbol;
+      if (!outposts.has(sys)) continue;
+      if (isProbe(s) && probesLeft[sys] > 0) { crews[sys].push(assign(s, sys)); probesLeft[sys]--; }
+      else if (isTrader(s) && tradersLeft[sys] > 0) { crews[sys].push(assign(s, sys)); tradersLeft[sys]--; }
+    }
+    // pass 2 — fill remaining slots from idle ships elsewhere (prefer shuttles; keep 80-cargo freighters home/hub)
+    const idleProbes = all.filter((s) => isProbe(s) && free(s));
+    const idleTraders = all.filter((s) => isTrader(s) && free(s)).sort((a, b) => a.cargo.capacity - b.cargo.capacity);
+    let pi = 0, ti = 0;
+    for (const sys of outposts.keys()) {
+      while (tradersLeft[sys] > 0 && ti < idleTraders.length) { crews[sys].push(assign(idleTraders[ti++], sys)); tradersLeft[sys]--; }
+      while (probesLeft[sys] > 0 && pi < idleProbes.length) { crews[sys].push(assign(idleProbes[pi++], sys)); probesLeft[sys]--; }
+      const op = outposts.get(sys);
+      log(`🛰 OUTPOST ${sys} (gate ${id(op.gateWp)}) crew: ${crews[sys].join(' ') || 'NONE (no idle ships)'}`);
+    }
+    outpostsReady = true;
+  }
+
   async function maybeTrigger() {
-    if (!AUTO || triggered) return;
+    if (!AUTO) return;
+    if (triggered) { if (OUTPOSTS.length && !outpostsReady) await setupOutposts(); return; }
     if (!gateBuilt()) return;
     // resolve the target gate from the home gate's connections
     let conns = [];
@@ -378,6 +542,7 @@ export function createExpansion(ctx) {
     triggered = true;
     const roles = [...members].map(([s, m]) => `${s.slice(-3)}:${m.role}`).join(' ');
     log(`🪐🚀 AUTO-EXPAND TRIGGERED → ${target.sys} (gate ${gw ? gw.slice(-3) : '?'}). Migrating: ${roles}. Floor=${FLOOR.toLocaleString()} antimatter~${antimatterPx}.`);
+    await setupOutposts();
   }
 
   function statusBlock() {
@@ -385,8 +550,9 @@ export function createExpansion(ctx) {
       enabled: AUTO, triggered,
       target: target ? target.sys : (WANT_TARGET || 'auto'),
       floor: FLOOR, antimatterPx,
-      members: [...members].map(([s, m]) => ({ ship: s.slice(-3), role: m.role, scanned: m.scanned ? m.scanned.size : undefined, last: m.last })),
+      members: [...members].map(([s, m]) => ({ ship: s.slice(-3), role: m.role, opSys: m.opSys, scanned: m.scanned ? m.scanned.size : undefined, last: m.last })),
       targetMarketsScanned: Object.keys(tgtMarkets).length, targetMarkets: tgtMarketWps.length,
+      outposts: [...outposts.values()].map((o) => ({ sys: o.sys, gate: o.gateWp ? id(o.gateWp) : '?', markets: o.marketWps.length, scanned: Object.keys(o.markets).length })),
     };
   }
 
