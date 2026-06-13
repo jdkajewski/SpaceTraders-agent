@@ -167,7 +167,7 @@ function renderHeader() {
 function renderFooter() {
   const age = (t) => t ? `${Math.max(0, Math.round((Date.now() - t) / 1000))}s` : '—';
   const apiNote = state.apiBusy ? '{yellow-fg}refreshing…{/yellow-fg}' : (state.apiErr ? `{red-fg}api:${esc(state.apiErr)}{/red-fg}` : `api ${age(state.apiAt)} ago`);
-  footer.setContent(` 1-5 page · ↑/↓ scroll · PgUp/PgDn ←/→ paginate · g/G top/bottom · r refresh · q quit  ·  files ${age(state.localAt)} ago · ${apiNote}`);
+  footer.setContent(` {bold}1-5{/bold} page · {bold}j/k{/bold} scroll · {bold}u/d{/bold} page · {bold}h/l{/bold} ◀▶ paginate · {bold}g/G{/bold} top/bot · {bold}r{/bold} refresh · {bold}q{/bold} quit  ·  files ${age(state.localAt)} ago · ${apiNote}`);
 }
 
 // ---- page renderers ----
@@ -378,6 +378,11 @@ screen.key(['q', 'C-c'], () => process.exit(0));
 screen.key(['r'], () => pollApi(true));
 screen.key(['k'], () => { body.scroll(-1); screen.render(); });
 screen.key(['j'], () => { body.scroll(1); screen.render(); });
+// page-scroll on LETTER keys (u/d) — arrows/PgUp/PgDn are eaten by some embedded
+// terminals (e.g. the Copilot terminal canvas), but letters always reach the app.
+const pgLines = () => Math.max(1, ((body.height | 0) || 20) - 2);
+screen.key(['u', 'C-u'], () => { body.scroll(-pgLines()); screen.render(); });
+screen.key(['d', 'C-d'], () => { body.scroll(pgLines()); screen.render(); });
 screen.key(['g'], () => { body.setScroll(0); screen.render(); });
 screen.key(['S-g', 'G'], () => { body.setScrollPerc(100); screen.render(); });
 function paginate(delta) {
