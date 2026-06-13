@@ -141,7 +141,7 @@ const tabs = blessed.box({ parent: screen, top: 1, left: 0, height: 1, width: '1
 const footer = blessed.box({ parent: screen, bottom: 0, left: 0, height: 1, width: '100%', tags: true, style: { fg: 'gray' } });
 const body = blessed.box({
   parent: screen, top: 2, left: 0, bottom: 1, width: '100%', tags: true, scrollable: true, alwaysScroll: true,
-  keys: false, mouse: true, scrollbar: { ch: ' ', style: { bg: 'cyan' } }, padding: { left: 1, right: 1 },
+  keys: true, mouse: true, scrollbar: { ch: ' ', style: { bg: 'cyan' } }, padding: { left: 1, right: 1 },
 });
 
 const PAGES = ['Status', 'Logs', 'Contracts', 'Markets', 'Surveys'];
@@ -369,29 +369,31 @@ async function pollApi(force = false) {
 }
 
 // ---- key bindings ----
-function setPage(n) { page = n; if (n === 2) { state.log.follow = true; } body.setScroll(0); renderAll(); }
+// body has blessed's built-in keys:true → up/down/pageup/pagedown/home/end + mouse-wheel
+// scroll it natively (most robust across terminals). We add page digits, vi keys, and
+// Markets/Surveys pagination on top, and track log-follow from the body 'scroll' event.
+function setPage(n) { page = n; state.log.follow = (n === 2); body.setScroll(0); renderAll(); }
 for (let n = 1; n <= 5; n++) screen.key([String(n)], () => setPage(n));
 screen.key(['q', 'C-c'], () => process.exit(0));
 screen.key(['r'], () => pollApi(true));
-screen.key(['up', 'k'], () => { if (page === 2) state.log.follow = false; body.scroll(-1); screen.render(); });
-screen.key(['down', 'j'], () => { body.scroll(1); if (page === 2) state.log.follow = body.getScrollPerc() >= 100; screen.render(); });
-screen.key(['g'], () => { if (page === 2) state.log.follow = false; body.setScroll(0); screen.render(); });
-screen.key(['S-g', 'G'], () => { if (page === 2) state.log.follow = true; body.setScrollPerc(100); screen.render(); });
+screen.key(['k'], () => { body.scroll(-1); screen.render(); });
+screen.key(['j'], () => { body.scroll(1); screen.render(); });
+screen.key(['g'], () => { body.setScroll(0); screen.render(); });
+screen.key(['S-g', 'G'], () => { body.setScrollPerc(100); screen.render(); });
 function paginate(delta) {
   if (page === 4) { mkIdx += delta; renderAll(); }
   else if (page === 5) { svIdx += delta; renderAll(); }
-  else { if (page === 2 && delta < 0) state.log.follow = false; body.scroll(delta * 10); if (page === 2) state.log.follow = body.getScrollPerc() >= 100; screen.render(); }
+  else { body.scroll(delta * 10); screen.render(); }
 }
-screen.key(['pageup'], () => paginate(-1));
-screen.key(['pagedown'], () => paginate(1));
-screen.key(['left', 'h'], () => { if (page === 4 || page === 5) paginate(-1); });
-screen.key(['right', 'l'], () => { if (page === 4 || page === 5) paginate(1); });
-// mouse wheel: scroll the body (and break log-follow when scrolling up)
-body.on('wheelup', () => { if (page === 2) state.log.follow = false; body.scroll(-3); screen.render(); });
-body.on('wheeldown', () => { body.scroll(3); if (page === 2) state.log.follow = body.getScrollPerc() >= 100; screen.render(); });
+// ←/→ (and h/l) paginate Markets/Surveys; on other pages they do a 10-line jump.
+screen.key(['left', 'h'], () => paginate(-1));
+screen.key(['right', 'l'], () => paginate(1));
+// keep log-follow in sync with whatever moved the scroll (keys, wheel, pagedown-to-bottom)
+body.on('scroll', () => { if (page === 2) state.log.follow = body.getScrollPerc() >= 100; });
 
 // ---- boot ----
 if (process.env.DASH_PAGE) page = Number(process.env.DASH_PAGE) || 1;
+body.focus();
 pollLocal();
 renderAll();
 pollApi(true);
