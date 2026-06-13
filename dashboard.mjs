@@ -171,6 +171,18 @@ function renderFooter() {
 }
 
 // ---- page renderers ----
+function goodPrice(good) {
+  let best = null;
+  for (const [wp, m] of Object.entries(state.markets || {})) {
+    const g = (m.tradeGoods || []).find((x) => x.symbol === good);
+    if (!g) continue;
+    const isExport = (m.exports || []).some((e) => (e.symbol || e) === good);
+    const cand = { wp, buy: g.purchasePrice, sell: g.sellPrice, supply: g.supply, isExport };
+    if (!best || (isExport && !best.isExport) ||
+        (isExport === best.isExport && (g.purchasePrice ?? Infinity) < (best.buy ?? Infinity))) best = cand;
+  }
+  return best;
+}
 function pageStatus() {
   const bs = state.bs, mf = bs.mineFeed || {};
   const out = [];
@@ -184,7 +196,15 @@ function pageStatus() {
     for (const m of state.gate.materials) {
       const pct = m.required ? m.fulfilled / m.required : 0;
       const t = pct >= 1 ? 'green' : pct >= 0.75 ? 'cyan' : pct >= 0.5 ? 'yellow' : 'red';
-      out.push(`  ${cell(m.tradeSymbol, 20)} ${bar(pct, 24, t)} ${cell((pct * 100).toFixed(0) + '%', 4)} {gray-fg}${m.fulfilled}/${m.required}{/gray-fg}`);
+      let priceNote = '';
+      if (pct < 1) {
+        const pr = goodPrice(m.tradeSymbol);
+        if (pr && pr.buy != null) {
+          const supTag = /SCARCE|LIMITED/.test(pr.supply || '') ? 'red' : /MODERATE/.test(pr.supply || '') ? 'yellow' : 'green';
+          priceNote = ` {gray-fg}·{/gray-fg} {gray-fg}buy{/gray-fg} {yellow-fg}${pr.buy.toLocaleString()}{/yellow-fg}{gray-fg}@${esc(SH(pr.wp))}{/gray-fg} ${tag(supTag, pr.supply || '?')}`;
+        }
+      }
+      out.push(`  ${cell(m.tradeSymbol, 20)} ${bar(pct, 24, t)} ${cell((pct * 100).toFixed(0) + '%', 4)} {gray-fg}${m.fulfilled}/${m.required}{/gray-fg}${priceNote}`);
     }
   } else {
     out.push(`{bold}GATE{/bold}  {gray-fg}awaiting live construction…{/gray-fg}`);
@@ -273,7 +293,7 @@ function pageMarkets() {
   if (mkIdx < 0) mkIdx = 0;
   const [wp, m] = entries[mkIdx];
   const out = [];
-  out.push(`{bold}MARKET{/bold} {cyan-fg}${esc(SH(wp))}{/cyan-fg} {gray-fg}(${mkIdx + 1}/${entries.length})  ←/→ or PgUp/PgDn to page{/gray-fg}`);
+  out.push(`{bold}MARKET{/bold} {cyan-fg}${esc(SH(wp))}{/cyan-fg} {gray-fg}(${mkIdx + 1}/${entries.length})  a/d to page{/gray-fg}`);
   const tags = (arr) => (arr || []).map((x) => x.symbol || x).join(', ');
   if (m.exports?.length) out.push(`  {gray-fg}exports{/gray-fg} {green-fg}${esc(tags(m.exports))}{/green-fg}`);
   if (m.imports?.length) out.push(`  {gray-fg}imports{/gray-fg} {yellow-fg}${esc(tags(m.imports))}{/yellow-fg}`);
@@ -296,7 +316,7 @@ function pageSurveys() {
   if (svIdx >= pages) svIdx = pages - 1; if (svIdx < 0) svIdx = 0;
   const slice = sv.slice(svIdx * svPerPage, svIdx * svPerPage + svPerPage);
   const out = [];
-  out.push(`{bold}SURVEYS{/bold} {gray-fg}(page ${svIdx + 1}/${pages}, ${sv.length} events, newest first)  ←/→ or PgUp/PgDn to page{/gray-fg}`);
+  out.push(`{bold}SURVEYS{/bold} {gray-fg}(page ${svIdx + 1}/${pages}, ${sv.length} events, newest first)  a/d to page{/gray-fg}`);
   out.push('{gray-fg}' + cell('AGE', 8) + cell('ASTEROID', 8) + cell('SIZE', 8) + cell('SHIP', 6) + 'DEPOSITS{/gray-fg}');
   const now = Date.now();
   for (const s of slice) {
