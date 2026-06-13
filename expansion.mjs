@@ -38,7 +38,7 @@ export function createExpansion(ctx) {
     navigate, refuel, buy, sell, jump, getShip, getAllShips,
     coords, D, chooseMode, planRoute, record,
     homeSystem, gateWp, gateBuilt, getCredits, reserve, homeMarkets, launchWorker,
-    fuelPx,
+    fuelPx, getShipyards, buyShip,
   } = ctx;
 
   const AUTO = process.env.AUTO_EXPAND === '1';
@@ -66,6 +66,23 @@ export function createExpansion(ctx) {
   const OUTPOST_TRADERS = Number(process.env.EXPAND_OUTPOST_TRADERS || 1);      // local traders per outpost
   const outposts = new Map();          // sys -> { sys, gateWp, markets:{}, marketWps:[], loaded:false }
   let outpostsReady = false;
+
+  // ---- AUTO-BUY (default OFF) -------------------------------------------------
+  // Grow the fleet instead of only reshuffling parked ships: keep every outpost staffed with a local trader and
+  // converge each outpost toward 1:1 probe:market coverage (live data). Existing idle ships are always used FIRST
+  // (setupOutposts/selectMembers); auto-buy only fills the SHORTFALL. New hulls are bought at a HOME shipyard
+  // (our market-sensor probes sit at those waypoints, so a hull is present to satisfy the purchase API), then
+  // assigned an outpost role and migrated out by the same 2-hop state machine. Hard safety: every buy is
+  // FLOOR-guarded (never drop below EXPAND_BUY_FLOOR), lifetime-capped, and throttled to one attempt per window.
+  const AUTOBUY = process.env.EXPAND_AUTOBUY === '1';
+  const BUY_FLOOR = Number(process.env.EXPAND_BUY_FLOOR || 0) || Math.max(FLOOR + 250_000, 700_000); // keep this much cash AFTER any buy
+  const BUY_EVERY_MS = Number(process.env.EXPAND_AUTOBUY_MS || 90_000);         // at most one buy attempt per window
+  const MAX_BUY_PROBES = Number(process.env.EXPAND_MAX_BUY_PROBES || 24);       // lifetime probe buys this run
+  const MAX_BUY_TRADERS = Number(process.env.EXPAND_MAX_BUY_TRADERS || 8);      // lifetime trader/hauler buys this run
+  const PROBE_TARGET_CAP = Number(process.env.EXPAND_PROBE_TARGET || 0);        // per-system probe target; 0 = 1:1 with markets
+  // trader preference: biggest cargo + best range/engine first (gate-capable LIGHT_HAULER beats a 300-fuel shuttle)
+  const TRADER_PREF = (process.env.EXPAND_TRADER_PREF || 'SHIP_HEAVY_FREIGHTER,SHIP_REFINING_FREIGHTER,SHIP_LIGHT_HAULER,SHIP_LIGHT_SHUTTLE,SHIP_COMMAND_FRIGATE').split(',').map((s) => s.trim()).filter(Boolean);
+  let boughtProbes = 0, boughtTraders = 0, lastBuyAt = 0;
 
   let triggered = false;
   let triggerLogged = false;
@@ -523,9 +540,66 @@ export function createExpansion(ctx) {
     outpostsReady = true;
   }
 
+  // Grow the fleet to fill the staffing/coverage SHORTFALL left after setupOutposts exhausted idle ships. One
+  // FLOOR-guarded, lifetime-capped buy attempt per window. Priority: (1) a trader for any trader-starved outpost
+  // (directly earns), then (2) a probe for the most coverage-deficient outpost (cheap, sharpens every lane).
+  async function autoBuy() {
+    if (!AUTOBUY || !triggered || !outpostsReady) return;
+    if (!getShipyards || !buyShip) return;                       // ctx not wired (older bot2)
+    if (now() - lastBuyAt < BUY_EVERY_MS) return;
+    if (boughtProbes >= MAX_BUY_PROBES && boughtTraders >= MAX_BUY_TRADERS) return;
+    let credits; try { credits = getCredits(); } catch { return; }
+    if (credits <= BUY_FLOOR) return;                            // no surplus over the safety floor — never buy
+
+    // current resident staffing per outpost (counts in-transit migrators too, so we never over-order)
+    const probeN = {}, traderN = {};
+    for (const sys of outposts.keys()) { probeN[sys] = 0; traderN[sys] = 0; }
+    for (const [, m] of members) {
+      if (!m.opSys || !outposts.has(m.opSys)) continue;
+      if (m.role === 'OUTPROBE') probeN[m.opSys]++;
+      else if (m.role === 'OUTLIGHT') traderN[m.opSys]++;
+    }
+
+    let yards; try { yards = await getShipyards(); } catch (e) { lastBuyAt = now(); log(`🛒 AUTOBUY shipyard read ERR ${e.message}`); return; }
+
+    // decide ONE action: trader-starved first, else worst probe-coverage gap
+    let action = null;
+    if (boughtTraders < MAX_BUY_TRADERS) {
+      const starved = [...outposts.keys()].find((sys) => traderN[sys] < OUTPOST_TRADERS);
+      if (starved) {
+        const pick = TRADER_PREF.map((t) => (yards[t] ? { type: t, wp: yards[t].wp, price: yards[t].price } : null))
+          .find((y) => y && y.wp && credits - (y.price || 320_000) >= BUY_FLOOR);
+        if (pick) action = { kind: 'trader', role: 'OUTLIGHT', type: pick.type, wp: pick.wp, price: pick.price || 320_000, sys: starved };
+      }
+    }
+    if (!action && boughtProbes < MAX_BUY_PROBES && yards.SHIP_PROBE && yards.SHIP_PROBE.wp) {
+      let worst = null, worstGap = 0;
+      for (const sys of outposts.keys()) {
+        const op = outposts.get(sys);
+        const markets = op.marketWps.length || 0;
+        if (!markets) continue;                                 // unmapped — don't buy probes blind
+        const tgt = PROBE_TARGET_CAP > 0 ? Math.min(markets, PROBE_TARGET_CAP) : markets;
+        const gap = tgt - probeN[sys];
+        if (gap > worstGap) { worstGap = gap; worst = sys; }
+      }
+      const y = yards.SHIP_PROBE, price = y.price || 26_000;
+      if (worst && credits - price >= BUY_FLOOR) action = { kind: 'probe', role: 'OUTPROBE', type: 'SHIP_PROBE', wp: y.wp, price, sys: worst };
+    }
+    if (!action) return;
+
+    lastBuyAt = now();                                          // throttle regardless of outcome (avoid retry spam)
+    let bought; try { bought = await buyShip(action.type, action.wp); } catch (e) { log(`🛒 AUTOBUY ${action.type} @${id(action.wp)} ERR ${e.message}`); return; }
+    if (!bought) { log(`🛒 AUTOBUY ${action.type} @${id(action.wp)} → no hull (retry next window)`); return; }
+    const m = action.role === 'OUTPROBE' ? { role: 'OUTPROBE', opSys: action.sys, scanned: new Set() } : { role: 'OUTLIGHT', opSys: action.sys };
+    members.set(bought, m);
+    launchWorker(bought);
+    if (action.kind === 'trader') { boughtTraders++; log(`🛒 AUTOBUY trader ${action.type} ${id(bought)} @${id(action.wp)} (~${action.price.toLocaleString()}) → ${action.sys} [traders ${traderN[action.sys]}→${traderN[action.sys] + 1}/${OUTPOST_TRADERS}, bought ${boughtTraders}/${MAX_BUY_TRADERS}]`); }
+    else { boughtProbes++; const op = outposts.get(action.sys); log(`🛒 AUTOBUY probe ${id(bought)} @${id(action.wp)} (~${action.price.toLocaleString()}) → ${action.sys} [probes ${probeN[action.sys]}→${probeN[action.sys] + 1}/${op.marketWps.length || '?'}, bought ${boughtProbes}/${MAX_BUY_PROBES}]`); }
+  }
+
   async function maybeTrigger() {
     if (!AUTO) return;
-    if (triggered) { if (OUTPOSTS.length && !outpostsReady) await setupOutposts(); return; }
+    if (triggered) { if (OUTPOSTS.length && !outpostsReady) await setupOutposts(); await autoBuy(); return; }
     if (!gateBuilt()) return;
     // resolve the target gate from the home gate's connections
     let conns = [];
@@ -553,6 +627,7 @@ export function createExpansion(ctx) {
       members: [...members].map(([s, m]) => ({ ship: s.slice(-3), role: m.role, opSys: m.opSys, scanned: m.scanned ? m.scanned.size : undefined, last: m.last })),
       targetMarketsScanned: Object.keys(tgtMarkets).length, targetMarkets: tgtMarketWps.length,
       outposts: [...outposts.values()].map((o) => ({ sys: o.sys, gate: o.gateWp ? id(o.gateWp) : '?', markets: o.marketWps.length, scanned: Object.keys(o.markets).length })),
+      autobuy: { enabled: AUTOBUY, floor: BUY_FLOOR, boughtProbes, boughtTraders, capProbes: MAX_BUY_PROBES, capTraders: MAX_BUY_TRADERS },
     };
   }
 

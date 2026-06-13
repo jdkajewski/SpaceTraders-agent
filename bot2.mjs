@@ -2840,6 +2840,8 @@ async function main() {
       homeMarkets: () => marketCache.data || {},
       fuelPx: () => FUEL_PX,
       launchWorker,
+      getShipyards,
+      buyShip: buyMiningShip,   // generic POST /my/ships {shipType, waypointSymbol} — name is historical
     });
     log(`🪐 AUTO_EXPAND armed — will migrate ships through the gate once it is BUILT (target ${process.env.EXPAND_TARGET_SYSTEM || 'auto'}).`);
   }
