@@ -963,11 +963,19 @@ function contractWorthIt(shipSym, ship, ci, markets) {
 async function contractRunnerTrip(shipSym, ship, markets) {
   const ci = activeContractInfo;
   if (!ci || ci.units <= 0) { if (DBG_CONTRACT && ship.cargo.capacity >= 40) log(`ctr? ${shipSym.slice(-3)} no-active-contract (ci=${ci ? ci.good + ':' + ci.units : 'null'})`); return false; }
-  // Cross-system delivery (e.g. an X1-PP48 dest after the gate opened): the home fleet can't navigate there, so
-  // never source/haul it — fall through to trading. Log once so the wedge is visible. (Fulfilment of these is the
-  // expansion hauler's job — TODO in expansion.mjs.) An already-held contract good is handled below via reconcile.
-  if (!contractHomeDeliverable(ci) && cargoUnits(ship, ci.good) <= 0) {
+  // Cross-system delivery (e.g. an X1-PP48 dest after the gate opened): the home fleet can't navigate there.
+  if (!contractHomeDeliverable(ci)) {
     if (warnedCrossSysContract !== ci.id) { warnedCrossSysContract = ci.id; log(`⛔ contract ${ci.id.slice(-6)} ${ci.good}→${ci.dest} is CROSS-SYSTEM (${sysOf(ci.dest)}≠${SYSTEM}); home fleet can't deliver → slot parked until deadline (expansion-hauler fulfilment is the proper fix)`); }
+    // If this hull already SOURCED the contract good (from a run before the guard existed), it can't deliver it →
+    // salvage-sell it at the best home sink so the ship + capital aren't stranded looping on a 400 cross-sys nav.
+    const held = cargoUnits(ship, ci.good);
+    if (held > 0) {
+      try {
+        const sink = bestSink(markets, ci.good);
+        if (sink) { if (sink.wp !== ship.nav.waypointSymbol) await goTo(shipSym, sink.wp); const s = await sell(shipSym, ci.good); log(`⤓ ${shipSym.slice(-3)} salvaged ${held} ${ci.good} from cross-sys contract (+${(s.got || 0).toLocaleString()})`); }
+      } catch (e) { log(`${shipSym.slice(-3)} cross-sys contract salvage ERR ${e.message}`); }
+      if (contractOwner && contractOwner.id === ci.id && contractOwner.ship === shipSym) contractOwner = null;
+    }
     return false;
   }
   if (contractOwner && contractOwner.id === ci.id && contractOwner.ship !== shipSym) return false;  // another ship owns it
