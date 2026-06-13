@@ -88,8 +88,11 @@ async function navigate(sym, dest, mode = 'CRUISE') {
   }
 }
 
+// Derive the system from the waypoint symbol (X1-PP30-A4 → X1-PP30) so buy/sell work in ANY system
+// (home or a jumped-to expansion system), not just the hardcoded SYSTEM. Home behavior is unchanged.
+const sysOf = (wp) => wp.split('-').slice(0, 2).join('-');
 async function marketGood(wp, symbol) {
-  const m = (await api('GET', `/systems/${SYSTEM}/waypoints/${wp}/market`)).data;
+  const m = (await api('GET', `/systems/${sysOf(wp)}/waypoints/${wp}/market`)).data;
   return m.tradeGoods?.find((g) => g.symbol === symbol);
 }
 
@@ -155,6 +158,22 @@ async function fulfill(sym, contractId) {
   return r.data;
 }
 
+// Jump a ship through a BUILT jump gate to a CONNECTED gate waypoint in another system.
+// Authoritative v2 mechanic: POST /my/ships/{sym}/jump { waypointSymbol }. The ship must be IN ORBIT;
+// a single unit of ANTIMATTER is auto-purchased+consumed from the market (a credit cost, returned in
+// `transaction`); a cooldown then applies to the ship. Returns the full data block (nav/cooldown/
+// transaction/agent) so the caller can learn the antimatter price + honor the cooldown.
+async function jump(sym, destGateWp) {
+  const ship = await getShip(sym);
+  if (ship.nav.status === 'DOCKED') { await api('POST', `/my/ships/${sym}/orbit`); }
+  else if (ship.nav.status === 'IN_TRANSIT') await waitArrival(sym, ship);
+  const r = await api('POST', `/my/ships/${sym}/jump`, { waypointSymbol: destGateWp });
+  const cost = r.data.transaction?.totalPrice;
+  const cd = r.data.cooldown?.remainingSeconds;
+  log(`${sym} JUMPED → ${destGateWp} (antimatter ${cost ?? '?'}cr, cooldown ${cd ?? '?'}s, credits ${r.data.agent?.credits})`);
+  return r.data;
+}
+
 async function runPlan(plan) {
   const sym = plan.ship;
   let totalSpent = 0, totalGot = 0;
@@ -171,7 +190,7 @@ async function runPlan(plan) {
   return { sym, totalSpent, totalGot, net: totalGot - totalSpent };
 }
 
-export { runPlan, navigate, buy, sell, refuel, transfer, deliver, fulfill, getShip };
+export { runPlan, navigate, buy, sell, refuel, transfer, deliver, fulfill, getShip, jump };
 
 async function runPlans(plans) {
   const results = await Promise.allSettled(plans.map((p) => runPlan(p)));

@@ -15,7 +15,8 @@
 //  Run:  node bot.mjs       Stop: touch STOP (graceful) or kill PID
 // ============================================================================
 import { api, getAllShips, getAllContracts, reqStats } from './st.mjs';
-import { navigate, buy, sell, deliver, fulfill, getShip, refuel, transfer } from './trade.mjs';
+import { navigate, buy, sell, deliver, fulfill, getShip, refuel, transfer, jump } from './trade.mjs';
+import { createExpansion } from './expansion.mjs';
 import fs from 'node:fs';
 
 const SYSTEM = 'X1-PP30';
@@ -231,6 +232,11 @@ const isGateHauler = (s) => { for (const h of GATE_HAULERS) { if (s === h || s.e
 // the smallest held quantity worth a dedicated run (a FULL hold always triggers — it can't trade anyway).
 const ORPHAN_GATE_DELIVERY = process.env.ORPHAN_GATE_DELIVERY !== '0';
 const ORPHAN_MIN_UNITS = Number(process.env.ORPHAN_MIN_UNITS || 5);
+// [AUTO_EXPAND] YOLO inter-system expansion (default OFF). When the home gate is BUILT, migrate a hauler +
+// light + idle probes through it and run inter-system arbitrage. Instantiated in main() (needs runtime
+// closures over gateCache/cachedCredits/etc.). With the flag off, `expansion` stays null and nothing changes.
+const AUTO_EXPAND = process.env.AUTO_EXPAND === '1';
+let expansion = null;
 let expansionTarget = CREDIT_TARGET || 8_000_000;             // recomputed live when DYNAMIC_TARGET
 // Operating reserve = guesstimate of near-term needs: FUEL to keep the whole fleet
 // moving + GOODS working capital (a cushion of cargo buys). Recomputed from the live
@@ -2327,6 +2333,13 @@ async function worker(shipSym) {
     try { ship = (await api('GET', `/my/ships/${shipSym}`)).data; } catch { await sleep(IDLE_WAIT_MS); continue; }
     const markets = await getMarkets();
 
+    // [AUTO_EXPAND] Migrated ships are fully owned by the expansion subsystem: it drives their cross-system
+    // arbitrage / local trading / scouting and manages their cargo. Route them here BEFORE recovery (so their
+    // in-flight goods aren't salvage-sold) and before any home role. Wrapped so a member can never crash the fleet.
+    if (expansion && expansion.isMember(shipSym)) {
+      await expansion.step(shipSym, ship);
+      continue;
+    }
     // [REPAIR] Two-tier ship maintenance (default OFF). Runs in the ship's OWN loop so it never races an external
     // manager for control. Forced (integrity critical) diverts to a shipyard; opportunistic (worn) only fires when
     // already at one. Acted → re-loop with fresh state.
@@ -2543,7 +2556,7 @@ function writeStatus() {
   if (now() - lastStatusAt < 4000) return; lastStatusAt = now();
   const ships = Object.entries(perShip).map(([s, v]) => ({ ship: s.slice(-3), net: v.net, projected: v.projected || 0, lanes: v.lanes, doing: v.last, route: fleetRoutes[s.slice(-3)] || null }));
   const inFlightProjected = ships.reduce((a, s) => a + (s.projected || 0), 0);   // expected net of trades currently mid-flight
-  fs.writeFileSync(here('./bot-status.json'), JSON.stringify({ updated: new Date().toISOString(), phase: currentPhase.name, phaseDesc: currentPhase.desc, runNet: totalNet, inFlightProjected, projectedTotal: totalNet + inFlightProjected, lanesRun, goal: expansionTarget, goalBreakdown: targetBreakdown, credits: cachedCredits, reserve: OPERATING_RESERVE, committed, growthBudget: growthBudget(), gate: { exists: gateCache.exists, built: gateCache.built, known: gateCache.known, remaining: gateCache.remaining, haulers: [...GATE_HAULERS], supplying: gateSupplyActive() && gateCreditOk(), buyPaused: gateBuyPaused, creditFloor: GATE_CREDIT_FLOOR, creditResume: GATE_CREDIT_RESUME }, inputFeed: { enabled: INPUT_FEED, active: inputFeedActive(), feeders: [...INPUT_FEEDERS], busy: [...inputActiveFeeders].map((s) => s.slice(-3)) }, mineFeed: { enabled: MINE_FEED, feeders: [...MINE_FEEDERS], busy: [...mineActive].map((s) => s.slice(-3)), good: MINE_GOOD || 'auto', site: mineSite, refiner: refinerSym && refinerSym.slice(-3), transport: [...MINE_TRANSPORT] }, ships }, null, 1));
+  fs.writeFileSync(here('./bot-status.json'), JSON.stringify({ updated: new Date().toISOString(), phase: currentPhase.name, phaseDesc: currentPhase.desc, runNet: totalNet, inFlightProjected, projectedTotal: totalNet + inFlightProjected, lanesRun, goal: expansionTarget, goalBreakdown: targetBreakdown, credits: cachedCredits, reserve: OPERATING_RESERVE, committed, growthBudget: growthBudget(), gate: { exists: gateCache.exists, built: gateCache.built, known: gateCache.known, remaining: gateCache.remaining, haulers: [...GATE_HAULERS], supplying: gateSupplyActive() && gateCreditOk(), buyPaused: gateBuyPaused, creditFloor: GATE_CREDIT_FLOOR, creditResume: GATE_CREDIT_RESUME }, inputFeed: { enabled: INPUT_FEED, active: inputFeedActive(), feeders: [...INPUT_FEEDERS], busy: [...inputActiveFeeders].map((s) => s.slice(-3)) }, mineFeed: { enabled: MINE_FEED, feeders: [...MINE_FEEDERS], busy: [...mineActive].map((s) => s.slice(-3)), good: MINE_GOOD || 'auto', site: mineSite, refiner: refinerSym && refinerSym.slice(-3), transport: [...MINE_TRANSPORT] }, expand: expansion ? expansion.statusBlock() : { enabled: false }, ships }, null, 1));
   const rows = ships.sort((a, b) => b.net - a.net).map((s) => `| ${s.ship} | ${s.net.toLocaleString()} | ${(s.projected || 0) ? '+' + s.projected.toLocaleString() : '—'} | ${s.lanes} | ${s.doing} |`).join('\n');
   const block = `\n\n## 🤖 AUTOTRADER v2 live (continuous)\n_run net **+${totalNet.toLocaleString()}** + in-flight projected **+${inFlightProjected.toLocaleString()}** · updated ${new Date().toISOString().slice(11, 19)}_\n\n| Ship | Run net | In-flight proj | Lanes | Last/now |\n|---|---:|---:|---:|---|\n${rows}\n`;
   const base = fs.readFileSync(here('./tracker.md'), 'utf8').split('\n## 🤖 AUTOTRADER')[0];
@@ -2609,6 +2622,8 @@ async function targetWatch() {
     // surface gate progress changes (shared site — other agents may build it, dropping our cost)
     const gstate = JSON.stringify(targetBreakdown.gateBuilt) + (targetBreakdown.gateMaterials ?? '');
     if (gstate !== lastGateState) { lastGateState = gstate; log(`🛰 gate status: built=${targetBreakdown.gateBuilt} materials-cost=${(targetBreakdown.gateMaterials||0).toLocaleString()} → goal ${expansionTarget.toLocaleString()}`); }
+    // [AUTO_EXPAND] As soon as the gate is BUILT, trigger the one-time migration (self-gates on gateBuilt + flag).
+    if (expansion) { try { await expansion.maybeTrigger(); } catch (e) { log(`🪐 maybeTrigger ERR ${e.message}`); } }
     if (cachedCredits >= expansionTarget && targetBreakdown.gateStatusKnown) {
       // [A] Only stop when the gate status is actually KNOWN. An unknown/unreachable gate
       // (outage) leaves gateStatusKnown=false → never a phantom EXPANSION-READY stop.
@@ -2617,6 +2632,9 @@ async function targetWatch() {
       // gate is built (by us or the shared system), the credit goal becomes the meaningful stop.
       if (GATE_SUPPLY && gateCache.exists && !gateCache.built) {
         log(`🎯 cost-to-expand met (${cachedCredits.toLocaleString()} ≥ ${expansionTarget.toLocaleString()}) but gate UNBUILT — continuing to trade + supply the gate (${Object.entries(gateCache.remaining).map(([k, v]) => `${v}× ${k}`).join(', ') || 'finalizing'})`);
+      } else if (AUTO_EXPAND) {
+        // YOLO mode: do NOT halt at the credit goal. Keep the home fleet trading AND run the inter-system
+        // expansion (migrated ships trade across the gate). The run only ends on STOP.
       } else {
         log(`🎯 EXPANSION-READY: credits ${cachedCredits.toLocaleString()} ≥ cost-to-expand ${expansionTarget.toLocaleString()} ${JSON.stringify(targetBreakdown)}`);
         stop = true; break;
@@ -2806,6 +2824,25 @@ async function main() {
   fleetSize = traders.length;            // [PHASE] feed determinePhase before the loops/targetWatch start
   currentPhase = determinePhase();
   log(`🧭 phase ${currentPhase.name} — ${currentPhase.desc}`);
+  // [AUTO_EXPAND] Build the expansion subsystem with runtime closures over live state. Inert unless AUTO_EXPAND=1
+  // AND the gate is built (maybeTrigger self-gates). Members are routed at the top of worker(); probes get their
+  // own supervised workers (they're excluded from the home `traders` pool).
+  if (AUTO_EXPAND) {
+    expansion = createExpansion({
+      api, log, sleep, now,
+      navigate, refuel, buy, sell, jump, getShip, getAllShips,
+      coords, D, chooseMode, planRoute, record,
+      homeSystem: SYSTEM,
+      gateWp: () => gateCache.wp,
+      gateBuilt: () => gateCache.built,
+      getCredits: () => cachedCredits,
+      reserve: () => OPERATING_RESERVE,
+      homeMarkets: () => marketCache.data || {},
+      fuelPx: () => FUEL_PX,
+      launchWorker,
+    });
+    log(`🪐 AUTO_EXPAND armed — will migrate ships through the gate once it is BUILT (target ${process.env.EXPAND_TARGET_SYSTEM || 'auto'}).`);
+  }
   // [RULE: keep-fleet-alive] supervise hoisted to module scope (see above). Register initial hulls so MINE_EXPAND
   // never double-spawns one, and keep their supervised promises in `tasks` so Promise.all keeps the process alive.
   const tasks = traders.map((s) => { launchedWorkers.add(s.symbol); return supervise(s.symbol); });
