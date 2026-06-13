@@ -38,7 +38,7 @@ export function createExpansion(ctx) {
     navigate, refuel, buy, sell, jump, getShip, getAllShips,
     coords, D, chooseMode, planRoute, record,
     homeSystem, gateWp, gateBuilt, getCredits, reserve, homeMarkets, launchWorker,
-    fuelPx, getShipyards, buyShip,
+    fuelPx, getShipyards, buyShip, negotiator,
   } = ctx;
 
   const AUTO = process.env.AUTO_EXPAND === '1';
@@ -507,6 +507,9 @@ export function createExpansion(ctx) {
     const reserved = new Set();
     for (const k of ['GATE_HAULERS', 'INPUT_FEEDERS', 'MINE_TRANSPORT', 'MINE_FUNNEL', 'MINE_BATCH', 'CONTRACT_RUNNER', 'NEGOTIATOR', 'CONTRACT_NEGOTIATOR', 'EXPAND_HAULERS', 'EXPAND_LIGHT', 'EXPAND_PROBES'])
       for (const t of listEnv(k)) reserved.add(t);
+    // also reserve the resolved contract negotiator (its bot2 DEFAULT isn't visible via env) — never poach it,
+    // or contracts stall with "ship not docked" errors. Passed from bot2 ctx as negotiator().
+    try { const neg = typeof negotiator === 'function' ? negotiator() : null; if (neg) reserved.add(neg); } catch {}
     const isReserved = (s) => [...reserved].some((t) => s.symbol === t || s.symbol.endsWith('-' + t));  // never poach a home-role ship
     const free = (s) => !members.has(s.symbol) && !isReserved(s);
     const isTrader = (s) => !isProbe(s) && s.cargo.capacity >= 20 && s.fuel.capacity >= 200 && !/MINING_LASER|SURVEYOR/.test(JSON.stringify(s.mounts || []));
@@ -543,9 +546,46 @@ export function createExpansion(ctx) {
   // Grow the fleet to fill the staffing/coverage SHORTFALL left after setupOutposts exhausted idle ships. One
   // FLOOR-guarded, lifetime-capped buy attempt per window. Priority: (1) a trader for any trader-starved outpost
   // (directly earns), then (2) a probe for the most coverage-deficient outpost (cheap, sharpens every lane).
+  // Per-system shipyard discovery (cached 10min): array of { wp, sells:Set<type>, price:{type:px} }. Used to buy
+  // LOCALLY in an outpost's own system (no 2-hop migration) and only where we have a ship present (purchase API).
+  const sysYardCache = new Map();
+  async function shipyardsIn(sys) {
+    const c = sysYardCache.get(sys);
+    if (c && now() - c.at < 600_000) return c.list;
+    const list = [];
+    try {
+      const wps = (await api('GET', `/systems/${sys}/waypoints?limit=20&traits=SHIPYARD`)).data || [];
+      for (const w of wps) {
+        try {
+          const sy = (await api('GET', `/systems/${sys}/waypoints/${w.symbol}/shipyard`)).data;
+          const sells = new Set(), price = {};
+          for (const s of sy.ships || []) { sells.add(s.type); if (s.purchasePrice != null) price[s.type] = s.purchasePrice; }
+          for (const t of sy.shipTypes || []) sells.add(t.type);
+          list.push({ wp: w.symbol, sells, price });
+        } catch {}
+      }
+    } catch {}
+    sysYardCache.set(sys, { at: now(), list });
+    return list;
+  }
+
+  // Pick where to buy `type`: walk `prefSys` in order (outpost-local first → home fallback), require one of our
+  // ships PRESENT at the yard waypoint (the purchase API needs it) so the buy actually succeeds. Returns
+  // { wp, price, sys, local } or null. `shipWps` = waypoints where we currently have a non-transit ship.
+  async function pickBuy(type, prefSys, shipWps) {
+    for (const sys of prefSys) {
+      if (!sys) continue;
+      let list; try { list = await shipyardsIn(sys); } catch { continue; }
+      const sell = list.filter((y) => y.sells.has(type));
+      const here = sell.find((y) => shipWps.has(y.wp));         // a yard that sells it AND has our ship docked/in-orbit
+      if (here) return { wp: here.wp, price: here.price[type] ?? null, sys, local: sys !== homeSystem };
+    }
+    return null;
+  }
+
   async function autoBuy() {
     if (!AUTOBUY || !triggered || !outpostsReady) return;
-    if (!getShipyards || !buyShip) return;                       // ctx not wired (older bot2)
+    if (!buyShip) return;                                        // ctx not wired (older bot2)
     if (now() - lastBuyAt < BUY_EVERY_MS) return;
     if (boughtProbes >= MAX_BUY_PROBES && boughtTraders >= MAX_BUY_TRADERS) return;
     let credits; try { credits = getCredits(); } catch { return; }
@@ -560,19 +600,24 @@ export function createExpansion(ctx) {
       else if (m.role === 'OUTLIGHT') traderN[m.opSys]++;
     }
 
-    let yards; try { yards = await getShipyards(); } catch (e) { lastBuyAt = now(); log(`🛒 AUTOBUY shipyard read ERR ${e.message}`); return; }
+    // waypoints where we have a ship present right now (purchase needs a hull at the yard)
+    let shipWps;
+    try { shipWps = new Set((await getAllShips()).filter((s) => s.nav.status !== 'IN_TRANSIT').map((s) => s.nav.waypointSymbol)); }
+    catch (e) { lastBuyAt = now(); log(`🛒 AUTOBUY fleet read ERR ${e.message}`); return; }
 
-    // decide ONE action: trader-starved first, else worst probe-coverage gap
+    // decide ONE action: trader-starved outpost first (earns), else worst probe-coverage gap (sharpens lanes).
+    // Buy LOCAL to the needy system when possible (prefSys = [sys, home]) → no migration, ship already on-site.
     let action = null;
     if (boughtTraders < MAX_BUY_TRADERS) {
       const starved = [...outposts.keys()].find((sys) => traderN[sys] < OUTPOST_TRADERS);
       if (starved) {
-        const pick = TRADER_PREF.map((t) => (yards[t] ? { type: t, wp: yards[t].wp, price: yards[t].price } : null))
-          .find((y) => y && y.wp && credits - (y.price || 320_000) >= BUY_FLOOR);
-        if (pick) action = { kind: 'trader', role: 'OUTLIGHT', type: pick.type, wp: pick.wp, price: pick.price || 320_000, sys: starved };
+        for (const t of TRADER_PREF) {                          // best hull first
+          const loc = await pickBuy(t, [starved, homeSystem], shipWps);
+          if (loc && credits - (loc.price || 320_000) >= BUY_FLOOR) { action = { kind: 'trader', role: 'OUTLIGHT', type: t, wp: loc.wp, price: loc.price || 320_000, sys: starved, local: loc.local }; break; }
+        }
       }
     }
-    if (!action && boughtProbes < MAX_BUY_PROBES && yards.SHIP_PROBE && yards.SHIP_PROBE.wp) {
+    if (!action && boughtProbes < MAX_BUY_PROBES) {
       let worst = null, worstGap = 0;
       for (const sys of outposts.keys()) {
         const op = outposts.get(sys);
@@ -582,8 +627,11 @@ export function createExpansion(ctx) {
         const gap = tgt - probeN[sys];
         if (gap > worstGap) { worstGap = gap; worst = sys; }
       }
-      const y = yards.SHIP_PROBE, price = y.price || 26_000;
-      if (worst && credits - price >= BUY_FLOOR) action = { kind: 'probe', role: 'OUTPROBE', type: 'SHIP_PROBE', wp: y.wp, price, sys: worst };
+      if (worst) {
+        const loc = await pickBuy('SHIP_PROBE', [worst, homeSystem], shipWps);
+        const price = loc ? (loc.price || 26_000) : 0;
+        if (loc && credits - price >= BUY_FLOOR) action = { kind: 'probe', role: 'OUTPROBE', type: 'SHIP_PROBE', wp: loc.wp, price, sys: worst, local: loc.local };
+      }
     }
     if (!action) return;
 
@@ -593,8 +641,9 @@ export function createExpansion(ctx) {
     const m = action.role === 'OUTPROBE' ? { role: 'OUTPROBE', opSys: action.sys, scanned: new Set() } : { role: 'OUTLIGHT', opSys: action.sys };
     members.set(bought, m);
     launchWorker(bought);
-    if (action.kind === 'trader') { boughtTraders++; log(`🛒 AUTOBUY trader ${action.type} ${id(bought)} @${id(action.wp)} (~${action.price.toLocaleString()}) → ${action.sys} [traders ${traderN[action.sys]}→${traderN[action.sys] + 1}/${OUTPOST_TRADERS}, bought ${boughtTraders}/${MAX_BUY_TRADERS}]`); }
-    else { boughtProbes++; const op = outposts.get(action.sys); log(`🛒 AUTOBUY probe ${id(bought)} @${id(action.wp)} (~${action.price.toLocaleString()}) → ${action.sys} [probes ${probeN[action.sys]}→${probeN[action.sys] + 1}/${op.marketWps.length || '?'}, bought ${boughtProbes}/${MAX_BUY_PROBES}]`); }
+    const where = action.local ? `LOCAL @${action.sys.slice(-4)}` : 'home→migrate';
+    if (action.kind === 'trader') { boughtTraders++; log(`🛒 AUTOBUY trader ${action.type} ${id(bought)} @${id(action.wp)} (~${action.price.toLocaleString()}) → ${action.sys} [${where}; traders ${traderN[action.sys]}→${traderN[action.sys] + 1}/${OUTPOST_TRADERS}, bought ${boughtTraders}/${MAX_BUY_TRADERS}]`); }
+    else { boughtProbes++; const op = outposts.get(action.sys); log(`🛒 AUTOBUY probe ${id(bought)} @${id(action.wp)} (~${action.price.toLocaleString()}) → ${action.sys} [${where}; probes ${probeN[action.sys]}→${probeN[action.sys] + 1}/${op.marketWps.length || '?'}, bought ${boughtProbes}/${MAX_BUY_PROBES}]`); }
   }
 
   async function maybeTrigger() {

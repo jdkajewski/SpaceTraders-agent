@@ -2842,6 +2842,7 @@ async function main() {
       launchWorker,
       getShipyards,
       buyShip: buyMiningShip,   // generic POST /my/ships {shipType, waypointSymbol} — name is historical
+      negotiator: () => NEGOTIATOR,   // reserve the contract negotiator so expansion never poaches it
     });
     log(`🪐 AUTO_EXPAND armed — will migrate ships through the gate once it is BUILT (target ${process.env.EXPAND_TARGET_SYSTEM || 'auto'}).`);
   }
