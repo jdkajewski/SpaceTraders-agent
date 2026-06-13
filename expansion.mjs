@@ -52,6 +52,8 @@ export function createExpansion(ctx) {
   const PROBE_DWELL_MS = Number(process.env.EXPAND_PROBE_DWELL_MS || 90_000);
   const SCAN_TTL_MS = Number(process.env.EXPAND_SCAN_TTL_MS || 120_000);
   let antimatterPx = Number(process.env.EXPAND_JUMP_COST || 12_000);            // est. for scoring; LEARNED from real jumps
+  let jumpCooldownMin = Number(process.env.EXPAND_JUMP_COOLDOWN_MIN || 8.2);    // est. cross-system jump dead-time; LEARNED from real cooldowns
+  const OP_OVERHEAD_MIN = Number(process.env.EXPAND_OP_OVERHEAD_MIN || 1.5);    // buy+sell market handling baked into every lane
 
   let triggered = false;
   let triggerLogged = false;
@@ -105,10 +107,23 @@ export function createExpansion(ctx) {
     return cr;
   }
 
+  // estimated minutes for a within-system trip (reuses the real chooseMode time model); null if not tank-reachable
+  function routeMins(from, to, ship, mkts) {
+    if (from === to) return 0;
+    const path = planRoute(from, to, ship.fuel.capacity, mkts);
+    if (!path) return null;
+    let cur = from, secs = 0;
+    for (const h of path) { secs += (chooseMode(D(cur, h), ship).time || 0); cur = h; }
+    return secs / 60;
+  }
+
   // within-system multi-hop nav (refuel-hop in CRUISE/BURN; never cross-system — callers guarantee same sys)
   async function goToSys(sym, dest, mkts) {
     let ship = await getShip(sym);
     if (ship.nav.waypointSymbol === dest && ship.nav.status !== 'IN_TRANSIT') return;
+    if (sysOf(dest) !== sysOf(ship.nav.waypointSymbol)) {                         // guard: cross-system moves are jumps, not navigate
+      log(`🪐 ${id(sym)} skip nav ${id(dest)} — different system than ${id(ship.nav.waypointSymbol)} (cross = jump only)`); return;
+    }
     const path = planRoute(ship.nav.waypointSymbol, dest, ship.fuel.capacity, mkts) || [dest];
     for (const hop of path) { ship = await getShip(sym); await navigate(sym, hop, chooseMode(D(ship.nav.waypointSymbol, hop), ship).mode); }
   }
@@ -149,18 +164,23 @@ export function createExpansion(ctx) {
           if (!dg) continue;
           const units = Math.min(sg.tradeVolume, dg.tradeVolume, capFree, affordable(sg.purchasePrice));
           if (units <= 0) continue;
-          let fuelCr, jumpCr = 0;
+          let fuelCr, jumpCr = 0, mins;
           if (!crossing) {
             const fc = routeFuelCr(srcWp, dstWp, ship, srcMkts); if (fc === null) continue; fuelCr = fc;
+            mins = routeMins(srcWp, dstWp, ship, srcMkts); if (mins === null) continue;
           } else {
             const f1 = routeFuelCr(srcWp, crossing.srcGate, ship, srcMkts);
             const f2 = routeFuelCr(crossing.dstGate, dstWp, ship, dstMkts);
             if (f1 === null || f2 === null) continue;                            // either leg would strand → skip
-            fuelCr = f1 + f2; jumpCr = antimatterPx;
+            const m1 = routeMins(srcWp, crossing.srcGate, ship, srcMkts);
+            const m2 = routeMins(crossing.dstGate, dstWp, ship, dstMkts);
+            if (m1 === null || m2 === null) continue;
+            fuelCr = f1 + f2; jumpCr = antimatterPx; mins = m1 + m2 + jumpCooldownMin; // gate legs + jump dead-time
           }
           const net = (dg.sellPrice - sg.purchasePrice) * units - fuelCr - jumpCr;
           if (net < MIN_NET) continue;
-          if (!best || net > best.net) best = { good: sg.symbol, srcWp, dstWp, buyPx: sg.purchasePrice, sellPx: dg.sellPrice, units, net, crossing: !!crossing };
+          const rate = net / Math.max(mins + OP_OVERHEAD_MIN, 0.5);              // credits/min — the real money metric (time-aware)
+          if (!best || rate > best.rate) best = { good: sg.symbol, srcWp, dstWp, buyPx: sg.purchasePrice, sellPx: dg.sellPrice, units, net, mins, rate, crossing: !!crossing };
         }
       }
     }
@@ -189,6 +209,19 @@ export function createExpansion(ctx) {
     }
   }
 
+  // help discover the new system faster: scan the nearest stale/unscanned market (shared freshness, so ships divide work)
+  async function helpScan(sym, ship) {
+    await loadTargetSystem(target.sys);
+    const here = ship.nav.waypointSymbol;
+    const todo = tgtMarketWps.filter((w) => !tgtMarkets[w] || now() - tgtMarkets[w].at > SCAN_TTL_MS);
+    if (!todo.length) return false;
+    todo.sort((a, b) => D(here, a) - D(here, b));
+    const dest = todo[0];
+    try { await goToSys(sym, dest, tgtMarkets); await scanMarket(dest); log(`🛰 ${id(sym)} scanned ${id(dest)} (${Object.keys(tgtMarkets).length}/${tgtMarketWps.length})`); }
+    catch (e) { log(`🛰 ${id(sym)} scout ERR ${e.message}`); }
+    return true;
+  }
+
   async function stepProbe(sym, ship) {
     const cur = sysOf(ship.nav.waypointSymbol);
     if (cur === homeSystem && target.sys !== homeSystem) { await ensureAtTargetThenJump(sym, ship); return; }
@@ -213,7 +246,10 @@ export function createExpansion(ctx) {
     await scanAllTargets();
     if (await dumpCargo(sym, ship, cur, tgtMarkets)) return;
     const lane = bestLane(ship, tgtMarkets, cur, tgtMarkets, cur, null);
-    if (!lane) { members.get(sym).last = 'parked (no local lane)'; await sleep(SLEEP_MS); return; }
+    if (!lane) {                                                                 // no local lane yet → help scan the system instead of idling
+      if (await helpScan(sym, ship)) { members.get(sym).last = 'scanning (no local lane)'; return; }
+      members.get(sym).last = 'parked (no local lane)'; await sleep(SLEEP_MS); return;
+    }
     await runLane(sym, ship, lane, tgtMarkets, tgtMarkets, null);
   }
 
@@ -233,7 +269,7 @@ export function createExpansion(ctx) {
     // 2) LOCAL lane here
     const local = bestLane(ship, srcMkts, cur, srcMkts, cur, null);
 
-    if (cross && (!local || cross.net >= local.net)) { await runLane(sym, ship, cross, srcMkts, otherMkts, { srcGate, dstGate }); return; }
+    if (cross && (!local || cross.rate >= local.rate)) { await runLane(sym, ship, cross, srcMkts, otherMkts, { srcGate, dstGate }); return; }
     if (local) { await runLane(sym, ship, local, srcMkts, srcMkts, null); return; }
 
     // 3) nothing here: if we're stranded in the target with no lane but HOME has markets, reposition home (empty jump)
@@ -257,7 +293,7 @@ export function createExpansion(ctx) {
   // execute a chosen lane. crossing={srcGate,dstGate} for inter-system; null for local.
   async function runLane(sym, ship, lane, srcMkts, dstMkts, crossing) {
     const tag = crossing ? 'X-SYS' : 'local';
-    log(`🪐 ${id(sym)} ${tag} ${lane.units} ${lane.good} ${id(lane.srcWp)}@${lane.buyPx}→${id(lane.dstWp)}@${lane.sellPx} est net=${Math.round(lane.net).toLocaleString()}`);
+    log(`🪐 ${id(sym)} ${tag} ${lane.units} ${lane.good} ${id(lane.srcWp)}@${lane.buyPx}→${id(lane.dstWp)}@${lane.sellPx} est net=${Math.round(lane.net).toLocaleString()} ~${Math.round(lane.rate || 0)}cr/min (${Math.round(lane.mins || 0)}m)`);
     let spent = 0, amCr = 0;
     try {
       await goToSys(sym, lane.srcWp, srcMkts);
@@ -272,7 +308,7 @@ export function createExpansion(ctx) {
         const d = await jump(sym, crossing.dstGate);
         amCr = d.transaction?.totalPrice || antimatterPx;
         if (d.transaction?.totalPrice > 0) antimatterPx = d.transaction.totalPrice;
-        if (d.cooldown?.remainingSeconds) cooldownUntil.set(sym, now() + d.cooldown.remainingSeconds * 1000);
+        if (d.cooldown?.remainingSeconds) { cooldownUntil.set(sym, now() + d.cooldown.remainingSeconds * 1000); jumpCooldownMin = d.cooldown.remainingSeconds / 60; }
       }
       await goToSys(sym, lane.dstWp, dstMkts);
       const s = await sell(sym, lane.good);
