@@ -68,7 +68,7 @@ describe('status snapshot shape == legacy bot-status.json (bot2.mjs:L2786)', () 
   it('per-ship row keys match legacy exactly', () => {
     const ships = data.ships as Array<Record<string, unknown>>;
     expect(ships).toHaveLength(1);
-    expect(Object.keys(ships[0]).sort()).toEqual([...LEGACY_SHIP].sort());
+    expect(Object.keys(ships[0]!).sort()).toEqual([...LEGACY_SHIP].sort());
   });
   it('the StatusSnapshot envelope carries the legacy data block', () => {
     expect(snap.phase).toBe('PROFIT');
