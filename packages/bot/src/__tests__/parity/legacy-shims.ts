@@ -13,7 +13,8 @@
  * decision functions under parity live there.
  *
  * So, per the Wave-6 spec's sanctioned option (a), each legacy expression is transcribed here
- * VERBATIM with a `bot2.mjs:Lxxx` / `expansion.mjs:Lxxx` line reference. The parity suite asserts
+ * VERBATIM with a `bot2.mjs:Lxxx` / `expansion.mjs:Lxxx` line reference (the legacy source now lives
+ * under `legacy/` — e.g. `legacy/bot2.mjs` — at the same line numbers). The parity suite asserts
  * `TS(fixture) === shim(fixture)` on shared fixtures; a reviewer audits parity by eye-diffing this
  * file against the legacy source. The legacy module-global constants (FUEL_PX, VALUE_OF_TIME, MAXD,
  * MIN_NET, COOLDOWN_*, SPEED_FAR_DIST, HAULER_PRICE, NEW_CELL_SEED, SLIPPAGE_FACTOR, …) are passed in
