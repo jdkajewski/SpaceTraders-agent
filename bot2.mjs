@@ -216,6 +216,17 @@ const GATE_PRICE_CEIL_FACTOR = Number(process.env.GATE_PRICE_CEIL_FACTOR || 2.0)
 // overpay during a spike — wait for mining/restock to cool it. Format "FAB_MATS:3200,ADVANCED_CIRCUITRY:7000".
 // Empty = no absolute cap (relative ceiling only).
 const GATE_MAX_PRICE = (() => { const out = {}; for (const p of (process.env.GATE_MAX_PRICE || '').split(',')) { const [k, v] = p.split(':'); if (k && v && Number(v) > 0) out[k.trim()] = Number(v); } return out; })();
+// [GATE] PRICE HYSTERESIS (anti-sawtooth on the per-material price cap). GATE_MAX_PRICE is the HARD pause line: when a
+// material's cheapest source exceeds it we stop buying that material (don't overpay into a spike). To resume we do NOT
+// pounce the instant it dips back under the cap (that sawtooths at the ceiling) — instead we wait until the price COOLS
+// to GATE_RESUME_PRICE, a SET lower threshold (the deadband). Mirrors the credit floor/resume latch, but on price and
+// inverted (pause ABOVE max, resume at/below resume-price). Format "FAB_MATS:1700,ADVANCED_CIRCUITRY:6000". When a
+// material has a max cap but no explicit resume price, it defaults to max × GATE_RESUME_PRICE_FACTOR.
+const GATE_RESUME_PRICE = (() => { const out = {}; for (const p of (process.env.GATE_RESUME_PRICE || '').split(',')) { const [k, v] = p.split(':'); if (k && v && Number(v) > 0) out[k.trim()] = Number(v); } return out; })();
+const GATE_RESUME_PRICE_FACTOR = Number(process.env.GATE_RESUME_PRICE_FACTOR || 0.9);   // resume at max×this when no explicit GATE_RESUME_PRICE set
+// [GATE] Fraction of the free growth budget the gate may spend per planning pass (the rest stays liquid for trading /
+// contracts / feeds so gate buying never starves the earners that refill it). 0.8 = gate uses up to 80% of growthBudget.
+let GATE_BUDGET_FRACTION = Math.min(1, Math.max(0, Number(process.env.GATE_BUDGET_FRACTION || 0.8)));   // live-tunable via gate-levers.json (budgetFraction)
 // [GATE] Price-settle PATIENCE: when a capped material drops back under its cap, don't pounce on the first tick —
 // wait up to GATE_PRICE_SETTLE_MS to see if it falls further (better entry/buffer), resuming buys once it rebounds
 // off its observed low (GATE_PRICE_REBOUND_EPS) or the window elapses. A good that was never above its cap buys
@@ -632,7 +643,8 @@ function reloadGateLevers() {
     const resume = Number.isFinite(j.resume) ? j.resume : (Number.isFinite(j.gap) ? GATE_CREDIT_FLOOR + j.gap : null);
     if (resume != null && resume !== GATE_CREDIT_RESUME) { GATE_CREDIT_RESUME = resume; changed = true; }
     if (GATE_CREDIT_RESUME <= GATE_CREDIT_FLOOR) GATE_CREDIT_RESUME = GATE_CREDIT_FLOOR + GATE_CREDIT_RESUME_GAP;  // keep a real deadband
-    if (changed) log(`⚙ gate levers reloaded — nest-egg floor ${GATE_CREDIT_FLOOR.toLocaleString()} → burst resume ${GATE_CREDIT_RESUME.toLocaleString()} (band ${(GATE_CREDIT_RESUME - GATE_CREDIT_FLOOR).toLocaleString()})`);
+    if (Number.isFinite(j.budgetFraction)) { const bf = Math.min(1, Math.max(0, j.budgetFraction)); if (bf !== GATE_BUDGET_FRACTION) { GATE_BUDGET_FRACTION = bf; changed = true; } }
+    if (changed) log(`⚙ gate levers reloaded — nest-egg floor ${GATE_CREDIT_FLOOR.toLocaleString()} → burst resume ${GATE_CREDIT_RESUME.toLocaleString()} (band ${(GATE_CREDIT_RESUME - GATE_CREDIT_FLOOR).toLocaleString()}), budget ${Math.round(GATE_BUDGET_FRACTION * 100)}% of growth`);
   } catch { /* no file or malformed → keep current (env-seeded) values */ }
 }
 
@@ -1262,25 +1274,24 @@ function bestSink(markets, good) {
 // greedily filling `free` cargo (cheapest units first) until full or credit headroom is exhausted. Each
 // buy is capped by the source market's tradeVolume; pricey markets (> cheapest×ceil per material) are
 // skipped so we only buy when it's cheap. Returns [{ sym, wp, units, px }] spanning markets/materials.
-// [GATE PRICE PATIENCE] Per capped material state machine. ABOVE cap → 'paused'. On the drop back UNDER the cap we
-// enter 'settling' and hold buys for GATE_PRICE_SETTLE_MS, tracking the low; we resume ('normal') once the price
-// rebounds >GATE_PRICE_REBOUND_EPS off that low (it bottomed) or the window elapses. A good never paused stays
-// 'normal' (buys immediately). Monotonic, so concurrent per-ship calls converge. Note: only advances while
-// planGateFill runs (i.e. credits >= floor); in practice credits recover before a spiked good cools to its cap.
-const gatePxState = {}; // sym -> { state:'paused'|'settling'|'normal', since, low }
+// [GATE PRICE HYSTERESIS] Per-material anti-sawtooth latch on the price cap. HARD pause when the cheapest source
+// exceeds GATE_MAX_PRICE; do NOT resume until it COOLS to the resume price (max × GATE_RESUME_PRICE_FACTOR, or an
+// explicit GATE_RESUME_PRICE override) — a deadband below the cap. Between resume-price and cap we HOLD the prior
+// state, so buying runs in sustained bursts instead of toggling every tick at the ceiling. Mirrors the credit
+// floor/resume latch, inverted for price. A material with no cap, or never spiked, buys immediately.
+const gatePxPaused = {};   // sym -> bool (latched)
 function gateBuyAllowed(sym, curMinPx, cap) {
-  if (!cap || !(GATE_PRICE_SETTLE_MS > 0)) return !cap ? true : curMinPx <= cap;   // patience off → cap is a hard line
-  const st = gatePxState[sym] || (gatePxState[sym] = { state: 'normal' });
-  if (curMinPx > cap) { st.state = 'paused'; return false; }
-  if (st.state === 'paused') { st.state = 'settling'; st.since = Date.now(); st.low = curMinPx; log(`gate ${sym} dropped under cap ${cap} @${curMinPx} → settling (watch for a lower entry)`); return false; }
-  if (st.state === 'settling') {
-    st.low = Math.min(st.low, curMinPx);
-    const waited = Date.now() - st.since >= GATE_PRICE_SETTLE_MS;
-    const rebounded = curMinPx > st.low * (1 + GATE_PRICE_REBOUND_EPS);
-    if (waited || rebounded) { st.state = 'normal'; log(`gate ${sym} price settled @${curMinPx} (low ${st.low}, ${rebounded ? 'rebounded' : 'timeout'}) → resuming buys`); return true; }
-    return false;
+  if (!cap) return true;                                    // no cap configured → always allowed
+  const resume = GATE_RESUME_PRICE[sym] || Math.round(cap * GATE_RESUME_PRICE_FACTOR);
+  const was = !!gatePxPaused[sym];
+  if (curMinPx > cap) gatePxPaused[sym] = true;             // spiked above the hard cap → arm the latch
+  else if (curMinPx <= resume) gatePxPaused[sym] = false;   // cooled to the resume price → release
+  // else: in the deadband (resume < px <= cap) → hold previous state
+  if (was !== !!gatePxPaused[sym]) {
+    if (gatePxPaused[sym]) log(`💲 gate ${sym} buy PAUSED — price ${curMinPx} > cap ${cap} (resume when ≤ ${resume})`);
+    else log(`💲 gate ${sym} buy RESUMED — price ${curMinPx} ≤ resume ${resume} (cap ${cap})`);
   }
-  return true;
+  return !gatePxPaused[sym];
 }
 
 // [FEED FOCUS] Buy-timing patience for input-feed source prices — the gateBuyAllowed mirror, separate state so the
@@ -1462,7 +1473,12 @@ async function gateSupplyTrip(shipSym, ship, markets) {
     // BOTH the gate credit-floor (overspend guard) AND growthBudget() (= credits − committed in-flight −
     // OPERATING_RESERVE). Whichever is more restrictive binds, so gate buying can never dip working capital
     // below the rolling reserve (fuel + lane buffer) or double-spend cash already committed to trades.
-    headroom: Math.min(growthBudget(), cachedCredits - GATE_CREDIT_FLOOR),
+    // [RESERVE + 80% BUDGET] Gate spend goes through the operating reserve like every other expense, AND is limited to
+    // GATE_BUDGET_FRACTION (default 0.8) of the free growth budget so it never starves the trading/contract/feed engine
+    // that refills the pool. headroom = min( 80% × growthBudget , credits − GATE_CREDIT_FLOOR ). growthBudget already =
+    // credits − committed in-flight − OPERATING_RESERVE, so the reserve and committed cash are protected; the 80% cap
+    // leaves 20% liquid for the earners; the gate credit-floor is the separate nest-egg overspend guard.
+    headroom: Math.min(Math.floor(GATE_BUDGET_FRACTION * growthBudget()), cachedCredits - GATE_CREDIT_FLOOR),
     slippage: SLIPPAGE_FACTOR,
     ceilFactor: GATE_PRICE_CEIL_FACTOR,
     absMax: GATE_MAX_PRICE,
@@ -1561,17 +1577,24 @@ function gateProducerInputTargets(markets) {
       if (!prod) continue;
       const imports = (m.tradeGoods || []).filter((x) => x.type === 'IMPORT');
       const inputs = imports.map((x) => x.symbol);
-      if (inputs.length && !seen.has(wp)) { out.push({ producerWp: wp, material: mat, remaining, inputs, tier: 1 }); seen.add(wp); }
+      if (inputs.length && !seen.has(wp)) { out.push({ producerWp: wp, material: mat, remaining, inputs, tier: 1, priorityInputs: new Set() }); seen.add(wp); }
       // TIER-2: for each SCARCE/LIMITED input this gate producer imports, find the market that EXPORTS it (the
       // sub-producer) and add it as a feed target whose inputs are ITS imports (the raw ore, sourced cheaply elsewhere).
+      // [PRIORITY] Tag the sub-producer's IMPORTED ORE that actually makes the scarce gate input (e.g. IRON_ORE → IRON)
+      // so planInputFeed feeds THAT first. Without this, equally-scarce ores tie-break on margin and a higher-margin
+      // SIDE ore (COPPER_ORE) crowds out the gate-critical one (IRON_ORE), leaving IRON perpetually SCARCE.
       if (FEED_SECOND_LEVEL) {
         for (const imp of imports.filter((x) => FEED_SCARCE_SUPPLY.has(x.supply))) {
           for (const [swp, sm] of Object.entries(markets)) {
             if (seen.has(swp)) continue;
             const sub = (sm.tradeGoods || []).find((x) => x.symbol === imp.symbol && x.type === 'EXPORT');
             if (!sub) continue;
-            const subInputs = (sm.tradeGoods || []).filter((x) => x.type === 'IMPORT').map((x) => x.symbol);
-            if (subInputs.length) { out.push({ producerWp: swp, material: imp.symbol, remaining, inputs: subInputs, tier: 2 }); seen.add(swp); }
+            const subImports = (sm.tradeGoods || []).filter((x) => x.type === 'IMPORT');
+            const subInputs = subImports.map((x) => x.symbol);
+            // The ore that makes THIS scarce gate input: prefer an import whose name shares the input's base (IRON ← IRON_ORE).
+            const base = imp.symbol.replace(/_ORE$/, '');
+            const priorityInputs = new Set(subInputs.filter((s) => s === base + '_ORE' || s.startsWith(base)));
+            if (subInputs.length) { out.push({ producerWp: swp, material: imp.symbol, remaining, inputs: subInputs, tier: 2, priorityInputs }); seen.add(swp); }
           }
         }
       }
@@ -1584,7 +1607,7 @@ function gateProducerInputTargets(markets) {
 // (its IMPORT entry's sellPrice = what we receive), find the cheapest EXTERNAL producer source and keep it
 // only if margin > 0. Greedy by per-lot gross, one tradeVolume lot each (off the slippage curve), bounded
 // by free cargo + cash headroom. Returns [{ sym, srcWp, buyPx, sellPx, margin, tv, units }].
-function planInputFeed(producerWp, inputs, markets, { free, headroom, maxLoss = 0 }) {
+function planInputFeed(producerWp, inputs, markets, { free, headroom, maxLoss = 0, priorityInputs = null }) {
   if (free <= 0 || headroom <= 0) return [];
   const dst = markets[producerWp];
   if (!dst) return [];
@@ -1609,14 +1632,13 @@ function planInputFeed(producerWp, inputs, markets, { free, headroom, maxLoss = 
     const cap = FEED_MAX_PRICE[sym] ?? (d.sellPrice + maxLoss);
     if (!feedBuyAllowed(sym, bestSrc.px, cap)) continue;
     const tv = Math.min(bestSrc.tv || 20, d.tradeVolume || 20);
-    cands.push({ sym, srcWp: bestSrc.wp, buyPx: bestSrc.px, sellPx: d.sellPrice, margin, tv, scarce: SUPPLY_RANK[d.supply] ?? 2 });
+    cands.push({ sym, srcWp: bestSrc.wp, buyPx: bestSrc.px, sellPx: d.sellPrice, margin, tv, scarce: SUPPLY_RANK[d.supply] ?? 2, priority: priorityInputs && priorityInputs.has(sym) ? 0 : 1 });
   }
-  // [INPUT_FEED] Scarcity-FIRST: feed the producer's SCARCEST inputs first (those throttle its output the
-  // most). Only profitable inputs reach here, so this never trades a loss — it just rebalances WHICH input
-  // we haul so we don't dump everything into the single highest-margin good (e.g. COPPER) and starve the
-  // others (IRON/QUARTZ/SILICON). Tie-break by per-lot gross so among equally-scarce inputs we take the
-  // most lucrative. As an input tiers up (SCARCE→LIMITED→…), it falls behind, so the feed rotates.
-  cands.sort((a, b) => (a.scarce - b.scarce) || (b.margin * Math.min(b.tv, free) - a.margin * Math.min(a.tv, free)));
+  // [INPUT_FEED] Sort order: (1) GATE PRIORITY — an ore that makes the scarce gate-critical input (e.g. IRON_ORE→IRON)
+  // wins over a side ore, so we don't starve the long pole; then (2) SCARCEST input first (throttles output most);
+  // then (3) per-lot gross so among equals we take the most lucrative. Without (1), equally-scarce ores tie-break on
+  // margin and a higher-margin side ore (COPPER_ORE) crowds out IRON_ORE -> IRON stays SCARCE forever.
+  cands.sort((a, b) => (a.priority - b.priority) || (a.scarce - b.scarce) || (b.margin * Math.min(b.tv, free) - a.margin * Math.min(a.tv, free)));
   const buys = [];
   let f = free, h = headroom;
   for (const c of cands) {
@@ -1646,7 +1668,7 @@ async function inputFeedTrip(shipSym, ship, markets) {
   for (const t of gateProducerInputTargets(markets)) {
     if (inputActiveProducers.has(t.producerWp)) continue;   // [GUARDRAIL] 1 feeder per producer — never let two of our ships sell into the same import market at once
     const maxLoss = focusSet.has(t.producerWp) ? FEED_MAX_LOSS_PER_UNIT : 0;   // [FEED FOCUS] long-pole producer may be fed at a capped loss
-    const p = planInputFeed(t.producerWp, t.inputs, markets, { free, headroom: growthBudget(), maxLoss });
+    const p = planInputFeed(t.producerWp, t.inputs, markets, { free, headroom: growthBudget(), maxLoss, priorityInputs: t.priorityInputs });
     const estNet = p.reduce((s, b) => s + b.margin * b.units, 0);
     // Focus producers: accept even a (capped) net-negative feed — it's a gate investment, per-unit loss already bounded
     // by maxLoss in planInputFeed. Non-focus producers must still clear INPUT_FEED_MIN_GROSS (profit-only).
