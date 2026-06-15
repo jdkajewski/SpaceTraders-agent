@@ -10,6 +10,7 @@ const GateLeversSchema = Type.Object({
   floor: Type.Number(),
   resume: Type.Number(),
   gap: Type.Number(),
+  budgetFraction: Type.Number(),
   updatedAt: Type.String({ format: 'date-time' }),
 });
 
@@ -17,6 +18,7 @@ const GateLeversPutBody = Type.Object({
   floor: Type.Number(),
   resume: Type.Number(),
   gap: Type.Number(),
+  budgetFraction: Type.Optional(Type.Number()),
 });
 
 const plugin: FastifyPluginAsyncTypebox = async (fastify) => {
@@ -32,7 +34,7 @@ const plugin: FastifyPluginAsyncTypebox = async (fastify) => {
     async (_req, reply) => {
       const row = await fastify.prisma.gateLevers.upsert({
         where: { id: 1 },
-        create: { id: 1, floor: 1_500_000, resume: 1_750_000, gap: 250_000 },
+        create: { id: 1, floor: 1_500_000, resume: 1_750_000, gap: 250_000, budgetFraction: 0.8 },
         update: {},
       });
       return reply.send({ ...row, updatedAt: row.updatedAt.toISOString() });

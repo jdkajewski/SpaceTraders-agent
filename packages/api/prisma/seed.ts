@@ -77,7 +77,7 @@ async function main() {
   await prisma.gateLevers.upsert({
     where: { id: 1 },
     update: {},
-    create: { id: 1, floor, resume: floor + gap, gap },
+    create: { id: 1, floor, resume: floor + gap, gap, budgetFraction: 0.8 },
   });
   console.log('  ✓ GateLevers singleton ready (id=1)');
 

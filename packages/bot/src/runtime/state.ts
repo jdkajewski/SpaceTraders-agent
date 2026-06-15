@@ -50,6 +50,7 @@ export interface LastGate {
 export interface GateLeverState {
   floor: number;
   resume: number;
+  budgetFraction: number;
 }
 
 /** Per-good buy-timing patience FSM value (bot2 `gatePxState`/`feedPxState` entry). */
@@ -103,8 +104,8 @@ export interface BotState {
   inputActiveProducers: Set<string>;
   gateBuyPaused: boolean;
   gateLevers: GateLeverState;
-  /** Per-good gate-material buy-timing patience FSM (bot2 `gatePxState`). */
-  gatePxState: Map<string, PriceSettleState>;
+  /** Per-good gate-material price-cap hysteresis latch (bot2 `gatePxPaused`): true = paused (price above cap). */
+  gatePxPaused: Map<string, boolean>;
   /** Per-good input-feed buy-timing patience FSM (bot2 `feedPxState`). */
   feedPxState: Map<string, PriceSettleState>;
 
@@ -204,8 +205,8 @@ export function createState(cfg: Config, opts: CreateStateOptions = {}): BotStat
     inputActiveFeeders: new Set(),
     inputActiveProducers: new Set(),
     gateBuyPaused: false,
-    gateLevers: { floor: cfg.GATE_CREDIT_FLOOR, resume: cfg.GATE_CREDIT_RESUME },
-    gatePxState: new Map(),
+    gateLevers: { floor: cfg.GATE_CREDIT_FLOOR, resume: cfg.GATE_CREDIT_RESUME, budgetFraction: cfg.GATE_BUDGET_FRACTION },
+    gatePxPaused: new Map(),
     feedPxState: new Map(),
 
     goodState: new Map(),

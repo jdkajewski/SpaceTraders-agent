@@ -9,6 +9,8 @@ import { logger } from '../core/logger.js';
 
 const log = logger.child({ mod: 'feed' });
 const SUPPLY_RANK: Record<string, number> = { SCARCE: 0, LIMITED: 1, MODERATE: 2, HIGH: 3, ABUNDANT: 4 };
+// An input at these supply tiers is a bottleneck worth tier-2 feeding (restocking at its own source).
+const FEED_SCARCE_SUPPLY = new Set(['SCARCE', 'LIMITED']);
 
 function ensurePerShip(state: BotState, shipSym: string): PerShipState {
   const ps = state.perShip[shipSym] ?? { net: 0, lanes: 0, last: '' };
@@ -21,6 +23,8 @@ export interface GateProducerInputTarget {
   material: string;
   remaining: number;
   inputs: string[];
+  tier: number;
+  priorityInputs: Set<string>;
 }
 
 export interface InputFeedBuy {
@@ -31,6 +35,7 @@ export interface InputFeedBuy {
   margin: number;
   tv: number;
   scarce: number;
+  priority: number;
   units: number;
 }
 
@@ -38,6 +43,7 @@ export interface PlanInputFeedOptions {
   free: number;
   headroom: number;
   maxLoss?: number;
+  priorityInputs?: Set<string> | null;
 }
 
 export function isInputFeeder(shipSym: string, cfg: Config): boolean {
@@ -57,16 +63,46 @@ export function canStartInputFeed(shipSym: string, state: BotState, cfg: Config)
   return isInputFeeder(shipSym, cfg) || state.inputActiveFeeders.has(shipSym) || state.inputActiveFeeders.size < inputFeedMax(cfg);
 }
 
+// [INPUT_FEED] Targets for the Phase 4 accelerator. TIER-1 = the EXPORT producer(s) of still-needed gate materials,
+// long-pole first, each paired with the inputs it IMPORTS. TIER-2 (FEED_SECOND_LEVEL) = the sub-producers that make a
+// TIER-1 producer's SCARCE/LIMITED inputs — feeding THEIR inputs lifts the scarce input at its source (e.g. J62 ore →
+// H55 makes IRON → F49 makes FAB_MATS). Producers are de-duped; per-producer concurrency cap still applies in
+// inputFeedTrip. Empty unless inputFeedActive(). (bot2 `gateProducerInputTargets`)
 export function gateProducerInputTargets(state: BotState, cfg: Config, markets: Record<string, Market>): GateProducerInputTarget[] {
   const out: GateProducerInputTarget[] = [];
   if (!inputFeedActive(state, cfg)) return out;
+  const seen = new Set<string>(); // producerWp de-dup (a market can be reached via multiple scarce inputs)
   const needed = Object.entries(state.gateCache.remaining || {}).sort((a, b) => b[1] - a[1]); // long pole first
   for (const [mat, remaining] of needed) {
     for (const [wp, m] of Object.entries(markets)) {
       const prod = (m.tradeGoods || []).find((x) => x.symbol === mat && x.type === 'EXPORT');
       if (!prod) continue;
-      const inputs = (m.tradeGoods || []).filter((x) => x.type === 'IMPORT').map((x) => x.symbol);
-      if (inputs.length) out.push({ producerWp: wp, material: mat, remaining, inputs });
+      const imports = (m.tradeGoods || []).filter((x) => x.type === 'IMPORT');
+      const inputs = imports.map((x) => x.symbol);
+      if (inputs.length && !seen.has(wp)) {
+        out.push({ producerWp: wp, material: mat, remaining, inputs, tier: 1, priorityInputs: new Set() });
+        seen.add(wp);
+      }
+      // TIER-2: for each SCARCE/LIMITED input this gate producer imports, find the market that EXPORTS it (the
+      // sub-producer) and add it as a feed target whose inputs are ITS imports (the raw ore, sourced cheaply elsewhere).
+      // [PRIORITY] Tag the sub-producer's IMPORTED ORE that makes the scarce gate input (IRON_ORE → IRON) so
+      // planInputFeed feeds THAT first and a higher-margin side ore can't crowd out the gate-critical one.
+      if (cfg.FEED_SECOND_LEVEL) {
+        for (const imp of imports.filter((x) => FEED_SCARCE_SUPPLY.has(x.supply ?? ''))) {
+          for (const [swp, sm] of Object.entries(markets)) {
+            if (seen.has(swp)) continue;
+            const sub = (sm.tradeGoods || []).find((x) => x.symbol === imp.symbol && x.type === 'EXPORT');
+            if (!sub) continue;
+            const subInputs = (sm.tradeGoods || []).filter((x) => x.type === 'IMPORT').map((x) => x.symbol);
+            const base = imp.symbol.replace(/_ORE$/, '');
+            const priorityInputs = new Set(subInputs.filter((s) => s === base + '_ORE' || s.startsWith(base)));
+            if (subInputs.length) {
+              out.push({ producerWp: swp, material: imp.symbol, remaining, inputs: subInputs, tier: 2, priorityInputs });
+              seen.add(swp);
+            }
+          }
+        }
+      }
     }
   }
   return out;
@@ -116,7 +152,7 @@ export function planInputFeed(
   state: BotState,
   cfg: Config,
 ): InputFeedBuy[] {
-  const { free, headroom, maxLoss = 0 } = opts;
+  const { free, headroom, maxLoss = 0, priorityInputs = null } = opts;
   if (free <= 0 || headroom <= 0) return [];
   const dst = markets[producerWp];
   if (!dst) return [];
@@ -141,14 +177,13 @@ export function planInputFeed(
     const cap = cfg.FEED_MAX_PRICE[sym] ?? d.sellPrice + maxLoss;
     if (!feedBuyAllowed(state, cfg, sym, bestSrc.px, cap)) continue;
     const tv = Math.min(bestSrc.tv || 20, d.tradeVolume || 20);
-    cands.push({ sym, srcWp: bestSrc.wp, buyPx: bestSrc.px, sellPx: d.sellPrice, margin, tv, scarce: SUPPLY_RANK[d.supply] ?? 2 });
+    cands.push({ sym, srcWp: bestSrc.wp, buyPx: bestSrc.px, sellPx: d.sellPrice, margin, tv, scarce: SUPPLY_RANK[d.supply ?? ''] ?? 2, priority: priorityInputs && priorityInputs.has(sym) ? 0 : 1 });
   }
-  // [INPUT_FEED] Scarcity-FIRST: feed the producer's SCARCEST inputs first (those throttle its output the
-  // most). Only profitable inputs reach here, so this never trades a loss — it just rebalances WHICH input
-  // we haul so we don't dump everything into the single highest-margin good (e.g. COPPER) and starve the
-  // others (IRON/QUARTZ/SILICON). Tie-break by per-lot gross so among equally-scarce inputs we take the
-  // most lucrative. As an input tiers up (SCARCE→LIMITED→…), it falls behind, so the feed rotates.
-  cands.sort((a, b) => a.scarce - b.scarce || b.margin * Math.min(b.tv, free) - a.margin * Math.min(a.tv, free));
+  // [INPUT_FEED] Sort order: (1) GATE PRIORITY — an ore that makes the scarce gate-critical input (e.g. IRON_ORE→IRON)
+  // wins over a side ore, so we don't starve the long pole; then (2) SCARCEST input first (throttles output most);
+  // then (3) per-lot gross so among equals we take the most lucrative. Without (1), equally-scarce ores tie-break on
+  // margin and a higher-margin side ore (COPPER_ORE) crowds out IRON_ORE → IRON stays SCARCE forever.
+  cands.sort((a, b) => a.priority - b.priority || a.scarce - b.scarce || b.margin * Math.min(b.tv, free) - a.margin * Math.min(a.tv, free));
   const buys: InputFeedBuy[] = [];
   let f = free;
   let h = headroom;
@@ -180,7 +215,7 @@ async function inputFeedTripImpl(shipSym: string, ship: Ship, markets: Record<st
   for (const t of gateProducerInputTargets(state, cfg, markets)) {
     if (state.inputActiveProducers.has(t.producerWp)) continue; // [GUARDRAIL] 1 feeder per producer — never let two of our ships sell into the same import market at once
     const maxLoss = focusSet.has(t.producerWp) ? cfg.FEED_MAX_LOSS_PER_UNIT : 0; // [FEED FOCUS] long-pole producer may be fed at a capped loss
-    const p = planInputFeed(t.producerWp, t.inputs, markets, { free, headroom: growthBudget(state), maxLoss }, state, cfg);
+    const p = planInputFeed(t.producerWp, t.inputs, markets, { free, headroom: growthBudget(state), maxLoss, priorityInputs: t.priorityInputs }, state, cfg);
     const estNet = p.reduce((s, b) => s + b.margin * b.units, 0);
     // Focus producers: accept even a (capped) net-negative feed — it's a gate investment, per-unit loss already bounded
     // by maxLoss in planInputFeed. Non-focus producers must still clear INPUT_FEED_MIN_GROSS (profit-only).

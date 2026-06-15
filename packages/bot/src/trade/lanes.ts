@@ -79,26 +79,38 @@ export function gateProducerWps(state: BotState, cfg: Config, markets: Record<st
   return set;
 }
 
-/** Producers (EXPORT) of still-needed FOCUS materials (the long pole). (bot2 `focusProducerWps`) */
-export function focusProducerWps(state: BotState, cfg: Config, markets: Record<string, Market>): Set<string> {
+/**
+ * Producers (EXPORT) of still-needed materials in a given set. Used two ways with DIFFERENT sets:
+ *   • FEED_FOCUS_MATERIALS → capped-loss feeding targets (we actively push these gate materials down).
+ *   • FEED_RESERVE_MATERIALS → input reservation (we hold these producers' inputs out of non-feed trades).
+ * Keeping them separate lets us focus-FEED a material (e.g. ADVANCED_CIRCUITRY) WITHOUT reserving its inputs
+ * (MACHINERY/MICROPROCESSORS are fat trade lanes that already sell INTO D45 — reserving them would kill throughput).
+ * (bot2 `producerWpsFor`)
+ */
+export function producerWpsFor(state: BotState, cfg: Config, markets: Record<string, Market>, matSet: readonly string[]): Set<string> {
   const set = new Set<string>();
   for (const mat of activeGateMaterials(state, cfg)) {
-    if (!cfg.FEED_FOCUS_MATERIALS.includes(mat)) continue;
+    if (!matSet.includes(mat)) continue;
     const w = findProducerWp(markets, mat);
     if (w) set.add(w);
   }
   return set;
 }
 
+/** Producers (EXPORT) of still-needed FOCUS materials (the long pole). (bot2 `focusProducerWps`) */
+export function focusProducerWps(state: BotState, cfg: Config, markets: Record<string, Market>): Set<string> {
+  return producerWpsFor(state, cfg, markets, cfg.FEED_FOCUS_MATERIALS);
+}
+
 /**
- * The input goods a focus producer IMPORTS. RESERVED: normal lanes/ride-alongs may not
+ * The input goods a RESERVE-material producer IMPORTS. RESERVED: normal lanes/ride-alongs may not
  * BUY these to sell anywhere but a focus producer. Empty unless FEED_RESERVE_INPUTS.
  * (bot2 `gateInputGoods`)
  */
 export function gateInputGoods(state: BotState, cfg: Config, markets: Record<string, Market>): Set<string> {
   const set = new Set<string>();
   if (!cfg.FEED_RESERVE_INPUTS) return set;
-  for (const wp of focusProducerWps(state, cfg, markets)) {
+  for (const wp of producerWpsFor(state, cfg, markets, cfg.FEED_RESERVE_MATERIALS)) {
     const m = markets[wp];
     if (!m) continue;
     for (const g of m.tradeGoods ?? []) if (g.type === 'IMPORT') set.add(g.symbol);

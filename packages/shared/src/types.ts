@@ -141,6 +141,7 @@ export interface GateLevers {
   floor: number;
   resume: number;
   gap: number;
+  budgetFraction: number;
 }
 
 export interface GateState {
@@ -284,6 +285,7 @@ export interface GateLeversDto {
   floor: number;
   resume: number;
   gap: number;
+  budgetFraction: number;
   updatedAt: string;
 }
 

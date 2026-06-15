@@ -130,6 +130,20 @@ const RawConfigSchema = z.object({
   GATE_PRICE_SETTLE_MS: num(240_000),
   GATE_PRICE_REBOUND_EPS: num(0.02),
   GATE_MAX_PRICE: kvMap,
+  // [GATE] PRICE HYSTERESIS resume thresholds (anti-sawtooth on the per-material price cap). GATE_MAX_PRICE is the
+  // HARD pause line; we do NOT resume buying the instant a material dips back under it (that sawtooths at the
+  // ceiling) — we wait until it COOLS to GATE_RESUME_PRICE (an explicit per-material floor, or max ×
+  // GATE_RESUME_PRICE_FACTOR when unset). Mirrors the credit floor/resume latch, inverted for price. (bot2 L216-227)
+  GATE_RESUME_PRICE: kvMap,
+  GATE_RESUME_PRICE_FACTOR: num(0.9),
+  // [GATE] Fraction of the free growth budget the gate may spend per planning pass (the rest stays liquid for the
+  // trading/contract/feed earners that refill the pool, so gate buying never starves them). Clamped to [0,1].
+  // Live-tunable via the gate-levers control input (budgetFraction). (bot2 L228-230)
+  GATE_BUDGET_FRACTION: z
+    .string()
+    .optional()
+    .default('0.8')
+    .transform((v) => Math.min(1, Math.max(0, Number(v)))),
   GATE_PROTECT: boolOn,
   GATE_PROTECT_MATERIALS: z
     .string()
@@ -160,6 +174,19 @@ const RawConfigSchema = z.object({
     .transform((v) => v.split(',').map((s) => s.trim()).filter(Boolean)),
   FEED_MAX_LOSS_PER_UNIT: num(30),
   FEED_RESERVE_INPUTS: boolOn,
+  // [FEED RESERVE] Which materials' inputs get RESERVED out of non-feed trades (separate from FEED_FOCUS so we can
+  // focus-FEED a material without locking its fat-lane inputs). Defaults to FAB_MATS only: FAB's inputs (IRON/QUARTZ/
+  // SILICON/COPPER) are thin and worth reserving; ADV_CIRC's inputs (MACHINERY/MICROPROCESSORS) are fat trade lanes
+  // that already sell into D45, so we feed ADV but DON'T reserve its inputs. (bot2 L268-272)
+  FEED_RESERVE_MATERIALS: z
+    .string()
+    .optional()
+    .default('FAB_MATS')
+    .transform((v) => v.split(',').map((s) => s.trim()).filter(Boolean)),
+  // [FEED SECOND-LEVEL] Also feed the SUB-producers that make a gate producer's SCARCE inputs (e.g. J62 ore → H55,
+  // which makes the IRON/COPPER/ALUMINUM that F49 and D45 need). Restocks the bottleneck at its true source. Default
+  // ON. (bot2 L273-274)
+  FEED_SECOND_LEVEL: boolOn,
   FEED_MAX_PRICE: kvMap,
   // FEED_PRICE_SETTLE_MS / FEED_PRICE_REBOUND_EPS default to GATE counterparts; see post-transform
   FEED_PRICE_SETTLE_MS: z.string().optional(), // handled below

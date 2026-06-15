@@ -181,12 +181,12 @@ export function determinePhaseLegacy(inp: {
   return 'PROFIT';
 }
 
-// ── gate-fill planner (bot2.mjs:L1291-1328) ──────────────────────────────────────────────
-// Tested with absMax = {} so the gateBuyAllowed/settle-state branch is inert (the `am` guard is
-// skipped) → fully deterministic. Transcribed verbatim otherwise.
+// ── gate-fill planner (bot2.mjs:L1291-1365, packing version) ──────────────────────────────
+// Tested with absMax = {} so the gateBuyAllowed branch is inert (the `am` guard is skipped) →
+// fully deterministic. Transcribed verbatim from the packing rewrite otherwise.
 type GateFillLegacy = { sym: string; wp: string; units: number; px: number };
 
-// bot2.mjs:L1291-1328 (absMax = {} path)
+// bot2.mjs:L1291-1365 (absMax = {} path; hold-packing cycle)
 export function planGateFillLegacy(
   remaining: Record<string, number>,
   claims: Map<string, number>,
@@ -210,21 +210,37 @@ export function planGateFillLegacy(
   }
   // absMax = {} → the `!absMax[o.sym]` guard is always true, so capOK is never consulted.
   const cheap = opts.filter((op) => op.px <= (minPx[op.sym] ?? op.px) * ceilFactor).sort((a, b) => a.px - b.px);
-  const buys: GateFillLegacy[] = [];
-  const planned: Record<string, number> = {};
+  // [GATE FILL] Pack the hold: add tradeVolume lots cheapest-first, cycling across all still-needed materials until
+  // the hold (f) or headroom (h) is exhausted (or nothing still needs units). bot2.mjs:L1333-1360.
+  const order: Record<string, number> = {};
   let f = free0, h = headroom0;
-  for (const op of cheap) {
-    if (f <= 0 || h <= 0) break;
-    const open = (remaining[op.sym] || 0) - (claims.get(op.sym) || 0) - (planned[op.sym] || 0);
-    if (open <= 0) continue;
-    const unitCost = op.px * slippage;
-    const affordable = Math.floor(h / Math.max(1, unitCost));
-    const cap = op.tv > 0 ? op.tv : f;
-    const units = Math.min(f, cap, open, affordable);
-    if (units <= 0) continue;
-    buys.push({ sym: op.sym, wp: op.wp, units, px: op.px });
-    planned[op.sym] = (planned[op.sym] || 0) + units;
-    f -= units; h -= Math.ceil(units * unitCost);
+  let progress = true;
+  while (f > 0 && h > 0 && progress) {
+    progress = false;
+    for (const op of cheap) {
+      if (f <= 0 || h <= 0) break;
+      const plannedSym = Object.entries(order)
+        .filter(([k]) => k.startsWith(op.sym + '@'))
+        .reduce((s, [, u]) => s + u, 0);
+      const open = (remaining[op.sym] || 0) - (claims.get(op.sym) || 0) - plannedSym;
+      if (open <= 0) continue;
+      const unitCost = op.px * slippage;
+      const affordable = Math.floor(h / Math.max(1, unitCost));
+      const lot = Math.min(f, op.tv > 0 ? op.tv : f, open, affordable);
+      if (lot <= 0) continue;
+      const key = op.sym + '@' + op.wp;
+      order[key] = (order[key] || 0) + lot;
+      f -= lot;
+      h -= Math.ceil(lot * unitCost);
+      progress = true;
+    }
+  }
+  const buys: GateFillLegacy[] = [];
+  for (const [key, units] of Object.entries(order)) {
+    const at = key.lastIndexOf('@');
+    const sym = key.slice(0, at), wp = key.slice(at + 1);
+    const op = cheap.find((x) => x.sym === sym && x.wp === wp);
+    if (op) buys.push({ sym, wp, units, px: op.px });
   }
   return buys;
 }

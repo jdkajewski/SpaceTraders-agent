@@ -61,7 +61,7 @@ describe('phase: determinePhase truth table', () => {
 describe('phase: gateCreditOk hysteresis latch (no sawtooth in band)', () => {
   it('pauses below floor, holds in the deadband, resumes only past resume', () => {
     const { s } = readyState();
-    s.gateLevers = { floor: 1_500_000, resume: 1_750_000 };
+    s.gateLevers = { floor: 1_500_000, resume: 1_750_000, budgetFraction: 0.8 };
 
     s.cachedCredits = 1_400_000; // below floor → hard stop
     expect(gateCreditOk(s)).toBe(false);
@@ -96,8 +96,16 @@ describe('phase: reloadGateLevers polls GET /gate-levers and keeps a deadband', 
 
   it('forces a real deadband when resume <= floor', async () => {
     const { c, s } = readyState();
-    await reloadGateLevers(s, c, persistenceReturning({ floor: 2_000_000, resume: 1_900_000, gap: 0 }));
+    await reloadGateLevers(s, c, persistenceReturning({ floor: 2_000_000, resume: 1_900_000, gap: 0 } as unknown as GateLevers));
     expect(s.gateLevers.resume).toBe(2_000_000 + c.GATE_CREDIT_RESUME_GAP);
+  });
+
+  it('accepts a live budgetFraction (clamped to [0,1])', async () => {
+    const { c, s } = readyState();
+    await reloadGateLevers(s, c, persistenceReturning({ floor: 1_500_000, resume: 1_750_000, gap: 250_000, budgetFraction: 0.5 } as unknown as GateLevers));
+    expect(s.gateLevers.budgetFraction).toBe(0.5);
+    await reloadGateLevers(s, c, persistenceReturning({ floor: 1_500_000, resume: 1_750_000, gap: 250_000, budgetFraction: 5 } as unknown as GateLevers));
+    expect(s.gateLevers.budgetFraction).toBe(1);
   });
 
   it('keeps current values when the fetch returns null', async () => {

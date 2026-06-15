@@ -114,11 +114,12 @@ model MineEvent {
 // Mirrors gate-levers.json. Always a single row with id = 1.
 // Operators PUT /gate-levers; bot polls GET /gate-levers.
 model GateLevers {
-  id        Int      @id @default(1)
-  floor     Float    @default(1500000)
-  resume    Float    @default(1750000)
-  gap       Float    @default(250000)
-  updatedAt DateTime @updatedAt
+  id             Int      @id @default(1)
+  floor          Float    @default(1500000)
+  resume         Float    @default(1750000)
+  gap            Float    @default(250000)
+  budgetFraction Float    @default(0.8)
+  updatedAt      DateTime @updatedAt
 }
 
 // ── Waypoints (seeded from coords.csv, read-mostly) ─────────────────────────

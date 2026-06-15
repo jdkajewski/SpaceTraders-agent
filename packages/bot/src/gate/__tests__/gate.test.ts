@@ -62,32 +62,64 @@ describe('gate: planGateFill', () => {
   });
 });
 
-describe('gate: gateBuyAllowed patience FSM', () => {
-  it('moves paused→settling→normal on REBOUND', () => {
-    const c = cfg({ GATE_PRICE_SETTLE_MS: 10_000, GATE_PRICE_REBOUND_EPS: 0.02 });
+describe('gate: gateBuyAllowed price hysteresis latch', () => {
+  it('pauses above cap, holds in the deadband, resumes only at/below the resume price', () => {
+    const c = cfg({ GATE_MAX_PRICE: { FAB_MATS: 100 }, GATE_RESUME_PRICE_FACTOR: 0.9 });
     const s = createState(c);
 
-    expect(gateBuyAllowed(s, c, 'FAB_MATS', 120, 100, 1_000)).toBe(false);
-    expect(s.gatePxState.get('FAB_MATS')?.state).toBe('paused');
+    // spike above cap → latch arms (paused)
+    expect(gateBuyAllowed(s, c, 'FAB_MATS', 120, 100)).toBe(false);
+    expect(s.gatePxPaused.get('FAB_MATS')).toBe(true);
 
-    expect(gateBuyAllowed(s, c, 'FAB_MATS', 95, 100, 2_000)).toBe(false);
-    expect(s.gatePxState.get('FAB_MATS')).toMatchObject({ state: 'settling', low: 95 });
+    // dips back under the cap but still above resume (90) → HOLD paused (deadband)
+    expect(gateBuyAllowed(s, c, 'FAB_MATS', 95, 100)).toBe(false);
+    expect(s.gatePxPaused.get('FAB_MATS')).toBe(true);
 
-    expect(gateBuyAllowed(s, c, 'FAB_MATS', 90, 100, 3_000)).toBe(false);
-    expect(s.gatePxState.get('FAB_MATS')?.low).toBe(90);
+    // cools to the resume price (≤ 90) → release
+    expect(gateBuyAllowed(s, c, 'FAB_MATS', 90, 100)).toBe(true);
+    expect(s.gatePxPaused.get('FAB_MATS')).toBe(false);
 
-    expect(gateBuyAllowed(s, c, 'FAB_MATS', 92, 100, 4_000)).toBe(true);
-    expect(s.gatePxState.get('FAB_MATS')?.state).toBe('normal');
+    // back into the deadband from below → HOLD resumed
+    expect(gateBuyAllowed(s, c, 'FAB_MATS', 95, 100)).toBe(true);
+    expect(s.gatePxPaused.get('FAB_MATS')).toBe(false);
   });
 
-  it('moves settling→normal on TIMEOUT', () => {
-    const c = cfg({ GATE_PRICE_SETTLE_MS: 5_000, GATE_PRICE_REBOUND_EPS: 0.5 });
+  it('honours an explicit GATE_RESUME_PRICE override and treats no-cap as always allowed', () => {
+    const c = cfg({ GATE_MAX_PRICE: { FAB_MATS: 100 }, GATE_RESUME_PRICE: { FAB_MATS: 80 } });
     const s = createState(c);
 
-    expect(gateBuyAllowed(s, c, 'ADVANCED_CIRCUITRY', 150, 100, 1_000)).toBe(false);
-    expect(gateBuyAllowed(s, c, 'ADVANCED_CIRCUITRY', 99, 100, 2_000)).toBe(false);
-    expect(gateBuyAllowed(s, c, 'ADVANCED_CIRCUITRY', 98, 100, 7_000)).toBe(true);
-    expect(s.gatePxState.get('ADVANCED_CIRCUITRY')?.state).toBe('normal');
+    expect(gateBuyAllowed(s, c, 'FAB_MATS', 120, 100)).toBe(false);
+    expect(gateBuyAllowed(s, c, 'FAB_MATS', 90, 100)).toBe(false); // above explicit resume 80 → still paused
+    expect(gateBuyAllowed(s, c, 'FAB_MATS', 80, 100)).toBe(true); // at resume → release
+
+    // no cap configured for the good → always allowed
+    expect(gateBuyAllowed(s, c, 'QUANTUM_STABILIZERS', 9_999, undefined)).toBe(true);
+  });
+});
+
+describe('gate: planGateFill packing', () => {
+  it('packs the hold across all needed materials cheapest-first, balancing the basket', () => {
+    const c = cfg({ GATE_MAX_PRICE: {} });
+    const s = createState(c);
+    const markets = {
+      F: market('F', [{ symbol: 'FAB_MATS', type: 'EXPORT', purchasePrice: 100, tradeVolume: 20 }]),
+      A: market('A', [{ symbol: 'ADVANCED_CIRCUITRY', type: 'EXPORT', purchasePrice: 110, tradeVolume: 20 }]),
+    };
+
+    const buys = planGateFill({ FAB_MATS: 100, ADVANCED_CIRCUITRY: 100 }, new Map(), markets, {
+      free: 80,
+      headroom: 1_000_000,
+      slippage: 1,
+      ceilFactor: 10,
+      state: s,
+      cfg: c,
+    });
+
+    const byMat = Object.fromEntries(buys.map((b) => [b.sym, b.units]));
+    // Old single-lot-per-material behaviour would yield 20 + 20 = 40/80; packing fills the 80 hull (40 + 40).
+    expect(byMat.FAB_MATS).toBe(40);
+    expect(byMat.ADVANCED_CIRCUITRY).toBe(40);
+    expect(buys.reduce((s, b) => s + b.units, 0)).toBe(80);
   });
 });
 

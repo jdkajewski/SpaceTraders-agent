@@ -91,9 +91,16 @@ export async function reloadGateLevers(state: BotState, cfg: Config, persistence
     changed = true;
   }
   if (lev.resume <= lev.floor) lev.resume = lev.floor + cfg.GATE_CREDIT_RESUME_GAP; // keep a real deadband
+  if (Number.isFinite(j.budgetFraction)) {
+    const bf = Math.min(1, Math.max(0, j.budgetFraction));
+    if (bf !== lev.budgetFraction) {
+      lev.budgetFraction = bf;
+      changed = true;
+    }
+  }
   if (changed)
     log.info(
-      `gate levers reloaded — nest-egg floor ${lev.floor.toLocaleString()} → burst resume ${lev.resume.toLocaleString()} (band ${(lev.resume - lev.floor).toLocaleString()})`,
+      `gate levers reloaded — nest-egg floor ${lev.floor.toLocaleString()} → burst resume ${lev.resume.toLocaleString()} (band ${(lev.resume - lev.floor).toLocaleString()}), budget ${Math.round(lev.budgetFraction * 100)}% of growth`,
     );
 }
 
