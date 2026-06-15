@@ -31,6 +31,9 @@ export type GoToFn = (shipSym: string, dest: string, markets: Record<string, Mar
 /** Record a completed trip's net + label (per-ship + lifetime accounting; bot2 `record`). */
 export type RecordFn = (shipSym: string, net: number, label: string) => Promise<void>;
 
+/** Spawn a supervised worker for a newly-acquired hull (dedupes; bot2 `launchWorker`). */
+export type LaunchWorkerFn = (shipSym: string) => void;
+
 /** Everything a Wave-4 subsystem needs, injected explicitly (no module globals). */
 export interface SubsystemDeps {
   state: BotState;
@@ -46,6 +49,8 @@ export interface SubsystemDeps {
   goTo: GoToFn;
   /** Run-accounting + status write (the worker's `record`). */
   record: RecordFn;
+  /** Give a bought hull (MINE_EXPAND / FLEET_SCALE) its own supervised worker (bot2 `launchWorker`). */
+  launchWorker: LaunchWorkerFn;
 }
 
 /** A background manager: a long-running loop until `state.stop` (bot2 manager funcs). */

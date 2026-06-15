@@ -22,6 +22,7 @@ import { FileLocalStore, reconcileLocalToApi, loadIntents } from './recovery.js'
 import { recomputeReserve, computeExpansionTarget } from './budget/budget.js';
 import { determinePhase, reloadGateLevers } from './budget/phase.js';
 import { supervise, installStopHandlers, type WorkerDeps, type StopOptions } from './worker.js';
+import { makeSubsystemDeps, buildWorkerHooks, buildManagers } from './subsystems/index.js';
 import type { DistFn } from './trade/lanes.js';
 import type { SpaceTradersClient } from './interfaces.js';
 
@@ -123,11 +124,31 @@ export async function main(): Promise<void> {
 
   const deps: WorkerDeps = { state, cfg, actions, router, markets, persistence, client, D };
 
+  // [WAVE-4] Supervised-worker launcher (bot2 `launchWorker`): dedupe + fire-and-forget supervise, so a
+  // hull bought by MINE_EXPAND / FLEET_SCALE joins the pool. Initial traders are pre-registered below so
+  // a manager never double-spawns one. With every Wave-4 flag OFF no manager buys, so this never fires.
+  const launchedWorkers = new Set<string>();
+  const launchWorker = (sym: string): void => {
+    if (launchedWorkers.has(sym)) return;
+    launchedWorkers.add(sym);
+    void supervise(sym, deps);
+  };
+
+  // [WAVE-4] Assemble the injected subsystem hooks + background managers. Each subsystem is internally
+  // flag-guarded: with all Wave-4 flags OFF the hooks are no-ops and the managers idle/return, so the bot
+  // behaves identically to the Wave-3 trading-only build (the key safety property).
+  const subDeps = makeSubsystemDeps({ state, cfg, actions, router, markets, persistence, client, D, launchWorker });
+  deps.hooks = buildWorkerHooks(subDeps);
+
   const stopOpts: StopOptions = {};
   if (process.env['STOP_POLL'] === '1') stopOpts.poll = () => process.env['STOP'] === '1';
   const stopWatch = installStopHandlers(state, stopOpts);
-  const tasks = traders.map((s) => supervise(s.symbol, deps));
+  const tasks = traders.map((s) => {
+    launchedWorkers.add(s.symbol); // register so a manager never double-spawns an existing hull (bot2 L3200)
+    return supervise(s.symbol, deps);
+  });
   tasks.push(targetWatch(state, cfg, client, markets, persistence, marketHolder, DYNAMIC_TARGET));
+  tasks.push(...buildManagers(subDeps).map((m) => m()));
 
   await Promise.all([...tasks, stopWatch]);
   await persistence.flush();
