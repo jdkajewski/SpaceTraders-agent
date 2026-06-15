@@ -121,7 +121,7 @@ export async function main(): Promise<void> {
   log.info(`workers: ${traders.map((s) => `${s.symbol.slice(-3)}(spd${s.engine?.speed},cap${s.cargo.capacity})`).join(' ')}`);
   log.info(`🧭 phase ${state.currentPhase.name} — ${state.currentPhase.desc}`);
 
-  const deps: WorkerDeps = { state, cfg, actions, router, markets, persistence, D };
+  const deps: WorkerDeps = { state, cfg, actions, router, markets, persistence, client, D };
 
   const stopOpts: StopOptions = {};
   if (process.env['STOP_POLL'] === '1') stopOpts.poll = () => process.env['STOP'] === '1';
