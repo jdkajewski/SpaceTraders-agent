@@ -1,0 +1,5 @@
+{
+  "_comment": "LIVE gate credit band (no restart needed; bot re-reads on mtime change). floor = trading/contract nest egg we never spend gate cash below. resume = rebuild target before the next gate-buy burst. band (resume-floor) = disposable income spent per burst; wider = chunkier, less sawtooth. OPERATING_RESERVE is separate and always enforced.",
+  "floor": 900000,
+  "resume": 1500000
+}

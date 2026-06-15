@@ -19,7 +19,7 @@ import { navigate, buy, sell, deliver, fulfill, getShip, refuel, transfer, jump 
 import { createExpansion } from './expansion.mjs';
 import fs from 'node:fs';
 
-const SYSTEM = 'X1-PP30';
+const SYSTEM = process.env.SYSTEM || 'X1-PP30';
 const MAXD = Number(process.env.MAXD || 2000);   // consider lanes system-wide; true viability decided by net/min (router-costed), not a hard cap
 let FUEL_PX = 0.72;     // cr per FUEL UNIT — LIVE-updated from market FUEL price each cycle (see computeFuelPx).
                         // 0.72 is only the boot fallback (verified: a 100-unit refuel costs 72 cr → 0.72/unit).
@@ -28,6 +28,32 @@ let FUEL_PX = 0.72;     // cr per FUEL UNIT — LIVE-updated from market FUEL pr
 // (extracting faster than markets heal). Longer cooldown + higher floor makes ships idle (letting
 // prices recover) instead of scraping depleted lanes. Both env-tunable.
 const MIN_NET = Number(process.env.MIN_NET || 4000);          // per-lane gross-profit floor; below this a ship idles
+// [TRADE_FIRST] When set, normal trading is the PRIMARY income: a ship only runs the active contract on a loop
+// where NO profitable lane is available to it right now. This makes contracts opportunistic (filling idle time)
+// and guarantees an unsourceable/low-value starter contract can never block the fleet from trading (greenfield).
+const TRADE_FIRST = process.env.TRADE_FIRST === '1';
+// [CONTRACTS] Master switch (default ON). Set CONTRACTS=0 to fully disable contract negotiation, election, and the
+// per-ship contract runner — used in greenfield/cold-start where a starter contract's upfront capital commitment
+// starves a tiny trade economy (and an unsourceable good can stall a hull). Re-enable once the fleet has grown.
+const CONTRACTS = process.env.CONTRACTS !== '0';
+// [FLEET_SCALE] Greenfield/pre-gate autoscaling. While the gate is unbuilt, grow the fleet from trading profits:
+// (1) buy PROBES toward 1:1 market coverage (cheap, unlocks price visibility → more/fatter lanes), parking each at
+// an uncovered market; (2) once coverage is good, buy LIGHT_HAULERs to add trade throughput. All funded ONLY from
+// growthBudget above FLEET_SCALE_FLOOR (trading working-capital is never touched). A persistent "anchor" ship at the
+// buy-yard enables purchases without diverting the earner. Default OFF; enable with FLEET_SCALE=1.
+const FLEET_SCALE = process.env.FLEET_SCALE === '1';
+const FLEET_SCALE_FLOOR = Number(process.env.FLEET_SCALE_FLOOR || 30_000);   // keep ≥ this liquid for trading before any ship buy
+const FLEET_SCALE_MS = Number(process.env.FLEET_SCALE_MS || 120_000);        // manager cadence
+const FLEET_HAULER_MIN = Number(process.env.FLEET_HAULER_MIN || 350_000);    // only buy a (pricey) 80-cargo hauler once credits clear this
+const FLEET_SHUTTLE_MIN = Number(process.env.FLEET_SHUTTLE_MIN || 120_000);  // buy a cheap 2nd+ cargo SHUTTLE (~82k) once credits clear this
+const FLEET_TARGET_TRADERS = Number(process.env.FLEET_TARGET_TRADERS || 4);  // grow cargo-ship count toward this via shuttles before splurging on haulers
+// [PROBE↔CARGO BALANCE] Probes give market DATA (cheap, enable lanes + contract sourcing); cargo ships give INCOME
+// throughput (1 alone serializes trade-vs-contract). Scale them together: probeTarget = BASE + RATIO×(cargoShips-1),
+// capped at the market count. The autoscaler buys whichever side is behind its target each cycle → balanced growth.
+const FLEET_BASE_PROBES = Number(process.env.FLEET_BASE_PROBES || 5);        // baseline probes for the 1st cargo ship (enough data to trade + source contracts)
+const FLEET_PROBE_RATIO = Number(process.env.FLEET_PROBE_RATIO || 3);        // additional probes wanted per extra cargo ship
+const FLEET_MAX_PROBES = Number(process.env.FLEET_MAX_PROBES || 0);          // hard cap (0 = the system's market count, i.e. full 1:1)
+const FLEET_MAX_HAULERS = Number(process.env.FLEET_MAX_HAULERS || 6);        // cap added haulers in the pre-gate phase
 // [MULTI-GOOD] Ride-along loadouts: after buying the primary good, fill the rest of the hold with OTHER
 // goods that are ALSO sold at the source AND profitably sink at the SAME destination (zero detour, zero
 // extra fuel). Data: cap-80 hulls run ~33% full because high-margin goods cap at tradeVolume ~20; ~27% of
@@ -158,14 +184,14 @@ const HAULER_PRICE = Number(process.env.HAULER_PRICE || 314_345);
 // gate. Trade-first (only fires on idle), credit-floored (construction supply pays $0, so never dip
 // below GATE_CREDIT_FLOOR), and work is split across idle ships via in-memory unit reservations.
 const GATE_SUPPLY = process.env.GATE_SUPPLY !== '0';                              // default ON; set GATE_SUPPLY=0 to disable
-const GATE_CREDIT_FLOOR = Number(process.env.GATE_CREDIT_FLOOR || 1_500_000);     // keep ≥ this cash while feeding the gate
+let GATE_CREDIT_FLOOR = Number(process.env.GATE_CREDIT_FLOOR || 1_500_000);       // keep ≥ this cash while feeding the gate (live-tunable via gate-levers.json)
 // [GATE] Hysteresis on the credit floor. The floor is a HARD stop: once credits dip below GATE_CREDIT_FLOOR we
 // pause gate buying. WITHOUT a deadband, the moment credits tick back above the floor we buy one batch and
 // instantly fall under again → sawtooth (buy/pause/buy/pause every cycle). With hysteresis we DON'T resume
 // until credits recover to GATE_CREDIT_RESUME (floor + GAP). That lets a real buffer rebuild, then we can buy
 // AGGRESSIVELY down toward the floor in a sustained burst before pausing again. Tune the gap to set burst size.
 const GATE_CREDIT_RESUME_GAP = Number(process.env.GATE_CREDIT_RESUME_GAP || 250_000);
-const GATE_CREDIT_RESUME = Number(process.env.GATE_CREDIT_RESUME || (GATE_CREDIT_FLOOR + GATE_CREDIT_RESUME_GAP));
+let GATE_CREDIT_RESUME = Number(process.env.GATE_CREDIT_RESUME || (GATE_CREDIT_FLOOR + GATE_CREDIT_RESUME_GAP));
 const GATE_SUPPLY_MAX_UNITS = Number(process.env.GATE_SUPPLY_MAX_UNITS || 0);     // 0 = up to free cargo capacity
 // [GATE_FUEL_CARGO] When a gate-bound leg can't be flown on a single tank, the tank-only router detours through a
 // FUEL market (extra hop). If the hauler has spare cargo slots (the per-trip material buy is usually tradeVolume-
@@ -196,6 +222,15 @@ const GATE_MAX_PRICE = (() => { const out = {}; for (const p of (process.env.GAT
 // normally with no delay. Set GATE_PRICE_SETTLE_MS=0 to disable (instant buy at the cap, legacy behavior).
 const GATE_PRICE_SETTLE_MS = Number(process.env.GATE_PRICE_SETTLE_MS ?? 240000);
 const GATE_PRICE_REBOUND_EPS = Number(process.env.GATE_PRICE_REBOUND_EPS ?? 0.02);
+// [FEED FOCUS] Buy-timing PATIENCE for the input feed — the mirror of the gate-material price-settle window, applied
+// to the INPUT source price so we feed at a good price instead of into a spike. Each input has a cap = the most we'll
+// pay for it = (what the producer pays for it) + FEED_MAX_LOSS_PER_UNIT, overridable per-good via FEED_MAX_PRICE
+// ("IRON:160,QUARTZ_SAND:40"). When a source spikes ABOVE the cap we pause that input; when it drops back under, we
+// wait up to FEED_PRICE_SETTLE_MS for it to bottom (resuming on a rebound off the low, FEED_PRICE_REBOUND_EPS) before
+// buying — so we catch the proper low, not the first tick. Set FEED_PRICE_SETTLE_MS=0 to buy instantly at the cap.
+const FEED_PRICE_SETTLE_MS = Number(process.env.FEED_PRICE_SETTLE_MS ?? GATE_PRICE_SETTLE_MS);
+const FEED_PRICE_REBOUND_EPS = Number(process.env.FEED_PRICE_REBOUND_EPS ?? GATE_PRICE_REBOUND_EPS);
+const FEED_MAX_PRICE = (() => { const out = {}; for (const p of (process.env.FEED_MAX_PRICE || '').split(',')) { const [k, v] = p.split(':'); if (k && v && Number(v) > 0) out[k.trim()] = Number(v); } return out; })();
 // [FAB GUARD] Protect the gate-material supply chain from PROFIT trading. The profit engine must never (a) trade
 // a gate material itself, nor (b) buy ANY good OUT OF a gate-material producer market (F51 makes FAB_MATS, D43
 // makes ADVANCED_CIRCUITRY) — pulling goods out of those markets depletes their production throughput and drives
@@ -211,6 +246,16 @@ const GATE_PROTECT_MATERIALS = new Set((process.env.GATE_PROTECT_MATERIALS || 'F
 // on, contract sourcing SKIPS the gate-material producer markets for those goods and walks down the market list
 // to the next-cheapest source that still clears the contract margin gate. Set =0 to allow buying from producers.
 const CONTRACT_AVOID_GATE_PRODUCER = process.env.CONTRACT_AVOID_GATE_PRODUCER !== '0';
+// [FEED FOCUS] The LONG-POLE gate material(s) whose producer we actively keep fed so it produces cheaply and the
+// gate completes faster. FAB_MATS is the long pole (1500+ units, SCARCE inputs); ADVANCED_CIRCUITRY is nearly done
+// and its inputs (MACHINERY/MICROPROCESSORS) are fat trade lanes already feeding D45 as a side effect, so we leave
+// those tradeable. For each focus producer we (a) RESERVE its imported inputs — normal profit lanes / ride-alongs
+// may not buy them to sell anywhere but a focus producer (so trades don't divert supply or bid the input price up),
+// and (b) run a DEDICATED input-feed willing to feed those inputs down to a small capped LOSS per unit (a gate
+// INVESTMENT, not trade profit) — especially while gate-buy is credit-floor paused and a gate hauler is otherwise idle.
+const FEED_FOCUS_MATERIALS = new Set((process.env.FEED_FOCUS_MATERIALS || 'FAB_MATS').split(',').map((s) => s.trim()).filter(Boolean));
+const FEED_MAX_LOSS_PER_UNIT = Number(process.env.FEED_MAX_LOSS_PER_UNIT || 30);   // feed a focus producer's inputs down to this loss/unit (0 = profit-only)
+const FEED_RESERVE_INPUTS = process.env.FEED_RESERVE_INPUTS !== '0';                // reserve focus producers' inputs from non-feed profit trades/ride-alongs
 // [GATE] Cap how many ships gate-supply CONCURRENTLY. Buying an EXPORT depletes its supply → price spikes
 // (live: D43 ADVANCED_CIRCUITRY 3,958→9,549 once 8 idle hulls piled on). Limiting simultaneous suppliers
 // lets the producer restock between pulls so materials stay cheap. Dedicated GATE_HAULERS always bypass
@@ -241,7 +286,14 @@ let expansionTarget = CREDIT_TARGET || 8_000_000;             // recomputed live
 // Operating reserve = guesstimate of near-term needs: FUEL to keep the whole fleet
 // moving + GOODS working capital (a cushion of cargo buys). Recomputed from the live
 // fleet (changes over time). v2 should persist this time-series to the DB + refine via ML.
-const GOODS_CUSHION = Number(process.env.GOODS_CUSHION || 300_000); // working capital for in-flight/next cargo buys
+const GOODS_CUSHION = Number(process.env.GOODS_CUSHION || 300_000); // base working capital for in-flight/next cargo buys
+// Per-cargo-ship working-capital cushion: the reserve grows by this much for each trading hull, so a multi-ship
+// fleet always keeps enough liquid to fund concurrent loads (prevents the drain-to-zero deadlock). ~1 cap-40 load.
+const GOODS_CUSHION_PER_SHIP = Number(process.env.GOODS_CUSHION_PER_SHIP || 25_000);
+// [ROLLING RESERVE] How many fresh concurrent loads of working capital to hold in the reserve. The `committed`
+// accounting already serializes in-flight buys, so this only needs to seed a few simultaneous new loads (not one
+// per ship). Keeps the reserve modest so a credit dip never freezes trading, while preventing a drain-to-zero.
+const RESERVE_CONCURRENCY = Number(process.env.RESERVE_CONCURRENCY || 3);
 let OPERATING_RESERVE = Number(process.env.OPERATING_RESERVE || 200_000); // recomputed at startup from fleet
 const NEGOTIATOR = process.env.NEGOTIATOR || 'SPACEJAM-DK-2-15';
 const here = (p) => new URL(p, import.meta.url);
@@ -370,11 +422,15 @@ function buildLanes(markets) {
   const activeMats = activeGateMaterials();
   const protectedWps = new Set();
   if (GATE_PROTECT) for (const mat of activeMats) { const w = findProducerWp(markets, mat); if (w) protectedWps.add(w); }
+  const inputGoods = gateInputGoods(markets);            // [FEED FOCUS] reserved FAB_MATS inputs (empty unless reserving)
+  const focusProducers = focusProducerWps(markets);      // [FEED FOCUS] the only sinks a reserved input may be sold into
   const best = {};
   for (const [sym, entries] of Object.entries(goods)) {
     if (GATE_PROTECT && activeMats.has(sym)) continue;                       // never profit-trade a still-needed gate material
+    const reservedInput = inputGoods.has(sym);                              // [FEED FOCUS] this good is a focus producer's input
     for (const b of entries) for (const s of entries) {
       if (GATE_PROTECT && protectedWps.has(b.wp)) continue;                   // don't buy OUT OF a gate-material producer market
+      if (reservedInput && !focusProducers.has(s.wp)) continue;              // [FEED FOCUS] reserved input: only a lane that FEEDS a focus producer is allowed
       if (s.sellPrice <= b.purchasePrice || b.purchasePrice <= 0) continue;
       const dist = D(b.wp, s.wp); if (dist > MAXD) continue;
       const units = Math.min(Math.min(b.tradeVolume, s.tradeVolume), 20);
@@ -402,11 +458,14 @@ function planRideAlongs(markets, lane, freeUnits, cashBudget, excludeSyms = null
   const dstSell = {};
   for (const g of dst.tradeGoods || []) dstSell[g.symbol] = g;
   const activeMats = activeGateMaterials();
+  const inputGoods = gateInputGoods(markets);            // [FEED FOCUS] reserved focus-producer inputs
+  const focusProducers = focusProducerWps(markets);
   const cands = [];
   for (const g of src.tradeGoods || []) {
     if (g.symbol === lane.sym || !(g.purchasePrice > 0)) continue;
     if (excludeSyms && excludeSyms.has(g.symbol)) continue;                 // [DEDUP] don't stack onto goods already aboard
     if (GATE_PROTECT && activeMats.has(g.symbol)) continue;                 // never ride-along a still-needed gate material
+    if (inputGoods.has(g.symbol) && !focusProducers.has(lane.sellWp)) continue;  // [FEED FOCUS] reserved input ride-along only when feeding a focus producer
     const d = dstSell[g.symbol];
     if (!d || !(d.sellPrice > 0)) continue;
     const margin = d.sellPrice - g.purchasePrice;
@@ -472,14 +531,24 @@ function commit(amount) { committed += amount; }
 function uncommit(amount) { committed = Math.max(0, committed - amount); }
 async function refreshCredits() { try { cachedCredits = (await api('GET', '/my/agent')).data.credits; } catch {} }
 
-// Recompute the operating reserve from the live fleet: fuel to fully top off every
-// hull (keep everyone moving) + a goods working-capital cushion. Guesstimate; v2 will
-// refine from observed fuel burn + lane buy-cost distributions and store the series in DB.
+// [ROLLING RESERVE] OPERATING_RESERVE = (A) fuel to top off the WHOLE fleet at the live fuel price + (B) a rolling
+// working-capital buffer sized from the ACTUAL recent lane buy-cost (EMA) times a small concurrency factor. We do
+// NOT reserve one full load per ship: the `committed` accounting already debits availableForWork() per in-flight
+// claim, so it serializes concurrent buys. The reserve is just the floor (keep everyone fueled + seed a few loads).
+let laneCostEMA = 0;   // rolling avg of claimed-lane estCost (actual working capital a trade consumes)
+function noteLaneCost(c) { if (c > 0) laneCostEMA = laneCostEMA > 0 ? Math.round(0.8 * laneCostEMA + 0.2 * c) : c; }
 async function recomputeReserve() {
   try {
     const ships = await getAllShips();
-    const fuelReserve = ships.reduce((a, s) => a + (s.fuel?.capacity || 0), 0) * FUEL_PX; // one full fleet refuel
-    OPERATING_RESERVE = Math.round(fuelReserve + GOODS_CUSHION);
+    // (A) FUEL: cost to fully top off every hull at the current live fuel price (rolling via FUEL_PX + fleet size).
+    const fuelReserve = ships.reduce((a, s) => a + (s.fuel?.capacity || 0), 0) * FUEL_PX;
+    // (B) WORKING CAPITAL: rolling lane-cost × a small concurrency buffer (seed a few simultaneous loads). Falls back
+    // to GOODS_CUSHION_PER_SHIP until we've observed real lane costs. Bounded so a few fat lanes can't balloon it.
+    const cargoShips = ships.filter((s) => (s.cargo?.capacity || 0) >= 30).length;
+    const perLoad = laneCostEMA > 0 ? laneCostEMA : GOODS_CUSHION_PER_SHIP;
+    const buffer = Math.min(cargoShips, RESERVE_CONCURRENCY);   // only reserve cash for ~this many concurrent fresh loads
+    const workingCapital = GOODS_CUSHION + perLoad * buffer;
+    OPERATING_RESERVE = Math.round(fuelReserve + workingCapital);
   } catch {}
 }
 
@@ -537,11 +606,34 @@ function gateSupplyActive() {
   return GATE_SUPPLY && gateCache.exists && !gateCache.built && gateCache.known;
 }
 
+// [LIVE-TUNE] The gate credit band (FLOOR = trading/contract nest egg we never spend gate cash below; the
+// FLOOR→RESUME deadband = anti-sawtooth burst size = the "disposable income" chunk the gate spends per burst)
+// is re-read from gate-levers.json at runtime so it can be widened/narrowed WITHOUT a restart. Only re-parsed
+// when the file's mtime changes. Accepts { floor, resume } or { floor, gap } (resume = floor + gap). This band
+// is PURELY the gate's own anti-sawtooth/nest-egg lever — it is SEPARATE from OPERATING_RESERVE, which is the
+// universal floor every purchase (incl. the gate, via growthBudget in planGateFill headroom) already respects.
+let gateLeverMtime = -1;
+function reloadGateLevers() {
+  try {
+    const st = fs.statSync(here('./gate-levers.json'));
+    if (st.mtimeMs === gateLeverMtime) return;                       // unchanged → skip re-parse
+    gateLeverMtime = st.mtimeMs;
+    const j = JSON.parse(fs.readFileSync(here('./gate-levers.json'), 'utf8'));
+    let changed = false;
+    if (Number.isFinite(j.floor) && j.floor !== GATE_CREDIT_FLOOR) { GATE_CREDIT_FLOOR = j.floor; changed = true; }
+    const resume = Number.isFinite(j.resume) ? j.resume : (Number.isFinite(j.gap) ? GATE_CREDIT_FLOOR + j.gap : null);
+    if (resume != null && resume !== GATE_CREDIT_RESUME) { GATE_CREDIT_RESUME = resume; changed = true; }
+    if (GATE_CREDIT_RESUME <= GATE_CREDIT_FLOOR) GATE_CREDIT_RESUME = GATE_CREDIT_FLOOR + GATE_CREDIT_RESUME_GAP;  // keep a real deadband
+    if (changed) log(`⚙ gate levers reloaded — nest-egg floor ${GATE_CREDIT_FLOOR.toLocaleString()} → burst resume ${GATE_CREDIT_RESUME.toLocaleString()} (band ${(GATE_CREDIT_RESUME - GATE_CREDIT_FLOOR).toLocaleString()})`);
+  } catch { /* no file or malformed → keep current (env-seeded) values */ }
+}
+
 // [GATE] Hysteresis latch for the credit floor. HARD stop at GATE_CREDIT_FLOOR; only RESUME once credits
 // recover to GATE_CREDIT_RESUME. Between the two thresholds we hold the previous state (the deadband), which
 // kills the at-floor sawtooth and lets buying run in sustained bursts. Updated each loop from cachedCredits.
 let gateBuyPaused = false;
 function gateCreditOk() {
+  reloadGateLevers();                                                // pick up any live band edit before deciding
   const was = gateBuyPaused;
   if (cachedCredits < GATE_CREDIT_FLOOR) gateBuyPaused = true;              // hard stop: arm the latch
   else if (cachedCredits >= GATE_CREDIT_RESUME) gateBuyPaused = false;     // recovered past resume band: release
@@ -674,6 +766,7 @@ function claimLane(ship, lanes, markets) {
   if (PARK_MIN_NET > 0 && bestProjected < PARK_MIN_NET) return { park: true, score: bestScore, projectedNet: bestProjected }; // best lane too thin → park
   gs(best.sym).lockedBy = ship.symbol;                            // lock synchronously
   commit(bestCost);                                               // reserve the cash synchronously
+  noteLaneCost(bestCost);                                          // feed the rolling working-capital estimate
   return { lane: best, score: bestScore, cost: bestCost, projectedNet: bestProjected };
 }
 
@@ -784,6 +877,7 @@ function electContractOwner(ci, markets, ships) {
 }
 
 async function contractManager() {
+  if (!CONTRACTS) { log('📜 contracts DISABLED (CONTRACTS=0) — trading only'); return; }
   while (!stop) {
     try {
       const cs = await getAllContracts();
@@ -810,6 +904,9 @@ async function contractManager() {
           // Negotiate the next contract whenever no freighter is mid-delivery. (We intentionally do NOT gate on
           // contractClaim here: contractClaim's only consumer, tryClaimContract, is disabled, so a stale claim would
           // otherwise permanently block negotiation — the bug that stalled contracts after 00:54.)
+          // [NEGOTIATOR DOCK] negotiate/contract requires the negotiator DOCKED. When it's a parked price-feed probe
+          // (greenfield) it sits in ORBIT → 400 "not docked". Dock it first (docking keeps its market price feed).
+          try { await api('POST', `/my/ships/${NEGOTIATOR}/dock`); } catch {}
           const r = await api('POST', `/my/ships/${NEGOTIATOR}/negotiate/contract`);
           const c = r.data.contract; await api('POST', `/my/contracts/${c.id}/accept`);
           const d = c.terms.deliver[0];
@@ -895,6 +992,28 @@ function cheapestSrc(markets, good, excludeWps = null) {
 function gateProducerWps(markets) {
   const set = new Set();
   if (GATE_PROTECT) for (const mat of activeGateMaterials()) { const w = findProducerWp(markets, mat); if (w) set.add(w); }
+  return set;
+}
+
+// [FEED FOCUS] Producers (EXPORT markets) of still-NEEDED focus materials (the long pole we keep fed, e.g. FAB_MATS@F49).
+function focusProducerWps(markets) {
+  const set = new Set();
+  for (const mat of activeGateMaterials()) {
+    if (!FEED_FOCUS_MATERIALS.has(mat)) continue;
+    const w = findProducerWp(markets, mat); if (w) set.add(w);
+  }
+  return set;
+}
+// [FEED FOCUS] The input goods a focus producer IMPORTS (e.g. IRON/QUARTZ_SAND/SILICON_CRYSTALS/COPPER for FAB_MATS).
+// RESERVED: normal profit lanes / ride-alongs may not BUY these to sell anywhere but a focus producer (the feed).
+// Empty when FEED_RESERVE_INPUTS is off, the gate is built, or no focus material is still needed.
+function gateInputGoods(markets) {
+  const set = new Set();
+  if (!FEED_RESERVE_INPUTS) return set;
+  for (const wp of focusProducerWps(markets)) {
+    const m = markets[wp]; if (!m) continue;
+    for (const g of m.tradeGoods || []) if (g.type === 'IMPORT') set.add(g.symbol);
+  }
   return set;
 }
 
@@ -1021,7 +1140,22 @@ async function contractRunnerTrip(shipSym, ship, markets) {
           return false;
         }
         perShip[shipSym].last = `CONTRACT src ${ci.good}@${src.wp.slice(-3)}`;
-        try { await buy(shipSym, ci.good, want - have, Math.round(src.px * 2)); } catch (e) { log(`${shipSym.slice(-3)} contract source ERR ${e.message}`); }
+        // [RESERVE] All expenses go through the operating reserve: cap the contract buy to funds free above
+        // OPERATING_RESERVE (committed-aware) so sourcing can't draw working capital below the reserve. The
+        // contract delivers PARTIAL and accumulates server-side, so a budget-capped buy just chips over more
+        // loops instead of bankrupting us — and even a forced clear stays inside the reserve. commit() for the
+        // buy window so a concurrent trade claim on another ship can't oversubscribe the same cash.
+        const unitPx = Math.max(1, Math.round(src.px * (1 + SLIPPAGE_FACTOR)));
+        const affordable = Math.max(0, Math.floor(availableForWork() / unitPx));
+        const qty = Math.min(want - have, affordable);
+        if (qty <= 0) {
+          if (DBG_CONTRACT) log(`ctr⏸ ${shipSym.slice(-3)} ${ci.good} buy deferred — avail ${Math.round(availableForWork()).toLocaleString()} < unit ${unitPx} (reserve ${OPERATING_RESERVE.toLocaleString()})`);
+        } else {
+          const estCost = qty * unitPx;
+          commit(estCost);
+          try { await buy(shipSym, ci.good, qty, Math.round(src.px * 2)); } catch (e) { log(`${shipSym.slice(-3)} contract source ERR ${e.message}`); }
+          uncommit(estCost);
+        }
         const sourced = await getShip(shipSym);
         have = cargoUnits(sourced, ci.good);
         // [MULTI-GOOD] The contract rarely fills the hold (e.g. 18 units in a cap-80 hull). While we're standing
@@ -1131,6 +1265,24 @@ function gateBuyAllowed(sym, curMinPx, cap) {
     const waited = Date.now() - st.since >= GATE_PRICE_SETTLE_MS;
     const rebounded = curMinPx > st.low * (1 + GATE_PRICE_REBOUND_EPS);
     if (waited || rebounded) { st.state = 'normal'; log(`gate ${sym} price settled @${curMinPx} (low ${st.low}, ${rebounded ? 'rebounded' : 'timeout'}) → resuming buys`); return true; }
+    return false;
+  }
+  return true;
+}
+
+// [FEED FOCUS] Buy-timing patience for input-feed source prices — the gateBuyAllowed mirror, separate state so the
+// feed and the gate-material buys never share/clobber each other's settle latches. cap = max we'll pay for this input.
+const feedPxState = {}; // sym -> { state:'paused'|'settling'|'normal', since, low }
+function feedBuyAllowed(sym, curPx, cap) {
+  if (!cap || !(FEED_PRICE_SETTLE_MS > 0)) return !cap ? true : curPx <= cap;   // patience off → cap is a hard line
+  const st = feedPxState[sym] || (feedPxState[sym] = { state: 'normal' });
+  if (curPx > cap) { st.state = 'paused'; return false; }
+  if (st.state === 'paused') { st.state = 'settling'; st.since = Date.now(); st.low = curPx; log(`feed ${sym} dropped under cap ${cap} @${curPx} → settling (watch for a lower entry)`); return false; }
+  if (st.state === 'settling') {
+    st.low = Math.min(st.low, curPx);
+    const waited = Date.now() - st.since >= FEED_PRICE_SETTLE_MS;
+    const rebounded = curPx > st.low * (1 + FEED_PRICE_REBOUND_EPS);
+    if (waited || rebounded) { st.state = 'normal'; log(`feed ${sym} price settled @${curPx} (low ${st.low}, ${rebounded ? 'rebounded' : 'timeout'}) → resuming feed buys`); return true; }
     return false;
   }
   return true;
@@ -1263,7 +1415,11 @@ async function gateSupplyTrip(shipSym, ship, markets) {
   if (GATE_SUPPLY_MAX_UNITS > 0) free = Math.min(free, GATE_SUPPLY_MAX_UNITS);
   const buys = planGateFill(g.remaining, gateClaims, markets, {
     free,
-    headroom: cachedCredits - GATE_CREDIT_FLOOR,
+    // [RESERVE] Gate spend goes through the operating reserve like every other expense: cap headroom by
+    // BOTH the gate credit-floor (overspend guard) AND growthBudget() (= credits − committed in-flight −
+    // OPERATING_RESERVE). Whichever is more restrictive binds, so gate buying can never dip working capital
+    // below the rolling reserve (fuel + lane buffer) or double-spend cash already committed to trades.
+    headroom: Math.min(growthBudget(), cachedCredits - GATE_CREDIT_FLOOR),
     slippage: SLIPPAGE_FACTOR,
     ceilFactor: GATE_PRICE_CEIL_FACTOR,
     absMax: GATE_MAX_PRICE,
@@ -1351,7 +1507,7 @@ function gateProducerInputTargets(markets) {
 // (its IMPORT entry's sellPrice = what we receive), find the cheapest EXTERNAL producer source and keep it
 // only if margin > 0. Greedy by per-lot gross, one tradeVolume lot each (off the slippage curve), bounded
 // by free cargo + cash headroom. Returns [{ sym, srcWp, buyPx, sellPx, margin, tv, units }].
-function planInputFeed(producerWp, inputs, markets, { free, headroom }) {
+function planInputFeed(producerWp, inputs, markets, { free, headroom, maxLoss = 0 }) {
   if (free <= 0 || headroom <= 0) return [];
   const dst = markets[producerWp];
   if (!dst) return [];
@@ -1370,7 +1526,11 @@ function planInputFeed(producerWp, inputs, markets, { free, headroom }) {
     }
     if (!bestSrc) continue;
     const margin = d.sellPrice - bestSrc.px;
-    if (margin <= 0) continue;   // never feed at a loss — the accelerator must pay for itself
+    if (margin < -maxLoss) continue;   // [FEED FOCUS] feed down to a capped LOSS/unit for focus producers (maxLoss>0); never below
+    // [FEED FOCUS] Buy-timing: cap = what the producer pays + the allowed loss (or a tighter FEED_MAX_PRICE override).
+    // Pause this input when its source is above the cap; once under, the settle window waits for the low before buying.
+    const cap = FEED_MAX_PRICE[sym] ?? (d.sellPrice + maxLoss);
+    if (!feedBuyAllowed(sym, bestSrc.px, cap)) continue;
     const tv = Math.min(bestSrc.tv || 20, d.tradeVolume || 20);
     cands.push({ sym, srcWp: bestSrc.wp, buyPx: bestSrc.px, sellPx: d.sellPrice, margin, tv, scarce: SUPPLY_RANK[d.supply] ?? 2 });
   }
@@ -1404,12 +1564,16 @@ async function inputFeedTrip(shipSym, ship, markets) {
   const free = ship.cargo.capacity - (ship.cargo.units || 0);
   if (free <= 0) return false;
 
-  let chosen = null, plan = null;
+  let chosen = null, plan = null, chosenMaxLoss = 0;
+  const focusSet = focusProducerWps(markets);
   for (const t of gateProducerInputTargets(markets)) {
     if (inputActiveProducers.has(t.producerWp)) continue;   // [GUARDRAIL] 1 feeder per producer — never let two of our ships sell into the same import market at once
-    const p = planInputFeed(t.producerWp, t.inputs, markets, { free, headroom: growthBudget() });
+    const maxLoss = focusSet.has(t.producerWp) ? FEED_MAX_LOSS_PER_UNIT : 0;   // [FEED FOCUS] long-pole producer may be fed at a capped loss
+    const p = planInputFeed(t.producerWp, t.inputs, markets, { free, headroom: growthBudget(), maxLoss });
     const estNet = p.reduce((s, b) => s + b.margin * b.units, 0);
-    if (p.length && estNet >= INPUT_FEED_MIN_GROSS) { chosen = t; plan = p; break; }
+    // Focus producers: accept even a (capped) net-negative feed — it's a gate investment, per-unit loss already bounded
+    // by maxLoss in planInputFeed. Non-focus producers must still clear INPUT_FEED_MIN_GROSS (profit-only).
+    if (p.length && (maxLoss > 0 || estNet >= INPUT_FEED_MIN_GROSS)) { chosen = t; plan = p; chosenMaxLoss = maxLoss; break; }
   }
   if (!chosen) return false;
 
@@ -1455,8 +1619,10 @@ async function inputFeedTrip(shipSym, ship, markets) {
       if (got <= 0) continue;
       const avgCost = (paid[b.sym] || 0) / got;
       const cur = fresh ? (freshBuy[b.sym] ?? 0) : null;   // null ⇒ refetch failed, fall back to selling
-      if (cur != null && cur > 0 && cur * got < (paid[b.sym] || 0)) {
-        log(`🛡️ ${shipSym.slice(-3)} HOLD ${b.sym}: producer buy ${cur} < cost ${Math.round(avgCost)} — salvaging later, not dumping at a loss`);
+      // [FEED FOCUS] HOLD only if the live loss EXCEEDS the allowed cap. For focus feeds we INTEND to accept up to
+      // chosenMaxLoss/unit, so a small loss is fine to sell; a deeper drop means HOLD + salvage later (don't dump).
+      if (cur != null && cur > 0 && (avgCost - cur) > chosenMaxLoss) {
+        log(`🛡️ ${shipSym.slice(-3)} HOLD ${b.sym}: producer buy ${cur} < cost ${Math.round(avgCost)} (loss > cap ${chosenMaxLoss}) — salvaging later, not dumping`);
         continue;
       }
       try { const rs = await sell(shipSym, b.sym); realized += rs.got || 0; spentSold += paid[b.sym] || 0; }
@@ -2029,9 +2195,35 @@ async function transportTrip(shipSym, ship, markets) {
 // A long leg that exceeds one fuel tank should hop through fuel-selling waypoints in CRUISE
 // instead of DRIFTing the whole way (which is ~10× slower). Edge A→B exists if dist ≤ tank and
 // B is a fuel node (or the destination). Minimizes total CRUISE time.
+//
+// [FUEL-NODE ROBUSTNESS] A waypoint sells FUEL if it appears in the market's tradeGoods (live prices, ONLY present
+// when we have a ship there) OR in its exchange/imports/exports STRUCTURE (returned by the API even with NO ship
+// present). The old check used tradeGoods ONLY, so at restart — before probes re-settle at every market — fuel
+// stations were invisible to the router → planRoute couldn't find intermediate refuel hops → it returned null →
+// the ship fell back to a single multi-hour DRIFT leg (the bug that stranded ships at outliers like J62). We also
+// keep a STICKY disk-backed set: fuel stations never move, so once observed a waypoint stays a fuel node forever,
+// surviving any transient fetch gap. The router graph is thus always complete regardless of where ships happen to be.
+const FUEL_NODES_FILE = here('./fuel-nodes.json');
+const stickyFuelNodes = new Set();
+try { for (const w of JSON.parse(fs.readFileSync(FUEL_NODES_FILE, 'utf8'))) stickyFuelNodes.add(w); } catch {}
+// Seed from the persisted markets.json STRUCTURE at module load (exchange/imports/exports survive across restarts and
+// don't need a ship present), so the router has a complete fuel graph from the very first resume, before getMarkets().
+try {
+  const mj = JSON.parse(fs.readFileSync(here('./markets.json'), 'utf8'));
+  for (const [w, m] of Object.entries(mj)) if ([...(m.exchange || []), ...(m.imports || []), ...(m.exports || []), ...(m.tradeGoods || [])].some((g) => (g.symbol || g) === 'FUEL')) stickyFuelNodes.add(w);
+} catch {}
+function marketSellsFuel(m) {
+  if (!m) return false;
+  if ((m.tradeGoods || []).some((g) => g.symbol === 'FUEL')) return true;              // live (ship present)
+  return [...(m.exchange || []), ...(m.imports || []), ...(m.exports || [])].some((g) => (g.symbol || g) === 'FUEL'); // structure (always returned)
+}
 function fuelNodes(markets) {
+  let grew = false;
+  for (const [w, m] of Object.entries(markets || {})) if (marketSellsFuel(m) && !stickyFuelNodes.has(w)) { stickyFuelNodes.add(w); grew = true; }
+  if (grew) { try { fs.writeFileSync(FUEL_NODES_FILE, JSON.stringify([...stickyFuelNodes])); } catch {} }
+  // Return only fuel nodes we have coordinates for (router needs coords). Sticky set is the union of all ever seen.
   const s = new Set();
-  for (const [w, m] of Object.entries(markets)) if ((m.tradeGoods || []).some((g) => g.symbol === 'FUEL')) s.add(w);
+  for (const w of stickyFuelNodes) if (coords[w]) s.add(w);
   return s;
 }
 function planRoute(from, to, fuelCap, markets) {
@@ -2382,7 +2574,11 @@ async function worker(shipSym) {
     if (isGateHauler(shipSym)) {
       if (GATE_SUPPLY && gateCache.exists && !gateCache.built) {
         if (await gateSupplyTrip(shipSym, ship, markets)) continue;
-        perShip[shipSym].last = 'PARKED (gate hauler, no supply now)';
+        // [FEED FOCUS] gate-buy is credit-floor paused (or nothing to supply) → don't idle a freighter. Shuttle the
+        // long-pole producer's inputs to it (capped-loss feed) so FAB_MATS keeps being produced and its price stays
+        // low while the nest egg rebuilds. Falls through to park only if there's no feed available right now.
+        if (await inputFeedTrip(shipSym, ship, markets)) continue;
+        perShip[shipSym].last = 'PARKED (gate hauler, no supply/feed now)';
         perShip[shipSym].projected = 0;
         await sleep(IDLE_WAIT_MS); continue;
       }
@@ -2439,9 +2635,15 @@ async function worker(shipSym) {
     // 0) CONTRACTS: run on whichever ship is best-positioned, gated by efficiency (contractWorthIt). Pinned hulls
     //    if CONTRACT_RUNNER is set, else ANY freighter (cargo >= 40). The runner self-gates and self-locks (one
     //    owner at a time), so ships for which sourcing isn't worth it from here simply fall through to trading.
-    const contractEligible = CONTRACT_RUNNER.size ? isContractRunner(shipSym) : (ship.cargo.capacity >= 40);
+    const contractEligible = CONTRACTS && (CONTRACT_RUNNER.size ? isContractRunner(shipSym) : (ship.cargo.capacity >= 40));
     if (contractEligible) {
-      if (await contractRunnerTrip(shipSym, ship, markets)) continue;
+      // [TRADE_FIRST] Trading is primary income. If a profitable lane is available to this ship right now, skip the
+      // contract this loop and go trade — so an unsourceable/low-value contract can never block the fleet. The
+      // contract still runs whenever the ship would otherwise be idle (no lane), keeping it opportunistic.
+      const lanePref = TRADE_FIRST ? claimLane(ship, buildLanes(markets), markets) : null;
+      if (!lanePref) {
+        if (await contractRunnerTrip(shipSym, ship, markets)) continue;
+      }
     }
 
     // 0b) deliver-what-you-hold: if this ship already carries the active contract's goods
@@ -2779,6 +2981,128 @@ async function mineExpandManager() {
   }
 }
 
+// [FLEET_SCALE] Greenfield autoscaler — see the env block above. Buys probes→1:1 coverage, then haulers, from surplus.
+// Probes are parked at uncovered markets (NO worker — they just feed prices). Haulers get launchWorker → trade pool.
+function isProbeHull(s) { return s.frame?.symbol === 'FRAME_PROBE' || (s.fuel?.capacity === 0 && (s.cargo?.capacity || 0) === 0); }
+async function fleetScaleManager(ctx) {
+  if (!FLEET_SCALE) return;
+  await sleep(25_000);   // let startup + first lane settle
+  // locate the best yard to anchor at: prefer one that sells BOTH probes AND a cargo ship (shuttle/hauler) so a
+  // single anchor enables every purchase. Fall back to separate yards only if no combined yard exists.
+  let probeYard = null, cargoYard = null, anchorYard = null;
+  try {
+    const swps = (await api('GET', `/systems/${SYSTEM}/waypoints?limit=20&traits=SHIPYARD`)).data || [];
+    const sells = {};   // wp -> Set(shipTypes)
+    for (const w of swps) {
+      try {
+        const sy = (await api('GET', `/systems/${SYSTEM}/waypoints/${w.symbol}/shipyard`)).data;
+        sells[w.symbol] = new Set((sy.shipTypes || []).map((t) => t.type));
+      } catch {}
+    }
+    const hasProbe = (wp) => sells[wp]?.has('SHIP_PROBE');
+    const hasCargo = (wp) => sells[wp]?.has('SHIP_LIGHT_HAULER') || sells[wp]?.has('SHIP_LIGHT_SHUTTLE');
+    // combined yard first (probe + cargo at one waypoint)
+    anchorYard = Object.keys(sells).find((wp) => hasProbe(wp) && hasCargo(wp)) || null;
+    probeYard = anchorYard || Object.keys(sells).find(hasProbe) || null;
+    cargoYard = anchorYard || Object.keys(sells).find(hasCargo) || null;
+  } catch {}
+  if (!anchorYard) anchorYard = probeYard;   // no combined yard → anchor where probes sell (cargo buys may be limited)
+  if (!probeYard) { log('🛰 FLEET_SCALE: no probe-selling shipyard found — disabled'); return; }
+  log(`🛰 FLEET_SCALE armed — anchorYard ${anchorYard?.slice(-3)} (probe ${probeYard?.slice(-3)}, cargo ${cargoYard?.slice(-3) || 'none'}), floor ${FLEET_SCALE_FLOOR.toLocaleString()}`);
+  let anchorSent = false;
+  let fleetSufficientLogged = false;   // [GATE TIE-IN] log the "fleet sufficient → yield to gate" transition once
+  while (!stop) {
+    try {
+      if (gateCache.built) { log('🛰 FLEET_SCALE: gate built → expansion takes over, manager exiting'); return; }
+      await refreshCredits();
+      const all = await getAllShips();
+      // ensure an anchor ship sits at the anchor-yard so we can purchase there anytime (use a probe, not the earner)
+      const atYard = all.find((s) => s.nav.waypointSymbol === anchorYard && s.nav.status !== 'IN_TRANSIT');
+      const headingYard = all.find((s) => s.nav.status === 'IN_TRANSIT' && s.nav.route?.destination?.symbol === anchorYard);
+      if (!atYard && !headingYard && !anchorSent) {
+        const freeProbe = all.find((s) => isProbeHull(s) && s.symbol !== NEGOTIATOR && s.nav.status !== 'IN_TRANSIT');
+        if (freeProbe) { try { if (freeProbe.nav.status === 'DOCKED') await api('POST', `/my/ships/${freeProbe.symbol}/orbit`); await api('POST', `/my/ships/${freeProbe.symbol}/navigate`, { waypointSymbol: anchorYard }); anchorSent = true; log(`🛰 FLEET_SCALE: anchoring ${freeProbe.symbol.slice(-3)} → ${anchorYard.slice(-3)} for buys`); } catch (e) { log(`🛰 anchor ERR ${e.message}`); } }
+      }
+      const budget = growthBudget();
+      if (budget < 1000 || cachedCredits < FLEET_SCALE_FLOOR) { await sleep(FLEET_SCALE_MS); continue; }
+
+      // coverage: markets where one of our ships is stationed or heading
+      const covered = new Set();
+      for (const s of all) { covered.add(s.nav.waypointSymbol); if (s.nav.route?.destination?.symbol) covered.add(s.nav.route.destination.symbol); }
+      const uncovered = MARKET_WPS.filter((w) => !covered.has(w));
+      const probeCount = all.filter(isProbeHull).length;
+      const probeCap = FLEET_MAX_PROBES > 0 ? FLEET_MAX_PROBES : MARKET_WPS.length;
+
+      // need an anchor present to buy
+      if (!atYard) { await sleep(FLEET_SCALE_MS); continue; }
+      if (atYard.nav.status !== 'DOCKED') { try { await api('POST', `/my/ships/${atYard.symbol}/dock`); } catch {} }
+
+      const yards = await getShipyards(true);
+      const probePx = yards.SHIP_PROBE?.price || 30_000;
+      const coveredCount = MARKET_WPS.length - uncovered.length;
+      const cargoShips = all.filter((s) => !isProbeHull(s) && (s.cargo?.capacity || 0) >= 30).length;   // frigate + shuttles + haulers
+      const haulers = all.filter((s) => !isProbeHull(s) && (s.cargo?.capacity || 0) >= 80).length;
+      const placeProbe = async () => {
+        const bought = await buyMiningShip('SHIP_PROBE', anchorYard);
+        if (!bought) return false;
+        // Prefer covering PRODUCER (EXPORT) markets first — they're the cheap sources that unlock both trade lanes
+        // AND contract sourcing. Among equal producer-status, pick the nearest. Falls back to any uncovered market.
+        const exporters = marketCache.data || {};
+        const score = (w) => ((exporters[w]?.exports || []).length > 0 ? 0 : 1);   // 0 = producer (prefer), 1 = consumer
+        const dest = uncovered.slice().sort((a, b) => (score(a) - score(b)) || (D(anchorYard, a) - D(anchorYard, b)))[0];
+        try { await api('POST', `/my/ships/${bought}/orbit`); await api('POST', `/my/ships/${bought}/navigate`, { waypointSymbol: dest }); } catch (e) { log(`🛰 ${bought.slice(-3)} place ERR ${e.message}`); }
+        log(`🛰 FLEET_SCALE bought PROBE ${bought.slice(-3)} @ ${probePx.toLocaleString()} → ${dest.slice(-3)} (coverage ${coveredCount + 1}/${MARKET_WPS.length})`);
+        return true;
+      };
+      const buyCargo = async (type, px) => {
+        // buy at the anchorYard (a combined yard sells probes+cargo, and the anchor probe is docked here)
+        const bought = await buyMiningShip(type, anchorYard);
+        if (!bought) return false;
+        log(`🛰 FLEET_SCALE bought ${type.replace('SHIP_', '')} ${bought.slice(-3)} @ ${px.toLocaleString()} → trade pool (cargo ships ${cargoShips + 1})`);
+        launchWorker(bought);
+        return true;
+      };
+      // A ship purchase must spend ONLY genuinely-free budget: after the buy, keep (a) all cash already `committed`
+      // to in-flight trades, (b) the rolling OPERATING_RESERVE (fuel + working capital), and (c) FLEET_SCALE_FLOOR.
+      // This is what actually prevents a big hauler buy from draining the fleet into a drain-to-zero deadlock.
+      const canAfford = (px) => (cachedCredits - committed - px) >= Math.max(FLEET_SCALE_FLOOR, OPERATING_RESERVE);
+      const shuttlePx = yards.SHIP_LIGHT_SHUTTLE?.price || 82_000;
+      const haulPx = yards.SHIP_LIGHT_HAULER?.price || 291_000;
+
+      // TIERED AUTOSCALE with PROBE↔CARGO BALANCE (one purchase per cycle). probeTarget scales with cargo ships so
+      // data (probes) and throughput (cargo ships) grow together; we buy whichever side is behind, cheapest-first.
+      const probeTarget = Math.min(probeCap, FLEET_BASE_PROBES + FLEET_PROBE_RATIO * Math.max(0, cargoShips - 1));
+      // [GATE TIE-IN] "Fleet sufficient" = we have the cargo throughput (FLEET_TARGET_TRADERS) AND the probe coverage
+      // (probeTarget) we set out to build. The whole point of the gate credit band (GATE_CREDIT_FLOOR/RESUME) is to
+      // accumulate working capital ONCE the fleet is built — so once sufficient, STOP buying ships (more would just
+      // park) and let surplus climb into the band → the gate gets fed/built. While INsufficient, the fleet is the
+      // priority (foundation first), so ship buys still come out of growth surplus as before.
+      const fleetSufficient = cargoShips >= FLEET_TARGET_TRADERS && probeCount >= probeTarget;
+      if (fleetSufficient) {
+        if (!fleetSufficientLogged) { fleetSufficientLogged = true; log(`🛰 FLEET_SCALE: fleet sufficient — ${cargoShips} cargo ships (target ${FLEET_TARGET_TRADERS}) + ${probeCount} probes (target ${probeTarget}) → holding fleet; surplus now accrues to the gate band (build to ${GATE_CREDIT_RESUME.toLocaleString()} → feed the gate)`); }
+        await sleep(FLEET_SCALE_MS); continue;
+      }
+      fleetSufficientLogged = false;   // dropped below target (lost a ship / coverage gap) → re-arm and refill
+      // A) PROBES — keep coverage at the ratio target for the current cargo-ship count (cheap, unlocks lanes+contracts)
+      if (probeCount < probeTarget && uncovered.length && canAfford(probePx)) {
+        if (await placeProbe()) { await sleep(FLEET_SCALE_MS); continue; }
+      }
+      // B) 2nd+ cargo ship via cheap SHUTTLE — probes are at target, so add throughput (parallel trade + contracts).
+      if (cargoShips < FLEET_TARGET_TRADERS && cachedCredits >= FLEET_SHUTTLE_MIN && canAfford(shuttlePx)) {
+        if (await buyCargo('SHIP_LIGHT_SHUTTLE', shuttlePx)) { await sleep(FLEET_SCALE_MS); continue; }
+      }
+      // C) big 80-cargo HAULER once we're flush — but ONLY while still BELOW the cargo-ship target. FLEET_TARGET_TRADERS
+      // is now the TOTAL cargo-ship cap (of which up to FLEET_MAX_HAULERS may be haulers); without the cargo-target
+      // bound, this tier kept buying haulers every time credits crossed FLEET_HAULER_MIN — draining the nest egg the
+      // gate band is trying to build, and adding hulls that just park. (See [GATE TIE-IN] above.)
+      if (cargoShips < FLEET_TARGET_TRADERS && cachedCredits >= FLEET_HAULER_MIN && haulers < FLEET_MAX_HAULERS && canAfford(haulPx)) {
+        if (await buyCargo('SHIP_LIGHT_HAULER', haulPx)) { await sleep(FLEET_SCALE_MS); continue; }
+      }
+    } catch (e) { log(`🛰 FLEET_SCALE ERR ${e.message}`); }
+    await sleep(FLEET_SCALE_MS);
+  }
+}
+
 // [MINE_MIGRATE] Watch the colony's rock for depletion and relocate when it's mined out. Depletion is read from the
 // waypoint's `modifiers`: migrate on STRIPPED always, and proactively on CRITICAL_LIMIT when a healthy alternative
 // rock with the same deposit exists. Migration just invalidates the cached site/asteroid list + stale surveys; the
@@ -2874,7 +3198,7 @@ async function main() {
   // [RULE: keep-fleet-alive] supervise hoisted to module scope (see above). Register initial hulls so MINE_EXPAND
   // never double-spawns one, and keep their supervised promises in `tasks` so Promise.all keeps the process alive.
   const tasks = traders.map((s) => { launchedWorkers.add(s.symbol); return supervise(s.symbol); });
-  tasks.push(contractManager(), targetWatch(), fleetTable(), mineExpandManager(), mineMigrateManager());
+  tasks.push(contractManager(), targetWatch(), fleetTable(), mineExpandManager(), mineMigrateManager(), fleetScaleManager());
   const stopWatch = (async () => { while (!stop) { if (fs.existsSync(here('./STOP'))) { stop = true; break; } await sleep(3000); } })();
   await Promise.all([...tasks, stopWatch]);
   log(`AUTOTRADER stopped. run net +${totalNet.toLocaleString()} over ${lanesRun} lanes`);

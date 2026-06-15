@@ -319,13 +319,22 @@ export function createExpansion(ctx) {
       await loadSystemInto(op);
       if (!op.gateWp) op.gateWp = ship.nav.waypointSymbol; // fallback: we jumped in via the gate
       if (m.role === 'OUTPROBE') {
-        if (!m.scanned) m.scanned = new Set();
-        const todo = op.marketWps.filter((w) => !m.scanned.has(w));
-        if (!todo.length) { await scanAllInto(op); await sleep(PROBE_DWELL_MS); m.last = `scanning ${op.sys.slice(-4)} (all)`; return; }
-        const here = ship.nav.waypointSymbol; todo.sort((a, b) => D(here, a) - D(here, b));
-        const dest = todo[0];
-        try { await goToSys(sym, dest, op.markets); await scanMarketInto(dest, op); m.scanned.add(dest); log(`🛰 ${id(sym)} scanned ${id(dest)} @${op.sys.slice(-4)} (${m.scanned.size}/${op.marketWps.length})`); }
-        catch (e) { log(`🛰 ${id(sym)} scout ERR ${e.message}`); m.scanned.add(dest); }
+        // 1:1 market partition: each OUTPROBE owns a contiguous arc of this outpost's markets and only refreshes
+        // ITS arc when stale. When probes>=markets each owns ONE market → it parks there (presence = live prices)
+        // → full 1:1 fresh coverage at MINIMAL API (no redundant fleet-wide rescans that would starve haulers).
+        const wps = op.marketWps;
+        if (!wps.length) { await sleep(SLEEP_MS); m.last = `scanning ${op.sys.slice(-4)} (mapping)`; return; }
+        const peers = [...members.entries()].filter(([, mm]) => mm.role === 'OUTPROBE' && mm.opSys === op.sys).map(([s]) => s).sort();
+        const idx = Math.max(0, peers.indexOf(sym)), n = peers.length || 1;
+        const lo = Math.floor((idx * wps.length) / n), hi = Math.max(Math.floor(((idx + 1) * wps.length) / n), lo + 1);
+        const arc = wps.slice(lo, hi);
+        m.scanned = new Set(arc);
+        const stale = arc.filter((w) => !op.markets[w] || now() - op.markets[w].at > SCAN_TTL_MS);
+        if (!stale.length) { await sleep(PROBE_DWELL_MS); m.last = `1:1 ${op.sys.slice(-4)} arc[${arc.length}] fresh`; return; }
+        const here = ship.nav.waypointSymbol; stale.sort((a, b) => D(here, a) - D(here, b));
+        const dest = stale[0];
+        try { await goToSys(sym, dest, op.markets); await scanMarketInto(dest, op); log(`🛰 ${id(sym)} refreshed ${id(dest)} @${op.sys.slice(-4)} (arc ${arc.length}/${wps.length})`); }
+        catch (e) { log(`🛰 ${id(sym)} scout ERR ${e.message}`); }
         await sleep(2000); return;
       }
       // OUTLIGHT: local buy-low/sell-high inside the outpost
@@ -520,25 +529,31 @@ export function createExpansion(ctx) {
       if (!gw) { log(`🛰 outpost ${sys} not among hub connections [${conns.map(sysOf).join(', ')}] — skip`); continue; }
       outposts.set(sys, { sys, gateWp: gw, markets: {}, marketWps: [], loaded: false });
     }
-    // pass 1 — resume ships already sitting in an outpost system
-    let probesLeft = {}, tradersLeft = {};
-    for (const sys of outposts.keys()) { probesLeft[sys] = OUTPOST_PROBES; tradersLeft[sys] = OUTPOST_TRADERS; }
-    const crews = {}; for (const sys of outposts.keys()) crews[sys] = [];
+    // Per-outpost probe target = 1:1 with markets (fresh data on every market); fall back to OUTPOST_PROBES until
+    // the system's markets are mapped so pass-2 never over-pulls blindly.
+    const probeTgt = (sys) => { const op = outposts.get(sys); const m = (op && op.marketWps.length) || 0; return m > 0 ? m : OUTPOST_PROBES; };
+    // pass 1 — adopt ALL ships already sitting in an outpost system (local residents = zero migration: this is where
+    // manually/locally-bought probes & haulers get put to work immediately, converging the system toward 1:1).
+    const crews = {}; const probeCnt = {}, traderCnt = {};
+    for (const sys of outposts.keys()) { crews[sys] = []; probeCnt[sys] = 0; traderCnt[sys] = 0; }
     for (const s of all) {
       if (!free(s)) continue; const sys = s.nav.systemSymbol;
       if (!outposts.has(sys)) continue;
-      if (isProbe(s) && probesLeft[sys] > 0) { crews[sys].push(assign(s, sys)); probesLeft[sys]--; }
-      else if (isTrader(s) && tradersLeft[sys] > 0) { crews[sys].push(assign(s, sys)); tradersLeft[sys]--; }
+      if (isProbe(s)) { crews[sys].push(assign(s, sys)); probeCnt[sys]++; }
+      else if (isTrader(s)) { crews[sys].push(assign(s, sys)); traderCnt[sys]++; }
     }
-    // pass 2 — fill remaining slots from idle ships elsewhere (prefer shuttles; keep 80-cargo freighters home/hub)
-    const idleProbes = all.filter((s) => isProbe(s) && free(s));
+    // pass 2 — fill the SHORTFALL from idle ships elsewhere. Probes: pull toward 1:1 but ONLY from non-home idle
+    // probes (never strip the home system's market scanners); surplus hub probes flow to probe-starved outposts.
+    // Traders: pull toward OUTPOST_TRADERS from any idle trader (home haulers ARE allowed to migrate out to fat lanes).
+    const idleProbes = all.filter((s) => isProbe(s) && free(s) && s.nav.systemSymbol !== homeSystem);
     const idleTraders = all.filter((s) => isTrader(s) && free(s)).sort((a, b) => a.cargo.capacity - b.cargo.capacity);
     let pi = 0, ti = 0;
     for (const sys of outposts.keys()) {
-      while (tradersLeft[sys] > 0 && ti < idleTraders.length) { crews[sys].push(assign(idleTraders[ti++], sys)); tradersLeft[sys]--; }
-      while (probesLeft[sys] > 0 && pi < idleProbes.length) { crews[sys].push(assign(idleProbes[pi++], sys)); probesLeft[sys]--; }
+      const ptgt = probeTgt(sys);
+      while (traderCnt[sys] < OUTPOST_TRADERS && ti < idleTraders.length) { crews[sys].push(assign(idleTraders[ti++], sys)); traderCnt[sys]++; }
+      while (probeCnt[sys] < ptgt && pi < idleProbes.length) { crews[sys].push(assign(idleProbes[pi++], sys)); probeCnt[sys]++; }
       const op = outposts.get(sys);
-      log(`🛰 OUTPOST ${sys} (gate ${id(op.gateWp)}) crew: ${crews[sys].join(' ') || 'NONE (no idle ships)'}`);
+      log(`🛰 OUTPOST ${sys} (gate ${id(op.gateWp)}) crew[P${probeCnt[sys]}/${ptgt} T${traderCnt[sys]}/${OUTPOST_TRADERS}]: ${crews[sys].join(' ') || 'NONE (no idle ships)'}`);
     }
     outpostsReady = true;
   }
