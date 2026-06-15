@@ -167,14 +167,22 @@ export interface PerShip {
   status: string;
 }
 
+/**
+ * Status snapshot = the body POSTed to `POST /status`. Shape matches the API
+ * route schema exactly: the mandatory summary columns plus `data`, which carries
+ * the full bot-status.json-compatible snapshot (built by the bot's `writeStatus`).
+ *
+ * Wave 3 (DRIFT #20): redefined from the earlier speculative shape (`ts`/`ships`/
+ * `gate: GateState`) to the real API body so the bot persistence client's
+ * `postStatus(snapshot)` validates against `/status`. `gate` is a short string
+ * label (or null), NOT the structured `GateState` (which now lives only inside `data`).
+ */
 export interface StatusSnapshot {
-  ts: string;
-  credits: number;
-  phase: Phase;
+  phase: string;
   runNet: number;
-  gate: GateState | null;
-  ships: PerShip[];
-  raw?: unknown;
+  credits: number;
+  gate?: string | null;
+  data: unknown;
 }
 
 export interface RunStats {
@@ -257,7 +265,7 @@ export interface StatusSnapshotDto {
   runNet: number;
   credits: number;
   gate?: string | null;
-  data: StatusSnapshot;
+  data: unknown;
 }
 
 export type StatusPostBody = StatusSnapshot;
