@@ -1,1 +1,32 @@
-{"name":"spacejam-status","version":"1.0.0","type":"module","private":true,"dependencies":{"blessed":"^0.1.81","chalk":"^5.6.2","cli-table3":"^0.6.5","commander":"^15.0.0"}}
+{
+  "name": "spacetraders-agent",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.33.0",
+  "engines": {
+    "node": ">=20.0.0",
+    "pnpm": ">=9.0.0"
+  },
+  "scripts": {
+    "build": "pnpm -r --filter './packages/*' build",
+    "typecheck": "pnpm -r --filter './packages/*' typecheck",
+    "lint": "eslint packages/*/src --ext .ts",
+    "test": "vitest run --workspace vitest.workspace.ts",
+    "test:watch": "vitest --workspace vitest.workspace.ts",
+    "db:up": "docker compose up postgres -d",
+    "db:migrate": "pnpm --filter @st/api prisma:migrate",
+    "db:seed": "pnpm --filter @st/api prisma:seed",
+    "db:studio": "pnpm --filter @st/api prisma:studio"
+  },
+  "devDependencies": {
+    "@typescript-eslint/eslint-plugin": "^8.0.0",
+    "@typescript-eslint/parser": "^8.0.0",
+    "eslint": "^9.0.0",
+    "eslint-config-prettier": "^9.0.0",
+    "prettier": "^3.0.0",
+    "typescript": "^5.5.0",
+    "typescript-eslint": "^8.0.0",
+    "vitest": "^2.0.0"
+  }
+}

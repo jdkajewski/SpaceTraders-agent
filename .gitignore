@@ -36,3 +36,15 @@ STOP.hint
 
 # ── Node ──────────────────────────────────────────────────
 node_modules/
+
+# ── TypeScript monorepo (packages/) ───────────────────────
+packages/*/dist/
+packages/*/tsconfig.tsbuildinfo
+*.tsbuildinfo
+
+# ── Prisma ────────────────────────────────────────────────
+packages/api/src/generated/
+
+# ── Environment ───────────────────────────────────────────
+.env.local
+.env.*.local

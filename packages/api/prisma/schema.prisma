@@ -1,0 +1,134 @@
+// SpaceTraders Agent — Prisma schema
+// All models map to bot2.mjs file artifacts (MASTER-PLAN §3).
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ── Singleton: run statistics (crash-safe, persisted across restarts) ─────────
+// Mirrors run-stats.json. Always a single row with id = 1.
+model RunStats {
+  id         Int      @id @default(1)
+  totalNet   Float    @default(0)
+  lanesRun   Int      @default(0)
+  updatedAt  DateTime @updatedAt
+}
+
+// ── Per-ship intents (crash-safe, in-flight cargo intents) ────────────────────
+// Mirrors intents.json. PK is the ship symbol.
+model Intent {
+  shipSym    String   @id
+  phase      String
+  good       String
+  units      Int
+  buyWp      String
+  sellWp     String
+  costBasis  Float
+  extras     Json?
+  updatedAt  DateTime @updatedAt
+}
+
+// ── Status snapshots (latest + history) ──────────────────────────────────────
+// Mirrors bot-status.json. Denormalized columns allow efficient querying;
+// the full snapshot lives in the `data` JSON column.
+model StatusSnapshot {
+  id        String   @id @default(cuid())
+  createdAt DateTime @default(now())
+  phase     String
+  runNet    Float
+  credits   Float
+  gate      String?  // "BUILT" | "UNBUILT" | null
+  data      Json
+
+  @@index([createdAt])
+}
+
+// ── Market snapshots (latest per waypoint) ────────────────────────────────────
+// Mirrors markets.json. PK is the waypoint symbol.
+model MarketSnapshot {
+  waypoint  String   @id
+  data      Json
+  updatedAt DateTime @updatedAt
+}
+
+// ── Market history (append-only time series) ─────────────────────────────────
+// Mirrors market-history.jsonl.
+model MarketHistory {
+  id           String   @id @default(cuid())
+  ts           DateTime @default(now())
+  waypoint     String
+  good         String
+  purchasePrice Float
+  sellPrice    Float
+  tradeVolume  Int
+  supply       String
+  activity     String?
+
+  @@index([ts])
+  @@index([waypoint])
+  @@index([good])
+}
+
+// ── Trade observations (append-only) ─────────────────────────────────────────
+// Mirrors trade-observations.jsonl.
+model TradeObservation {
+  id         String   @id @default(cuid())
+  ts         DateTime @default(now())
+  shipSym    String
+  good       String
+  buyWp      String
+  sellWp     String
+  projected  Float
+  realized   Float
+  units      Int
+  buyPx      Float
+  sellPx     Float
+
+  @@index([ts])
+  @@index([shipSym])
+}
+
+// ── Mine events (append-only) ────────────────────────────────────────────────
+// Mirrors mine-history.jsonl. type = extract | refine | survey | feed
+model MineEvent {
+  id      String   @id @default(cuid())
+  ts      DateTime @default(now())
+  type    String
+  shipSym String
+  data    Json
+
+  @@index([ts])
+  @@index([shipSym])
+}
+
+// ── GateLevers singleton (operator control input) ────────────────────────────
+// Mirrors gate-levers.json. Always a single row with id = 1.
+// Operators PUT /gate-levers; bot polls GET /gate-levers.
+model GateLevers {
+  id        Int      @id @default(1)
+  floor     Float    @default(1500000)
+  resume    Float    @default(1750000)
+  gap       Float    @default(250000)
+  updatedAt DateTime @updatedAt
+}
+
+// ── Waypoints (seeded from coords.csv, read-mostly) ─────────────────────────
+// PK is the waypoint symbol (e.g. "X1-PP30-A1").
+model Waypoint {
+  symbol String @id
+  x      Float
+  y      Float
+}
+
+// ── FuelNodes cache (optional, derived — may remain in-memory) ───────────────
+model FuelNode {
+  symbol    String   @id
+  systemSym String
+  updatedAt DateTime @updatedAt
+}
