@@ -256,6 +256,14 @@ const CONTRACT_AVOID_GATE_PRODUCER = process.env.CONTRACT_AVOID_GATE_PRODUCER !=
 const FEED_FOCUS_MATERIALS = new Set((process.env.FEED_FOCUS_MATERIALS || 'FAB_MATS').split(',').map((s) => s.trim()).filter(Boolean));
 const FEED_MAX_LOSS_PER_UNIT = Number(process.env.FEED_MAX_LOSS_PER_UNIT || 30);   // feed a focus producer's inputs down to this loss/unit (0 = profit-only)
 const FEED_RESERVE_INPUTS = process.env.FEED_RESERVE_INPUTS !== '0';                // reserve focus producers' inputs from non-feed profit trades/ride-alongs
+// [FEED RESERVE] Which materials' inputs get RESERVED out of non-feed trades (separate from FEED_FOCUS so we can
+// focus-FEED a material without locking its fat-lane inputs). Defaults to FAB_MATS only: FAB's inputs (IRON/QUARTZ/
+// SILICON/COPPER) are thin and worth reserving; ADV_CIRC's inputs (MACHINERY/MICROPROCESSORS) are fat trade lanes
+// that already sell into D45, so we feed ADV but DON'T reserve its inputs.
+const FEED_RESERVE_MATERIALS = new Set((process.env.FEED_RESERVE_MATERIALS || 'FAB_MATS').split(',').map((s) => s.trim()).filter(Boolean));
+// [FEED SECOND-LEVEL] Also feed the SUB-producers that make a gate producer's SCARCE inputs (e.g. J62 ore → H55,
+// which makes the IRON/COPPER/ALUMINUM that F49 and D45 need). Restocks the bottleneck at its true source. Default ON.
+const FEED_SECOND_LEVEL = process.env.FEED_SECOND_LEVEL !== '0';
 // [GATE] Cap how many ships gate-supply CONCURRENTLY. Buying an EXPORT depletes its supply → price spikes
 // (live: D43 ADVANCED_CIRCUITRY 3,958→9,549 once 8 idle hulls piled on). Limiting simultaneous suppliers
 // lets the producer restock between pulls so materials stay cheap. Dedicated GATE_HAULERS always bypass
@@ -995,22 +1003,27 @@ function gateProducerWps(markets) {
   return set;
 }
 
-// [FEED FOCUS] Producers (EXPORT markets) of still-NEEDED focus materials (the long pole we keep fed, e.g. FAB_MATS@F49).
-function focusProducerWps(markets) {
+// [FEED FOCUS] Producers (EXPORT markets) of still-NEEDED materials in a given set. Used two ways with DIFFERENT sets:
+//   • FEED_FOCUS_MATERIALS → capped-loss feeding targets (we actively push these gate materials down).
+//   • FEED_RESERVE_MATERIALS → input reservation (we hold these producers' inputs out of non-feed trades).
+// Keeping them separate lets us focus-FEED a material (e.g. ADVANCED_CIRCUITRY) WITHOUT reserving its inputs
+// (MACHINERY/MICROPROCESSORS are fat trade lanes that already sell INTO D45 — reserving them would kill throughput).
+function producerWpsFor(markets, matSet) {
   const set = new Set();
   for (const mat of activeGateMaterials()) {
-    if (!FEED_FOCUS_MATERIALS.has(mat)) continue;
+    if (!matSet.has(mat)) continue;
     const w = findProducerWp(markets, mat); if (w) set.add(w);
   }
   return set;
 }
-// [FEED FOCUS] The input goods a focus producer IMPORTS (e.g. IRON/QUARTZ_SAND/SILICON_CRYSTALS/COPPER for FAB_MATS).
-// RESERVED: normal profit lanes / ride-alongs may not BUY these to sell anywhere but a focus producer (the feed).
-// Empty when FEED_RESERVE_INPUTS is off, the gate is built, or no focus material is still needed.
+function focusProducerWps(markets) { return producerWpsFor(markets, FEED_FOCUS_MATERIALS); }
+// [FEED FOCUS] The input goods a RESERVE-material producer IMPORTS (e.g. IRON/QUARTZ_SAND/SILICON_CRYSTALS/COPPER for
+// FAB_MATS). RESERVED: normal profit lanes / ride-alongs may not BUY these to sell anywhere but a focus producer (the
+// feed). Empty when FEED_RESERVE_INPUTS is off, the gate is built, or no reserve material is still needed.
 function gateInputGoods(markets) {
   const set = new Set();
   if (!FEED_RESERVE_INPUTS) return set;
-  for (const wp of focusProducerWps(markets)) {
+  for (const wp of producerWpsFor(markets, FEED_RESERVE_MATERIALS)) {
     const m = markets[wp]; if (!m) continue;
     for (const g of m.tradeGoods || []) if (g.type === 'IMPORT') set.add(g.symbol);
   }
@@ -1309,21 +1322,37 @@ function planGateFill(remaining, claims, markets, { free, headroom, slippage, ce
   const capOK = {};
   for (const sym of Object.keys(minPx)) capOK[sym] = gateBuyAllowed(sym, minPx[sym], absMax[sym]);
   const cheap = opts.filter((o) => o.px <= (minPx[o.sym] ?? o.px) * ceilFactor && (!absMax[o.sym] || (o.px <= absMax[o.sym] && capOK[o.sym]))).sort((a, b) => a.px - b.px);
-  const buys = [];
-  const planned = {};
+  // [GATE FILL] Pack the hold: add tradeVolume-sized lots cheapest-first, cycling across all still-needed materials,
+  // until the hold (free) or the headroom is exhausted (or nothing still needs units). Previously each material was
+  // capped at ONE tradeVolume lot per trip, which left big haulers HALF-EMPTY (e.g. 20 FAB + 20 ADV = 40/80) and
+  // doubled the number of gate trips (and fuel). Cycling one lot per material per pass naturally balances the basket
+  // (→ 40 FAB + 40 ADV on an 80 hull) while favoring the cheaper long-pole. The per-lot price ceiling enforced in
+  // buy() (GATE_MAX_PRICE) still aborts a run if a source spikes, so packing the hold while cheap/abundant is safe.
+  const order = {};   // "sym@wp" -> accumulated units
   let f = free, h = headroom;
-  for (const o of cheap) {
-    if (f <= 0 || h <= 0) break;
-    const open = (remaining[o.sym] || 0) - (claims.get(o.sym) || 0) - (planned[o.sym] || 0);
-    if (open <= 0) continue;
-    const unitCost = o.px * slippage;
-    const affordable = Math.floor(h / Math.max(1, unitCost));
-    const cap = o.tv > 0 ? o.tv : f;
-    const units = Math.min(f, cap, open, affordable);
-    if (units <= 0) continue;
-    buys.push({ sym: o.sym, wp: o.wp, units, px: o.px });
-    planned[o.sym] = (planned[o.sym] || 0) + units;
-    f -= units; h -= Math.ceil(units * unitCost);
+  let progress = true;
+  while (f > 0 && h > 0 && progress) {
+    progress = false;
+    for (const o of cheap) {                                        // cheapest source first
+      if (f <= 0 || h <= 0) break;
+      const plannedSym = Object.entries(order).filter(([k]) => k.startsWith(o.sym + '@')).reduce((s, [, u]) => s + u, 0);
+      const open = (remaining[o.sym] || 0) - (claims.get(o.sym) || 0) - plannedSym;
+      if (open <= 0) continue;
+      const unitCost = o.px * slippage;
+      const affordable = Math.floor(h / Math.max(1, unitCost));
+      const lot = Math.min(f, o.tv > 0 ? o.tv : f, open, affordable);   // one tradeVolume lot this pass
+      if (lot <= 0) continue;
+      const key = o.sym + '@' + o.wp;
+      order[key] = (order[key] || 0) + lot;
+      f -= lot; h -= Math.ceil(lot * unitCost);
+      progress = true;
+    }
+  }
+  const buys = [];
+  for (const [key, units] of Object.entries(order)) {
+    const at = key.lastIndexOf('@'); const sym = key.slice(0, at), wp = key.slice(at + 1);
+    const o = cheap.find((x) => x.sym === sym && x.wp === wp);
+    if (o) buys.push({ sym, wp, units, px: o.px });
   }
   return buys;
 }
@@ -1391,6 +1420,20 @@ async function haulGoTo(shipSym, dest, markets, opts = {}) {
 async function gateSupplyTrip(shipSym, ship, markets) {
   const g = gateCache;
   if (!gateSupplyActive()) return false;
+  // [GATE DELIVER-FIRST] If we're already standing AT the gate holding still-needed material (a restart caught us here
+  // mid-trip, or a prior leg ended at the gate), DELIVER it NOW rather than planning a buy trip that hauls it away on a
+  // wasteful detour (the I59→F49→D45→I59 round-trip we observed). Delivery is free, ungated by the credit floor, and
+  // always advances the gate. After dropping off we fall through next loop to a fresh (empty-hold) buy trip.
+  if (ship.nav.waypointSymbol === g.wp && ship.nav.status !== 'IN_TRANSIT') {
+    const heldNeeded = (ship.cargo.inventory || []).filter((i) => GATE_PROTECT_MATERIALS.has(i.symbol) && (g.remaining?.[i.symbol] > 0) && i.units > 0);
+    if (heldNeeded.length) {
+      perShip[shipSym] = perShip[shipSym] || { net: 0, lanes: 0, last: '' };
+      perShip[shipSym].last = `SUPPLY_GATE(at-gate) ${heldNeeded.reduce((s, i) => s + i.units, 0)}u`;
+      log(`⛏ ${shipSym.slice(-3)} at gate holding ${heldNeeded.map((i) => `${i.units} ${i.symbol}`).join(', ')} → deliver first`);
+      await supplyHeldToGate(shipSym, heldNeeded.map((i) => i.symbol));
+      return true;
+    }
+  }
   if (!gateCreditOk()) {
     // Buying is paused by the credit-floor hysteresis. But if we're ALREADY holding still-needed gate material
     // (bought before the pause), DELIVER it — supplying is free, advances the gate, and frees the hauler instead
@@ -1447,9 +1490,16 @@ async function gateSupplyTrip(shipSym, ship, markets) {
   gateActiveSuppliers.add(shipSym);   // count toward the concurrency cap for the duration of this trip
 
   const total = buys.reduce((s, b) => s + b.units, 0);
+  // [RESERVE] Commit the estimated spend SYNCHRONOUSLY before buying — like trade lanes / input-feed do — so a
+  // concurrent gate hauler or trade claim sees the reduced growthBudget/availableForWork and can't oversubscribe the
+  // same cash below the operating reserve. Reconciled to the real spend after the buys (uncommit estimate, the actual
+  // cash already left the agent). estCost uses the per-lot price cap (worst case) × slippage so we never under-commit.
+  let estCost = 0;
+  for (const b of buys) { const px = GATE_MAX_PRICE[b.sym] || Math.round(b.px * (1 + SLIPPAGE_FACTOR)); estCost += Math.ceil(b.units * px); }
+  commit(estCost);
   perShip[shipSym] = perShip[shipSym] || { net: 0, lanes: 0, last: '' };
   perShip[shipSym].last = `SUPPLY_GATE ${total}u`;
-  log(`⛏ ${shipSym.slice(-3)} gate-fill ${total}u [${buys.map((b) => `${b.units} ${b.sym}@${b.wp.slice(-3)}`).join(', ')}] → ${g.wp.slice(-3)} (credits ${cachedCredits.toLocaleString()})`);
+  log(`⛏ ${shipSym.slice(-3)} gate-fill ${total}u [${buys.map((b) => `${b.units} ${b.sym}@${b.wp.slice(-3)}`).join(', ')}] → ${g.wp.slice(-3)} (credits ${cachedCredits.toLocaleString()}, committed ${estCost.toLocaleString()})`);
   try {
     // Visit each source market once (group buys by waypoint), then haul the basket to the gate.
     const byWp = {};
@@ -1457,7 +1507,13 @@ async function gateSupplyTrip(shipSym, ship, markets) {
     for (const [wp, list] of Object.entries(byWp)) {
       await goTo(shipSym, wp);                                        // refuel-hop to the source
       for (const b of list) {
-        try { await buy(shipSym, b.sym, b.units, Math.round(b.px * (1 + SLIPPAGE_FACTOR))); }
+        // [GATE FILL] Per-lot price ceiling = the configured GATE_MAX_PRICE abs cap (the "only buy when ≤ this"
+        // price), NOT just first-lot+slippage. buy() re-reads price each tradeVolume lot and stops if it climbs
+        // past this — so a packed multi-lot hold keeps buying while the source stays under the real cap, instead
+        // of stalling ~10% above the first lot's price (which left holds half-filled). Falls back to px+slippage
+        // when no abs cap is configured for the material.
+        const maxPx = GATE_MAX_PRICE[b.sym] || Math.round(b.px * (1 + SLIPPAGE_FACTOR));
+        try { await buy(shipSym, b.sym, b.units, maxPx); }
         catch (e) { log(`${shipSym.slice(-3)} gate buy ERR ${b.units} ${b.sym}@${wp.slice(-3)}: ${e.message}`); }
       }
     }
@@ -1479,25 +1535,46 @@ async function gateSupplyTrip(shipSym, ship, markets) {
     // loop (recovers the cash, forfeits that gate progress — acceptable, the server snapshot re-plans).
     log(`${shipSym} gate-supply ERR ${e.message}`);
   } finally {
+    uncommit(estCost);   // [RESERVE] release the estimate; the real cash already left the agent (refreshCredits reconciles)
     for (const [sym, u] of Object.entries(reserved)) gateClaims.set(sym, Math.max(0, (gateClaims.get(sym) || 0) - u));
     gateActiveSuppliers.delete(shipSym);
   }
   return true;
 }
 
-// [INPUT_FEED] Targets for the Phase 4 accelerator: the EXPORT producer(s) of still-needed gate materials,
-// long-pole first (most units remaining), each paired with the inputs it IMPORTS. Feeding those inputs is
-// what restocks the gate material at its source. Empty unless inputFeedActive().
+// [INPUT_FEED] Targets for the Phase 4 accelerator. TIER-1 = the EXPORT producer(s) of still-needed gate materials,
+// long-pole first, each paired with the inputs it IMPORTS. TIER-2 (FEED_SECOND_LEVEL) = the sub-producers that make
+// a TIER-1 producer's SCARCE/LIMITED inputs — feeding THEIR inputs lifts the scarce input at its source. Example
+// chain: J62 (IRON_ORE, cheap+abundant) → H55 (makes IRON, currently SCARCE) → F49 (makes FAB_MATS). Without tier-2
+// we drain H55's IRON without restocking its ore, so IRON stays SCARCE forever. H55 also makes ALUMINUM (a D45/ADV
+// input), so feeding its ore helps BOTH gate materials. Producers are de-duped; per-producer concurrency cap (1
+// feeder each) still applies in inputFeedTrip. Empty unless inputFeedActive().
+const FEED_SCARCE_SUPPLY = new Set(['SCARCE', 'LIMITED']);   // an input at these supply tiers is a bottleneck worth tier-2 feeding
 function gateProducerInputTargets(markets) {
   const out = [];
   if (!inputFeedActive()) return out;
+  const seen = new Set();   // producerWp de-dup (a market can be reached via multiple scarce inputs)
   const needed = Object.entries(gateCache.remaining || {}).sort((a, b) => b[1] - a[1]); // long pole first
   for (const [mat, remaining] of needed) {
     for (const [wp, m] of Object.entries(markets)) {
       const prod = (m.tradeGoods || []).find((x) => x.symbol === mat && x.type === 'EXPORT');
       if (!prod) continue;
-      const inputs = (m.tradeGoods || []).filter((x) => x.type === 'IMPORT').map((x) => x.symbol);
-      if (inputs.length) out.push({ producerWp: wp, material: mat, remaining, inputs });
+      const imports = (m.tradeGoods || []).filter((x) => x.type === 'IMPORT');
+      const inputs = imports.map((x) => x.symbol);
+      if (inputs.length && !seen.has(wp)) { out.push({ producerWp: wp, material: mat, remaining, inputs, tier: 1 }); seen.add(wp); }
+      // TIER-2: for each SCARCE/LIMITED input this gate producer imports, find the market that EXPORTS it (the
+      // sub-producer) and add it as a feed target whose inputs are ITS imports (the raw ore, sourced cheaply elsewhere).
+      if (FEED_SECOND_LEVEL) {
+        for (const imp of imports.filter((x) => FEED_SCARCE_SUPPLY.has(x.supply))) {
+          for (const [swp, sm] of Object.entries(markets)) {
+            if (seen.has(swp)) continue;
+            const sub = (sm.tradeGoods || []).find((x) => x.symbol === imp.symbol && x.type === 'EXPORT');
+            if (!sub) continue;
+            const subInputs = (sm.tradeGoods || []).filter((x) => x.type === 'IMPORT').map((x) => x.symbol);
+            if (subInputs.length) { out.push({ producerWp: swp, material: imp.symbol, remaining, inputs: subInputs, tier: 2 }); seen.add(swp); }
+          }
+        }
+      }
     }
   }
   return out;
