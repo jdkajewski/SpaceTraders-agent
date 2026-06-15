@@ -221,3 +221,85 @@ export interface MarketHistoryRow {
   supply: string;
   activity?: string;
 }
+
+// ── API request / response DTOs (used by both @st/api routes and Wave 2 bot client) ──
+
+export interface BatchInsertResult {
+  inserted: number;
+}
+
+export interface RunStatsDto {
+  totalNet: number;
+  lanesRun: number;
+  updatedAt: string;
+}
+
+export type RunStatsPutBody = Omit<RunStatsDto, 'updatedAt'>;
+
+export interface IntentDto {
+  shipSym: string;
+  phase: string;
+  good: string;
+  units: number;
+  buyWp: string;
+  sellWp: string;
+  costBasis: number;
+  extras?: Record<string, unknown>;
+  updatedAt: string;
+}
+
+export type IntentPutBody = Omit<IntentDto, 'shipSym' | 'updatedAt'>;
+
+export interface StatusSnapshotDto {
+  id: string;
+  createdAt: string;
+  phase: string;
+  runNet: number;
+  credits: number;
+  gate?: string | null;
+  data: StatusSnapshot;
+}
+
+export type StatusPostBody = StatusSnapshot;
+
+export interface MarketSnapshotDto {
+  waypoint: string;
+  data: unknown;
+  updatedAt: string;
+}
+
+export interface GateLeversDto {
+  floor: number;
+  resume: number;
+  gap: number;
+  updatedAt: string;
+}
+
+export type GateLeversPutBody = Omit<GateLeversDto, 'updatedAt'>;
+
+export interface MarketHistoryFilter {
+  waypoint?: string;
+  good?: string;
+  since?: string;
+  limit?: number;
+}
+
+export interface TradeObservationFilter {
+  shipSym?: string;
+  good?: string;
+  since?: string;
+  limit?: number;
+}
+
+export interface MineEventFilter {
+  shipSym?: string;
+  type?: string;
+  since?: string;
+  limit?: number;
+}
+
+export interface WaypointDto {
+  symbol: string;
+  x: number;
+  y: number;
+}

@@ -17,6 +17,7 @@ RUN pnpm install --frozen-lockfile
 COPY tsconfig.base.json ./
 COPY packages/shared/ ./packages/shared/
 COPY packages/api/ ./packages/api/
+COPY coords.csv ./coords.csv
 
 # Generate Prisma client + build
 RUN pnpm --filter @st/api prisma:generate
@@ -38,9 +39,10 @@ RUN pnpm install --frozen-lockfile --prod
 
 COPY --from=builder /app/packages/shared/dist ./packages/shared/dist
 COPY --from=builder /app/packages/api/dist ./packages/api/dist
-COPY --from=builder /app/packages/api/src/generated ./packages/api/src/generated
 COPY --from=builder /app/packages/api/prisma ./packages/api/prisma
+COPY --from=builder /app/coords.csv ./coords.csv
 
 EXPOSE 3000
 
-CMD ["node", "packages/api/dist/index.js"]
+# Run migrations then seed singletons then start the server
+CMD ["sh", "-c", "node_modules/.bin/prisma migrate deploy --schema packages/api/prisma/schema.prisma && node packages/api/dist/server.js"]

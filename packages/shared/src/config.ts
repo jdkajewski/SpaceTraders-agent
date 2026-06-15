@@ -213,6 +213,12 @@ const RawConfigSchema = z.object({
   // ── expansion ───────────────────────────────────────────────────────────
   AUTO_EXPAND: boolOff,
   EXPAND_TARGET_SYSTEM: str(''),
+
+  // ── API server (Wave 1 additions — not in legacy bot2.mjs) ───────────────
+  API_PORT: num(3000),
+  API_HOST: str('0.0.0.0'),
+  BOT_KEY: str(''),
+  BOT_AUTH_ENABLED: boolOff,
 });
 
 // ── post-transform: resolve derived defaults ─────────────────────────────────
