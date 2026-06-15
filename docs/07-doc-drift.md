@@ -1,5 +1,23 @@
 # 07 — Documentation Drift (what the old docs got wrong)
 
+> **⚠️ Wave 6 update — this docs set now tracks the TypeScript monorepo.**
+> As of the TS rebuild (Waves 0–6), the canonical bot is the **TypeScript stack** under `packages/`
+> (`@st/shared`, `@st/api`, `@st/bot`), run via `docker compose up` or `pnpm --filter @st/bot start`.
+> The legacy `.mjs` files (`bot2.mjs`, `st.mjs`, `trade.mjs`, `expansion.mjs`, monitors) are archived
+> under [`legacy/`](../legacy/) and kept **only** as the parity reference for the durable parity harness
+> (`packages/bot/src/__tests__/parity/`). **Docs 01–08 still describe the legacy `bot2.mjs` behaviour** —
+> they remain the behavioural spec the TS port preserves, but the line-count / file-path / "as it runs
+> now" references in them point at the old `.mjs` and are *historical*. For the TS architecture, run
+> paths, and the legacy→TS map, read the new **[`09-ts-rebuild.md`](09-ts-rebuild.md)**. For every place
+> the TS port intentionally or incidentally diverges from the legacy behaviour (and how each was
+> resolved), read **[`rebuild/DRIFT-LOG.md`](../rebuild/DRIFT-LOG.md)** (all 35 entries resolved in W6).
+>
+> The sections below are the *original* legacy-era drift notes (legacy docs vs legacy code). They are
+> retained verbatim for provenance; the absolute `~/.copilot/session-state/...bot2.mjs` paths and the
+> "2404 vs 3206 line" counts refer to the legacy file now living at `legacy/bot2.mjs`.
+
+---
+
 These docs describe `bot2.mjs` **as it actually runs now**, verified against the live source at
 `/Users/danielkajewski/.copilot/session-state/18a148a9-5032-4a86-9f91-34d8680cdcfd/files/bot2.mjs`
 (**2404 lines** as of the 11:41 CT launch) and the live `bot-status.json` + current log. This page

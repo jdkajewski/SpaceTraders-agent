@@ -1,55 +1,115 @@
 # SpaceTraders-agent
 
 A headless, continuously-running autotrader for [SpaceTraders](https://spacetraders.io).
-One Node process runs ~20 ship workers in parallel to drive a single agent through the
-**greenfield → jump-gate → seed-next-system** playbook: maximize per-lane trading profit
-while building the system's jump gate, with mining, contracts, input-feeding, and
-opportunistic gate supply all running as cooperating loops.
+It drives a single agent through the **greenfield → jump-gate → seed-next-system** playbook:
+maximize per-lane trading profit while building the system's jump gate, with mining, contracts,
+input-feeding, and opportunistic gate supply running as cooperating loops.
 
-> ⚠️ The agent token is read **only** from `SPACETRADERS_PLAYER_AGENT_TOKEN`. It is never
-> stored in the repo, and all local state (`markets.json`, `tracker.md`, `*.log`, `*.jsonl`, …)
-> is git-ignored.
+> **As of the TypeScript rebuild (Waves 0–6), the canonical stack is the TS monorepo under
+> [`packages/`](packages/).** The original single-file `bot2.mjs` and its monitors are archived under
+> [`legacy/`](legacy/) and are used only as the parity reference for the test harness. New architecture:
+> **[`docs/09-ts-rebuild.md`](docs/09-ts-rebuild.md)**.
 
-## Quick start
+## Monorepo layout
 
-```bash
-npm install
-export SPACETRADERS_PLAYER_AGENT_TOKEN="your-agent-token"
-node markets.mjs X1-PP30-A1 X1-PP30-A2 ...   # seed markets.json (your stationed waypoints)
-echo "# tracker" > tracker.md                 # status file the bot appends to
-node bot2.mjs                                  # add config flags as needed
+```
+packages/shared   @st/shared  — config (zod), domain types, constants, coords/distance. No I/O.
+packages/api      @st/api     — Fastify + Prisma/Postgres persistence service (the bot's datastore).
+packages/bot      @st/bot     — the trading/expansion bot; talks to the game API + @st/api over HTTP.
+docs/                          — guided documentation set (01–09).
+rebuild/                       — MASTER-PLAN.md, per-wave specs, DRIFT-LOG.md.
+legacy/                        — archived legacy .mjs (bot2/st/trade/expansion + monitors).
+deploy/bot.env.example         — operator launch profile for the bot service.
+docker-compose.yml             — postgres → api (healthcheck) → bot.
+coords.csv                     — waypoint coordinate seed (consumed by the api Docker seed).
 ```
 
-`touch STOP` to drain gracefully; remove it before relaunching. Full flag set and the
-production launch profile are in [`docs/05-config-reference.md`](docs/05-config-reference.md).
+Package READMEs: **[api](packages/api/README.md)** (route reference + Swagger) ·
+**[bot](packages/bot/README.md)** (module map, flags, DRY_RUN, live spot-check).
+
+## Quick start (Docker — the canonical run path)
+
+```bash
+docker compose up --build
+```
+
+That brings up **postgres → api (waits for healthy) → bot**. With no `deploy/bot.env` present the bot
+boots in **`DRY_RUN=1`**: it makes **no live game calls and needs no token**, so this smoke-tests the
+whole stack out of the box. The API serves interactive route docs at <http://localhost:3000/docs>.
+
+To run **live**, supply the operator profile and a real token:
+
+```bash
+cp deploy/bot.env.example deploy/bot.env
+#   edit deploy/bot.env: paste SPACETRADERS_PLAYER_AGENT_TOKEN, set DRY_RUN=0
+docker compose up --build
+```
+
+`docker-compose.yml` loads `./deploy/bot.env` if present (`env_file` `required: false`).
+
+## Local development (pnpm)
+
+```bash
+pnpm install
+pnpm --filter @st/api prisma:generate     # REQUIRED first — the Prisma client is gitignored
+pnpm -r build                             # build all three packages (project references)
+pnpm -r typecheck
+pnpm test                                 # vitest workspace (parity, crash-safety, unit)
+pnpm lint
+```
+
+> **Gotcha:** in a fresh checkout you **must** run `pnpm --filter @st/api prisma:generate` before any
+> `build`/`typecheck`, or you get `Cannot find module '../generated/prisma/index.js'`.
+
+### Database (Postgres via Prisma)
+
+```bash
+pnpm db:up          # docker compose up postgres -d
+pnpm db:migrate     # prisma migrate dev   (@st/api)
+pnpm db:seed        # seed waypoints from coords.csv
+pnpm db:studio      # Prisma Studio
+```
+
+### Run the services locally
+
+```bash
+# API (needs DATABASE_URL; defaults to the compose Postgres):
+pnpm --filter @st/api start         # or: pnpm --filter @st/api dev   (tsx watch)
+
+# Bot (needs API_BASE_URL + SPACETRADERS_PLAYER_AGENT_TOKEN for a live run, or DRY_RUN=1):
+pnpm --filter @st/bot start         # node dist/main.js
+```
+
+## Configuration & flags
+
+Every operator flag is a field on the `@st/shared` config schema
+([`packages/shared/src/config.ts`](packages/shared/src/config.ts)); `loadConfig(process.env)` is the
+**single** env entry point. The catalogue lives in
+[`docs/05-config-reference.md`](docs/05-config-reference.md); the ready-to-edit launch profile is
+[`deploy/bot.env.example`](deploy/bot.env.example).
+
+Key connection vars: `SPACETRADERS_PLAYER_AGENT_TOKEN` (live token — read only from env, never stored),
+`API_BASE_URL`, `BOT_KEY`/`BOT_AUTH_ENABLED` (optional `x-bot-key` auth), `SYSTEM`, `DRY_RUN`.
+
+## Graceful stop
+
+The bot replaces the legacy `touch STOP` file with **signal handlers**: `SIGTERM`/`SIGINT` set
+`state.stop`, and each ship worker finishes its in-flight action then exits (no half-completed trades).
+So `docker compose stop` / `Ctrl-C` / `kill -TERM` all drain cleanly. For environments that can't signal,
+set `STOP_POLL=1` and the bot also polls `STOP=1` from the env as a fallback trip.
 
 ## Documentation
 
-**Start here → [`docs/README.md`](docs/README.md)** for the full guided set. In depth:
+**Start here → [`docs/README.md`](docs/README.md).** Highlights:
 
-- **[01 — Strategy](docs/01-strategy.md):** the dual profit+gate goal, why `runNet` (not credits) is the metric, the phase state machine, and the cost-to-expand budget.
-- **[02 — Architecture](docs/02-architecture.md):** single process, continuous ship workers, shared state, crash-safe recovery, graceful drain.
-- **[03 — Subsystems](docs/03-subsystems.md):** trading engine, gate supply, mining colony, contract pipeline, input-feed, orphan-cargo delivery, ride-alongs.
-- **[04 — Optimizations & tricks](docs/04-optimizations-and-tricks.md):** shared token bucket, fuel-aware routing, fill-bias, credit hysteresis, price-settle patience, contract auto-force.
-- **[05 — Config reference](docs/05-config-reference.md):** every env flag by subsystem + the prod launch profile.
-- **[06 — Tooling](docs/06-tooling.md):** the ops/analysis scripts and the local-first, rate-limit-safe philosophy.
-- **[07 — Doc drift](docs/07-doc-drift.md):** where older notes disagree with the live code (code wins).
-- **[08 — Expansion](docs/08-expansion.md):** the multi-system roadmap (probe partitioning, one-time send + residency pinning, ship-buy policy).
+- **[01 — Strategy](docs/01-strategy.md)**, **[02 — Architecture](docs/02-architecture.md)**,
+  **[03 — Subsystems](docs/03-subsystems.md)**, **[04 — Optimizations](docs/04-optimizations-and-tricks.md)**,
+  **[05 — Config reference](docs/05-config-reference.md)**, **[06 — Tooling](docs/06-tooling.md)**.
+- **[07 — Doc drift](docs/07-doc-drift.md):** where older notes disagree with the code (and the W6 banner
+  on the legacy→TS move).
+- **[08 — Expansion](docs/08-expansion.md):** the multi-system roadmap.
+- **[09 — TS rebuild](docs/09-ts-rebuild.md):** the monorepo architecture, persistence/crash-safety flow,
+  parity harness, and run paths.
 
-Raw design notes captured while building: [`RULES_ENGINE.md`](RULES_ENGINE.md),
-[`EXPANSION-DESIGN.md`](EXPANSION-DESIGN.md).
-
-## Code map
-
-| Path | Purpose |
-|---|---|
-| `bot2.mjs` | The main bot — all worker loops and managers. |
-| `st.mjs` / `trade.mjs` | API client (token, rate-limit bucket, retry) / ship primitives. |
-| `markets.mjs` | One-shot market snapshot → `markets.json`. |
-| `expand.mjs`, `contracts.mjs`, `networth.mjs`, `status.mjs`, `health.mjs`, `probe_util.mjs`, … | Ops & analysis tools — see [`docs/06-tooling.md`](docs/06-tooling.md). |
-| `*.sh`, `analyze.py` | Monitoring loops and offline analysis. |
-| `coords.csv` | Static home-system waypoint geometry (bot input). |
-
-> The bot is tuned around one home system (`X1-PP30`) and an externally-provisioned
-> fleet; treat the hard-coded waypoints/ship IDs as a worked example. The rationale lives
-> in `docs/`.
+Docs 01–08 describe the legacy `bot2.mjs` behaviour, which the TS port preserves (parity-first); every
+intentional divergence is logged and resolved in [`rebuild/DRIFT-LOG.md`](rebuild/DRIFT-LOG.md).
