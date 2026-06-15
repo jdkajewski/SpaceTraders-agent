@@ -20,5 +20,12 @@ export default tseslint.config(
       '@typescript-eslint/no-import-type-side-effects': 'error',
     },
   },
+  {
+    // Test mocks frequently declare async stubs with no `await`.
+    files: ['**/__tests__/**', '**/*.test.ts'],
+    rules: {
+      '@typescript-eslint/require-await': 'off',
+    },
+  },
   prettierConfig,
 );
