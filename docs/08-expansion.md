@@ -75,6 +75,10 @@ system forever (never route back across the gate).
 
 - **`jumpShip(sym, targetGateWp)` primitive** — POST `/my/ships/{sym}/jump`; handle cooldown. Probes
   are fuel-0 and jump for free; confirm fuel/antimatter cost for cargo hulls at execution time.
+  > **Status (DRIFT #2, corrected in W6):** this primitive is **already implemented**, not a TODO — it
+  > is `jump()` in the legacy `trade.mjs`, ported to `jump()` in `packages/bot/src/trade/shipActions.ts`
+  > and wired through `ExpansionCtx.jump`. The TS expansion subsystem performs the gate jump itself; there
+  > is no separate one-time `expand_send.mjs` step.
 - **`expand_send.mjs` (one-time script, run with the bot stopped — like `buyFab.mjs`)**: for each
   chosen ship → `goTo(home gate I63)` → jump to the target system gate → optional `goTo` a target
   waypoint. This is a **batch relocation, not a steady-state loop**.

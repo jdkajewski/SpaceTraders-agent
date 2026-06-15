@@ -111,8 +111,10 @@ export function writeStatus(state: BotState, cfg: Config, persistence: Persisten
       enabled: cfg.MINE_FEED,
       feeders: [...cfg.MINE_FEEDERS],
       busy: [...state.mining.active].map((s) => s.slice(-3)),
+      good: cfg.MINE_GOOD || 'auto', // DRIFT #36: legacy bot2 L2786 emits the forced/auto target good
       site: state.mining.site,
       refiner: state.mining.refinerSym && state.mining.refinerSym.slice(-3),
+      transport: [...cfg.MINE_TRANSPORT], // DRIFT #36: legacy emits the explicit transport override set
     },
     expand:
       state.expansionStatus !== undefined

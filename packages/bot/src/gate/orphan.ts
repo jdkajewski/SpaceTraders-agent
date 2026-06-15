@@ -210,7 +210,14 @@ export function nearestHopTowardGate(from: string, gateWp: string, fuelCap: numb
   return best;
 }
 
-// Route a non-hauler's stranded gate cargo to the gate by the cheapest feasible means (see config comment).
+// Route a non-hauler's stranded gate cargo to the gate by the cheapest feasible means. Tier order (matches
+// the body below, and DRIFT-LOG.md #27 — the legacy header comment listed a 3-tier order while the spec/body
+// interleave a distinct SELF+fuel-cargo tier; this is the reconciled 4-tier superset, no rescue path dropped):
+//   0. already AT the gate → supply held materials immediately.
+//   1. SELF route: a ≤1-tank refuel-hop route exists → self-haul to the gate.
+//   2. SELF + fuel-cargo: no tank-only route, but carried FUEL bridges the dry legs → self-haul augmented.
+//   3. TRANSFER: hand the cargo to a co-located gate hauler.
+//   4. stage-hop: none of the above → hop to the nearest fuel node toward the gate and await a hauler/route.
 // Returns true if it took ownership of this loop (worker should `continue`).
 export function createOrphanGateHook(deps: SubsystemDeps, isGateHauler: (shipSym: string) => boolean): WorkerHook {
   return async function deliverOrphanGateCargo(shipSym: string, ship: Ship, markets: Record<string, Market>): Promise<boolean> {
