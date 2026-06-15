@@ -4,6 +4,9 @@
 generator client {
   provider = "prisma-client-js"
   output   = "../src/generated/prisma"
+  // Emit query-engine binaries for both the host (native) and the linux-musl Docker runtime
+  // (node:20-alpine, OpenSSL 3) so the API image works on amd64 and arm64. (DRIFT #34)
+  binaryTargets = ["native", "linux-musl-arm64-openssl-3.0.x", "linux-musl-openssl-3.0.x"]
 }
 
 datasource db {

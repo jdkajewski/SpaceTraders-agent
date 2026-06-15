@@ -35,7 +35,7 @@ services:
       postgres:
         condition: service_healthy
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:${API_PORT:-3000}/health || exit 1"]
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:${API_PORT:-3000}/health || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -46,15 +46,23 @@ services:
       context: .
       dockerfile: packages/bot/Dockerfile
     restart: unless-stopped
+    # Operator launch profile (live token + flag set) lives in ./deploy/bot.env, loaded if present.
+    # Left absent, the bot comes up in DRY_RUN (no live SpaceTraders calls, no token needed) so
+    # `docker compose up` smoke-tests the full stack out of the box.
+    env_file:
+      - path: ./deploy/bot.env
+        required: false
     environment:
-      API_BASE_URL: http://api:3000
-      ST_TOKEN: ${ST_TOKEN}
+      API_BASE_URL: ${API_BASE_URL:-http://api:3000}
+      BOT_KEY: ${BOT_KEY:-}
       SYSTEM: ${SYSTEM:-X1-PP30}
+      # Default-on smoke mode. Set DRY_RUN=0 (and supply a token) in deploy/bot.env for a live run.
+      DRY_RUN: ${DRY_RUN:-1}
+      DRY_RUN_CREDITS: ${DRY_RUN_CREDITS:-250000}
+      SPACETRADERS_PLAYER_AGENT_TOKEN: ${SPACETRADERS_PLAYER_AGENT_TOKEN:-}
     depends_on:
       api:
         condition: service_healthy
-    profiles:
-      - full
 
 volumes:
   pgdata:

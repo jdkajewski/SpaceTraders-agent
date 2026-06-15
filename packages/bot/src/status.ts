@@ -114,7 +114,10 @@ export function writeStatus(state: BotState, cfg: Config, persistence: Persisten
       site: state.mining.site,
       refiner: state.mining.refinerSym && state.mining.refinerSym.slice(-3),
     },
-    expand: { enabled: cfg.AUTO_EXPAND },
+    expand:
+      state.expansionStatus !== undefined
+        ? (state.expansionStatus() as Record<string, unknown>)
+        : { enabled: cfg.AUTO_EXPAND },
     ships,
   };
 

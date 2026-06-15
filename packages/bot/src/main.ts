@@ -10,8 +10,8 @@
  */
 
 import { distance, loadConfig, type Config, type Market } from '@st/shared';
-import type { CoordsMap } from '@st/shared';
 import { createSpaceTradersClient } from './clients/spacetraders.js';
+import { createDryRunClient } from './clients/dryRun.js';
 import { createPersistenceClient } from './clients/persistence.js';
 import { createShipActions } from './trade/shipActions.js';
 import { createRouter } from './routing/route.js';
@@ -21,8 +21,13 @@ import { createState, type BotState } from './runtime/state.js';
 import { FileLocalStore, reconcileLocalToApi, loadIntents } from './recovery.js';
 import { recomputeReserve, computeExpansionTarget } from './budget/budget.js';
 import { determinePhase, reloadGateLevers } from './budget/phase.js';
-import { supervise, installStopHandlers, type WorkerDeps, type StopOptions } from './worker.js';
+import { supervise, installStopHandlers, type WorkerDeps, type StopOptions, type WorkerHook } from './worker.js';
 import { makeSubsystemDeps, buildWorkerHooks, buildManagers } from './subsystems/index.js';
+import { buyMiningShip } from './mining/expandMine.js';
+import { fleetTableManager } from './fleet/table.js';
+import { createExpansion, type Expansion, type ExpansionCtx } from './expansion/index.js';
+import { buildLanes } from './trade/lanes.js';
+import { writeStatus } from './status.js';
 import type { DistFn } from './trade/lanes.js';
 import type { SpaceTradersClient } from './interfaces.js';
 
@@ -40,16 +45,24 @@ async function refreshCredits(state: BotState, client: SpaceTradersClient): Prom
 
 export async function main(): Promise<void> {
   const cfg: Config = loadConfig();
-  const client = createSpaceTradersClient({ token: cfg.SPACETRADERS_PLAYER_AGENT_TOKEN });
+  // [DRY_RUN] swap the live game client for an offline no-op one — zero fetches to SpaceTraders,
+  // no token required. Our own persistence API (below) is still used. (Wave 5.4)
+  const client: SpaceTradersClient = cfg.DRY_RUN
+    ? createDryRunClient({ credits: cfg.DRY_RUN_CREDITS })
+    : createSpaceTradersClient({ token: cfg.SPACETRADERS_PLAYER_AGENT_TOKEN });
+  if (cfg.DRY_RUN) log.info('🧪 DRY_RUN: live SpaceTraders API disabled (no fetches, no mutations).');
   const local = new FileLocalStore();
   const persistence = createPersistenceClient({ local, baseUrl: cfg.API_BASE_URL, botKey: cfg.BOT_KEY });
 
   // [BOOT] reconcile the local crash-safety store forward before anything reads state.
   await reconcileLocalToApi(persistence, local);
 
-  // static coords → distance function (seeded from the API waypoint table).
+  // static coords → distance function (seeded from the API waypoint table). MUTABLE: the expansion
+  // subsystem injects new-system waypoint coords into this same map so D()/planRoute work there too.
   const wps = await persistence.getWaypoints();
-  const coords: CoordsMap = Object.fromEntries(wps.map((w) => [w.symbol, [w.x, w.y] as const]));
+  const coords: Record<string, readonly [number, number]> = Object.fromEntries(
+    wps.map((w) => [w.symbol, [w.x, w.y] as const]),
+  );
   const D: DistFn = (a, b) => distance(a, b, coords);
 
   // one shared, synchronously-readable market snapshot (mirrors bot2's marketCache.data).
@@ -140,6 +153,77 @@ export async function main(): Promise<void> {
   const subDeps = makeSubsystemDeps({ state, cfg, actions, router, markets, persistence, client, D, launchWorker });
   deps.hooks = buildWorkerHooks(subDeps);
 
+  // [AUTO_EXPAND] Build the inter-system expansion subsystem (Wave 5). Self-gates on AUTO_EXPAND +
+  // gateBuilt() at maybeTrigger; with AUTO_EXPAND OFF we never construct it, so it is fully inert.
+  // The ctx mirrors bot2 main() L3180–3196 exactly (see plan.md ctx map).
+  let expansion: Expansion | null = null;
+  if (cfg.AUTO_EXPAND) {
+    const xlog = logger.child({ mod: 'expansion' });
+    const ctx: ExpansionCtx = {
+      cfg,
+      api: (method, path, body) => client.api(method, path, body),
+      log: (m) => xlog.info(m),
+      sleep,
+      now: () => Date.now(),
+      navigate: (sym, dest, mode) => actions.navigate(sym, dest, mode),
+      refuel: (sym) => actions.refuel(sym),
+      buy: (sym, good, units, maxPx) => actions.buy(sym, good, units, maxPx),
+      sell: (sym, good) => actions.sell(sym, good),
+      jump: (sym, destGateWp) => actions.jump(sym, destGateWp),
+      getShip: (sym) => actions.getShip(sym),
+      getAllShips: () => client.getAllShips(),
+      coords,
+      D,
+      chooseMode: (dist, ship) => router.chooseMode(dist, ship),
+      planRoute: (from, to, fuelCap, mkts) => router.planRoute(from, to, fuelCap, mkts),
+      record: (sym, net, label) => subDeps.record(sym, net, label),
+      homeSystem: cfg.SYSTEM,
+      gateWp: () => state.gateCache.wp,
+      gateBuilt: () => state.gateCache.built,
+      getCredits: () => state.cachedCredits,
+      reserve: () => state.operatingReserve,
+      homeMarkets: () => marketHolder.data,
+      fuelPx: () => markets.getFuelPx(),
+      launchWorker,
+      buyShip: (shipType, wp) => buyMiningShip(subDeps, shipType, wp),
+      negotiator: () => cfg.NEGOTIATOR || null,
+    };
+    expansion = createExpansion(ctx);
+    // Surface the expansion status block in the persisted snapshot's `expand` field.
+    state.expansionStatus = () => expansion!.statusBlock();
+    // [EXPANSION] Inject the member-dispatch hook (runs first in the worker loop). isMember gates it,
+    // so non-members fall straight through to the normal trading cascade.
+    const expansionHook: WorkerHook = async (sym, ship) => {
+      if (!expansion || !expansion.isMember(sym)) return false;
+      await expansion.step(sym, ship);
+      return true;
+    };
+    deps.hooks = { ...deps.hooks, expansion: expansionHook };
+    log.info('🪐 AUTO_EXPAND armed (fires once the home gate is BUILT).');
+  }
+
+  // [DRY_RUN] Offline smoke: prove the stack is wired (boot → load markets/run-stats from the
+  // persistence API → log planned phase + top lanes → write a StatusSnapshot row) without touching
+  // the live game or buying anything. Then idle on the stop watcher. (Wave 5.4)
+  if (cfg.DRY_RUN) {
+    const lanes = buildLanes(marketHolder.data, state, cfg, D)
+      .sort((a, b) => b.gross - a.gross)
+      .slice(0, 5);
+    log.info(`🧪 DRY_RUN smoke — phase ${state.currentPhase.name} (${state.currentPhase.desc}), ${Object.keys(marketHolder.data).length} markets loaded`);
+    if (lanes.length === 0) log.info('🧪 DRY_RUN smoke — no profitable lanes in the snapshot');
+    for (const l of lanes)
+      log.info(`🧪 lane ${l.sym}: ${l.buyWp.slice(-4)}→${l.sellWp.slice(-4)} ${l.units}u +${l.gross.toLocaleString()} (margin ${l.margin})`);
+    state.lastStatusAt = 0; // force the throttled writeStatus to emit
+    writeStatus(state, cfg, persistence);
+    await persistence.flush();
+    log.info('🧪 DRY_RUN smoke complete — status snapshot written. Idling on stop watcher.');
+    const dryStopOpts: StopOptions = {};
+    if (process.env['STOP_POLL'] === '1') dryStopOpts.poll = () => process.env['STOP'] === '1';
+    await installStopHandlers(state, dryStopOpts);
+    log.info('🧪 DRY_RUN exiting.');
+    return;
+  }
+
   const stopOpts: StopOptions = {};
   if (process.env['STOP_POLL'] === '1') stopOpts.poll = () => process.env['STOP'] === '1';
   const stopWatch = installStopHandlers(state, stopOpts);
@@ -147,7 +231,8 @@ export async function main(): Promise<void> {
     launchedWorkers.add(s.symbol); // register so a manager never double-spawns an existing hull (bot2 L3200)
     return supervise(s.symbol, deps);
   });
-  tasks.push(targetWatch(state, cfg, client, markets, persistence, marketHolder, DYNAMIC_TARGET));
+  tasks.push(targetWatch(state, cfg, client, markets, persistence, marketHolder, DYNAMIC_TARGET, expansion));
+  tasks.push(fleetTableManager(subDeps));
   tasks.push(...buildManagers(subDeps).map((m) => m()));
 
   await Promise.all([...tasks, stopWatch]);
@@ -163,11 +248,12 @@ export async function main(): Promise<void> {
 async function targetWatch(
   state: BotState,
   cfg: Config,
-  client: ReturnType<typeof createSpaceTradersClient>,
+  client: SpaceTradersClient,
   markets: ReturnType<typeof createMarketsService>,
   persistence: ReturnType<typeof createPersistenceClient>,
   marketHolder: { data: Record<string, Market> },
   dynamicTarget: boolean,
+  expansion: Expansion | null,
 ): Promise<void> {
   while (!state.stop) {
     await refreshCredits(state, client);
@@ -188,10 +274,22 @@ async function targetWatch(
       log.info(`🛰 gate status: built=${String(bd.gateBuilt)} materials-cost=${(bd.gateMaterials || 0).toLocaleString()} → goal ${state.expansionTarget.toLocaleString()}`);
     }
 
+    // [AUTO_EXPAND] As soon as the gate is BUILT, fire the one-time migration (self-gates internally).
+    if (expansion) {
+      try {
+        await expansion.maybeTrigger();
+      } catch (e) {
+        log.warn(`🪐 maybeTrigger ERR ${(e as Error).message}`);
+      }
+    }
+
     if (state.cachedCredits >= state.expansionTarget && bd.gateStatusKnown) {
       // [A] Only stop when the gate status is actually KNOWN (an outage leaves it false → never a phantom stop).
       if (cfg.GATE_SUPPLY && state.gateCache.exists && !state.gateCache.built) {
         log.info(`🎯 cost-to-expand met (${state.cachedCredits.toLocaleString()} ≥ ${state.expansionTarget.toLocaleString()}) but gate UNBUILT — continuing to trade + supply the gate`);
+      } else if (cfg.AUTO_EXPAND) {
+        // [AUTO_EXPAND] YOLO mode: do NOT halt at the credit goal. Keep the home fleet trading AND run the
+        // inter-system expansion (migrated ships trade across the gate). The run only ends on STOP.
       } else {
         log.info(`🎯 EXPANSION-READY: credits ${state.cachedCredits.toLocaleString()} ≥ cost-to-expand ${state.expansionTarget.toLocaleString()} ${JSON.stringify(state.targetBreakdown)}`);
         state.stop = true;

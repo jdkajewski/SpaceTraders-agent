@@ -1,0 +1,13 @@
+# Keep host build artifacts out of the Docker build context so images build cleanly and
+# (critically) the host-generated Prisma client/engine — built for darwin — never leaks into
+# the linux image, which caused "Query Engine ... darwin-arm64" runtime crashes. (DRIFT #34)
+**/node_modules
+**/dist
+**/.turbo
+**/tsconfig.tsbuildinfo
+packages/api/src/generated
+packages/*/src/generated
+**/*.log
+**/*.out
+.git
+deploy/bot.env
