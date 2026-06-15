@@ -75,6 +75,8 @@ export function buildWorkerHooks(deps: SubsystemDeps): WorkerHooks {
   const feed = createFeedHooks(deps);
   const fleet = createFleetHooks(deps);
   return {
+    // Expansion member-dispatch is wired by main() only when AUTO_EXPAND is on; default no-op here.
+    expansion: () => Promise.resolve(false),
     repair: fleet.repair,
     gateHauler: gate.gateHauler,
     inputFeeder: feed.inputFeeder,

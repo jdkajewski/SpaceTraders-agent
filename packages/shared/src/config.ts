@@ -210,9 +210,43 @@ const RawConfigSchema = z.object({
   // ── fuel cargo ──────────────────────────────────────────────────────────
   FUEL_CARGO: boolOff,
 
-  // ── expansion ───────────────────────────────────────────────────────────
+  // ── expansion (port of expansion.mjs — Wave 5; all default OFF/inert) ─────
   AUTO_EXPAND: boolOff,
   EXPAND_TARGET_SYSTEM: str(''),
+  // 0 ⇒ derived at runtime (reserve()+400_000); see createExpansion.
+  EXPAND_CREDIT_FLOOR: num(0),
+  EXPAND_HAULERS: csvSet,
+  EXPAND_LIGHT: csvSet,
+  EXPAND_PROBES: csvSet,
+  EXPAND_MAX_PROBES: num(4),
+  EXPAND_MIN_NET: num(1000),
+  EXPAND_PROBE_DWELL_MS: num(90_000),
+  EXPAND_SCAN_TTL_MS: num(120_000),
+  EXPAND_JUMP_COST: num(12_000),
+  EXPAND_JUMP_COOLDOWN_MIN: num(8.2),
+  EXPAND_OP_OVERHEAD_MIN: num(1.5),
+  // outpost fan-out (default OFF — empty set)
+  EXPAND_OUTPOSTS: csvSet,
+  EXPAND_OUTPOST_PROBES: num(2),
+  EXPAND_OUTPOST_TRADERS: num(1),
+  // fleet auto-buy (default OFF)
+  EXPAND_AUTOBUY: boolOff,
+  // 0 ⇒ derived at runtime (max(FLOOR+250_000, 700_000)); see createExpansion.
+  EXPAND_BUY_FLOOR: num(0),
+  EXPAND_AUTOBUY_MS: num(90_000),
+  EXPAND_MAX_BUY_PROBES: num(24),
+  EXPAND_MAX_BUY_TRADERS: num(8),
+  EXPAND_PROBE_TARGET: num(0),
+  EXPAND_TRADER_PREF: str(
+    'SHIP_HEAVY_FREIGHTER,SHIP_REFINING_FREIGHTER,SHIP_LIGHT_HAULER,SHIP_LIGHT_SHUTTLE,SHIP_COMMAND_FRIGATE',
+  ),
+
+  // ── dry-run / offline smoke (Wave 5 — not in legacy bot2.mjs) ─────────────
+  // When DRY_RUN=1 the SpaceTraders game client is swapped for a no-op fixture
+  // client (no live game calls, no mutations); the bot still talks to the
+  // persistence API. DRY_RUN_CREDITS seeds the fixture agent balance.
+  DRY_RUN: boolOff,
+  DRY_RUN_CREDITS: num(1_000_000),
 
   // ── API server (Wave 1 additions — not in legacy bot2.mjs) ───────────────
   API_PORT: num(3000),

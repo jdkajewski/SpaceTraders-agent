@@ -38,6 +38,12 @@ export type WorkerHook = (shipSym: string, ship: Ship, markets: Record<string, M
  * handled the ship this loop (the worker then `continue`s). All default to no-ops.
  */
 export interface WorkerHooks {
+  /**
+   * Inter-system expansion member dispatch (Wave 5). When a ship has been migrated to the
+   * expansion fleet this handles it end-to-end and short-circuits the rest of the loop — runs
+   * FIRST, before repair/recovery (bot2 worker top: `if (expansion.isMember) { step; continue }`).
+   */
+  expansion: WorkerHook;
   /** Two-tier ship maintenance (opportunistic/forced); runs before recovery (bot2 parity). */
   repair: WorkerHook;
   /** Dedicated gate hauler (pinned to gate-supply while unbuilt). */
@@ -62,6 +68,7 @@ const noHook: WorkerHook = () => Promise.resolve(false);
 
 /** Default hooks: every Wave-4 subsystem disabled (no-op). */
 export const noopHooks: WorkerHooks = {
+  expansion: noHook,
   repair: noHook,
   gateHauler: noHook,
   inputFeeder: noHook,
@@ -159,6 +166,11 @@ export async function worker(shipSym: string, rawDeps: WorkerDeps): Promise<void
     }
     const markets = await marketsSvc.getMarkets();
     const go = (sym: string, dest: string): Promise<void> => goTo(sym, dest, markets, deps);
+
+    // [EXPANSION] If this ship has been migrated into the inter-system expansion fleet, the
+    // expansion subsystem owns it end-to-end. Runs FIRST — before repair/recovery — so a member's
+    // cross-system flight is never interrupted by home-system maintenance. (bot2 worker top, Wave 5)
+    if (await hooks.expansion(shipSym, ship, markets)) continue;
 
     // [REPAIR] Two-tier ship maintenance (default OFF). Runs in the ship's OWN loop, BEFORE recovery, so a
     // forced-divert to a shipyard happens before any new work and never races an external manager. (bot2 L2562)

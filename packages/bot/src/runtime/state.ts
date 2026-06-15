@@ -168,6 +168,13 @@ export interface BotState {
 
   /** Synchronous snapshot of the shared market cache (set by main/markets svc). */
   marketsRef: () => Record<string, Market>;
+
+  /**
+   * Optional expansion status provider (Wave 5). When `AUTO_EXPAND` is on, main sets this to
+   * `expansion.statusBlock`; `writeStatus` surfaces it in the snapshot's `expand` field. Left
+   * undefined in the single-system live build, so the snapshot reports `{ enabled: false }`.
+   */
+  expansionStatus?: () => unknown;
 }
 
 export interface CreateStateOptions {

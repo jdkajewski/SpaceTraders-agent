@@ -34,4 +34,4 @@ RUN pnpm install --frozen-lockfile --prod
 COPY --from=builder /app/packages/shared/dist ./packages/shared/dist
 COPY --from=builder /app/packages/bot/dist ./packages/bot/dist
 
-CMD ["node", "packages/bot/dist/index.js"]
+CMD ["node", "packages/bot/dist/main.js"]
