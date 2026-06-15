@@ -39,9 +39,9 @@ async function refreshCredits(state: BotState, client: SpaceTradersClient): Prom
 
 export async function main(): Promise<void> {
   const cfg: Config = loadConfig();
-  const client = createSpaceTradersClient();
+  const client = createSpaceTradersClient({ token: cfg.SPACETRADERS_PLAYER_AGENT_TOKEN });
   const local = new FileLocalStore();
-  const persistence = createPersistenceClient({ local });
+  const persistence = createPersistenceClient({ local, baseUrl: cfg.API_BASE_URL, botKey: cfg.BOT_KEY });
 
   // [BOOT] reconcile the local crash-safety store forward before anything reads state.
   await reconcileLocalToApi(persistence, local);

@@ -36,9 +36,9 @@ const log = logger.child({ mod: 'persistence' });
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 export interface PersistenceClientOptions {
-  /** Base URL of the Fastify API (defaults to `API_BASE_URL` or localhost). */
+  /** Base URL of the Fastify API. Source it from `@st/shared` `Config.API_BASE_URL`. */
   baseUrl?: string;
-  /** Optional shared-secret header (`x-bot-key`), from `BOT_KEY` by default. */
+  /** Optional shared-secret header (`x-bot-key`). Source it from `Config.BOT_KEY`. */
   botKey?: string;
   /** Injectable fetch (defaults to the global). Eases unit testing. */
   fetchImpl?: typeof fetch;
@@ -101,8 +101,8 @@ class Batcher<T> {
 }
 
 export function createPersistenceClient(opts: PersistenceClientOptions = {}): PersistenceClient {
-  const base = (opts.baseUrl ?? process.env['API_BASE_URL'] ?? 'http://localhost:3000').replace(/\/$/, '');
-  const botKey = opts.botKey ?? process.env['BOT_KEY'];
+  const base = (opts.baseUrl ?? 'http://localhost:3000').replace(/\/$/, ''); // from shared Config (DRIFT #17)
+  const botKey = opts.botKey; // from shared Config.BOT_KEY; no direct process.env read
   const doFetch = opts.fetchImpl ?? fetch;
   const local = opts.local;
   const retries = opts.retries ?? 4;

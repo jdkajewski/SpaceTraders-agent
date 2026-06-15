@@ -219,6 +219,11 @@ const RawConfigSchema = z.object({
   API_HOST: str('0.0.0.0'),
   BOT_KEY: str(''),
   BOT_AUTH_ENABLED: boolOff,
+
+  // ── bot runtime endpoints (Wave 3 — fold st.mjs/bot2 process.env reads into
+  //    shared config; resolves DRIFT #17) ────────────────────────────────────
+  API_BASE_URL: str('http://localhost:3000'),
+  SPACETRADERS_PLAYER_AGENT_TOKEN: str(''),
 });
 
 // ── post-transform: resolve derived defaults ─────────────────────────────────

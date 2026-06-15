@@ -62,7 +62,7 @@ export function __resetRateLimiter(): void {
 }
 
 export interface SpaceTradersClientOptions {
-  /** Player agent token (defaults to `SPACETRADERS_PLAYER_AGENT_TOKEN`). */
+  /** Player agent token. Source it from `@st/shared` `Config.SPACETRADERS_PLAYER_AGENT_TOKEN`. */
   token?: string;
   /** API base URL (defaults to the public v2 endpoint). */
   baseUrl?: string;
@@ -79,7 +79,7 @@ interface ErrorBody {
  * bucket; only the token/baseUrl/fetch are per-instance.
  */
 export function createSpaceTradersClient(opts: SpaceTradersClientOptions = {}): SpaceTradersClient {
-  const token = opts.token ?? process.env['SPACETRADERS_PLAYER_AGENT_TOKEN'];
+  const token = opts.token; // sourced from shared Config (DRIFT #17); no direct process.env read
   if (!token) throw new Error('Missing SPACETRADERS_PLAYER_AGENT_TOKEN');
   const base = opts.baseUrl ?? BASE_DEFAULT;
   const doFetch = opts.fetchImpl ?? fetch;
