@@ -1,5 +1,5 @@
 import Fastify from 'fastify';
-import { TypeBoxTypeProvider } from '@fastify/type-provider-typebox';
+import type { TypeBoxTypeProvider } from '@fastify/type-provider-typebox';
 import autoload from '@fastify/autoload';
 import swagger from '@fastify/swagger';
 import swaggerUi from '@fastify/swagger-ui';
