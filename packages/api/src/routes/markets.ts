@@ -1,5 +1,6 @@
 import type { FastifyPluginAsyncTypebox } from '@fastify/type-provider-typebox';
 import { Type } from '@sinclair/typebox';
+import type { MarketSnapshot } from '../generated/prisma/index.js';
 
 const MarketSnapshotSchema = Type.Object({
   waypoint: Type.String(),
@@ -34,7 +35,7 @@ const plugin: FastifyPluginAsyncTypebox = async (fastify) => {
       const rows = await fastify.prisma.marketSnapshot.findMany({
         orderBy: { waypoint: 'asc' },
       });
-      return reply.send(rows.map((r) => ({ ...r, updatedAt: r.updatedAt.toISOString() })));
+      return reply.send(rows.map((r: MarketSnapshot) => ({ ...r, updatedAt: r.updatedAt.toISOString() })));
     },
   );
 

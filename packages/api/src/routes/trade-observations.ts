@@ -1,5 +1,6 @@
 import type { FastifyPluginAsyncTypebox } from '@fastify/type-provider-typebox';
 import { Type } from '@sinclair/typebox';
+import type { TradeObservation } from '../generated/prisma/index.js';
 
 const TradeObservationRow = Type.Object({
   ts: Type.Optional(Type.String({ format: 'date-time' })),
@@ -89,7 +90,7 @@ const plugin: FastifyPluginAsyncTypebox = async (fastify) => {
         orderBy: { ts: 'desc' },
         take: limit,
       });
-      return reply.send(rows.map((r) => ({ ...r, ts: r.ts.toISOString() })));
+      return reply.send(rows.map((r: TradeObservation) => ({ ...r, ts: r.ts.toISOString() })));
     },
   );
 };
