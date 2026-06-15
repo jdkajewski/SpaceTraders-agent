@@ -12,7 +12,7 @@
 
 import type { Config, Market, Ship, TradeObservation } from '@st/shared';
 import type { BotState } from './runtime/state.js';
-import type { MarketsService, PersistenceClient, Router, ShipActions } from './interfaces.js';
+import type { MarketsService, PersistenceClient, Router, ShipActions, SpaceTradersClient } from './interfaces.js';
 import type { MarketsServiceExtra } from './market/markets.js';
 import type { DistFn } from './trade/lanes.js';
 import { buildLanes, claimLane, planRideAlongs, cooldownFor } from './trade/lanes.js';
@@ -38,6 +38,8 @@ export type WorkerHook = (shipSym: string, ship: Ship, markets: Record<string, M
  * handled the ship this loop (the worker then `continue`s). All default to no-ops.
  */
 export interface WorkerHooks {
+  /** Two-tier ship maintenance (opportunistic/forced); runs before recovery (bot2 parity). */
+  repair: WorkerHook;
   /** Dedicated gate hauler (pinned to gate-supply while unbuilt). */
   gateHauler: WorkerHook;
   /** Dedicated input feeder (long-pole producer inputs). */
@@ -60,6 +62,7 @@ const noHook: WorkerHook = () => Promise.resolve(false);
 
 /** Default hooks: every Wave-4 subsystem disabled (no-op). */
 export const noopHooks: WorkerHooks = {
+  repair: noHook,
   gateHauler: noHook,
   inputFeeder: noHook,
   mining: noHook,
@@ -79,6 +82,8 @@ export interface WorkerDeps {
   router: Router;
   markets: MarketsService & MarketsServiceExtra;
   persistence: PersistenceClient;
+  /** Direct SpaceTraders client (Wave-4 subsystems: negotiate/extract/refine/shipyard/repair). */
+  client: SpaceTradersClient;
   D: DistFn;
   hooks?: Partial<WorkerHooks>;
 }
@@ -88,6 +93,14 @@ interface ResolvedDeps extends Omit<WorkerDeps, 'hooks'> {
 }
 
 // ── navigation (bot2 goTo L2255) ─────────────────────────────────────────────
+
+/** Minimal deps for refuel-aware navigation — shared by the worker and Wave-4 subsystems. */
+export interface NavDeps {
+  state: BotState;
+  actions: ShipActions;
+  router: Router;
+  D: DistFn;
+}
 
 /**
  * Refuel-aware navigation: plan a ≤1-tank-hop route and fly it (CRUISE/BURN/DRIFT per
@@ -99,7 +112,7 @@ export async function goTo(
   shipSym: string,
   dest: string,
   markets: Record<string, Market>,
-  deps: ResolvedDeps,
+  deps: NavDeps,
 ): Promise<void> {
   const { state, actions, router, D } = deps;
   let ship = await actions.getShip(shipSym);
@@ -146,6 +159,10 @@ export async function worker(shipSym: string, rawDeps: WorkerDeps): Promise<void
     }
     const markets = await marketsSvc.getMarkets();
     const go = (sym: string, dest: string): Promise<void> => goTo(sym, dest, markets, deps);
+
+    // [REPAIR] Two-tier ship maintenance (default OFF). Runs in the ship's OWN loop, BEFORE recovery, so a
+    // forced-divert to a shipyard happens before any new work and never races an external manager. (bot2 L2562)
+    if (await hooks.repair(shipSym, ship, markets)) continue;
 
     // [RECOVERY] Before any new work, resume/salvage cargo left by a crash or STOP mid-haul. Mining
     // colony hulls intentionally HOLD cargo, so they skip recovery and let their role manage it.

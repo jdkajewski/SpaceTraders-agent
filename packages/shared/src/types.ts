@@ -32,6 +32,8 @@ export interface ShipEngine {
 }
 
 export interface ShipFrame {
+  /** Frame type symbol (e.g. FRAME_PROBE). Optional: not all API reads populate it. */
+  symbol?: string;
   condition: number;
   integrity: number;
 }
@@ -53,6 +55,8 @@ export interface Ship {
   frame: ShipFrame;
   fuel: ShipFuel;
   mounts: ShipMount[];
+  /** Installed modules (e.g. MODULE_ORE_REFINERY_I). Optional: only some reads populate it. */
+  modules?: ShipMount[];
 }
 
 export interface MarketGood {
