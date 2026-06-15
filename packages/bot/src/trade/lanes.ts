@@ -259,13 +259,16 @@ export interface ClaimDeps {
 }
 
 /**
- * Atomically (no await between check and set) claim the best AFFORDABLE lane.
- * Scores every lane (incl. outer) on true net/min using refuel-aware multi-hop routing,
- * so a fat outer trade can win over a thin cluster one — no hard distance cap. A detour-free
- * fill/drop-off tie-breaker then re-ranks lanes within FILL_BIAS_EPS of the best.
- * (bot2 `claimLane`)
+ * Pure lane SELECTION — score every lane (incl. outer) on true net/min using refuel-aware
+ * multi-hop routing (a fat outer trade can beat a thin cluster one, no hard distance cap),
+ * apply the FILL-BIAS near-tie re-rank, and return the chosen lane descriptor / park sentinel
+ * / null. **No side effects** — does NOT lock the good or commit cash. (bot2 `claimLane`
+ * scoring half; the lock/commit half lives in `claimLane`.)
+ *
+ * Shared by `claimLane` (which mutates) and `peekLane` (which doesn't), so the two can never
+ * diverge in how they rank lanes.
  */
-export function claimLane(ship: Ship, lanes: Lane[], markets: Record<string, Market>, deps: ClaimDeps): ClaimResult {
+export function selectLane(ship: Ship, lanes: Lane[], markets: Record<string, Market>, deps: ClaimDeps): ClaimResult {
   const { state, cfg, router } = deps;
   const cand: Array<{ l: Lane; score: number; estCost: number; net: number; bias?: number }> = [];
   for (const l of lanes) {
@@ -315,8 +318,36 @@ export function claimLane(ship: Ship, lanes: Lane[], markets: Record<string, Mar
   const bestProjected = chosen.net;
   if (cfg.PARK_MIN_NET > 0 && bestProjected < cfg.PARK_MIN_NET)
     return { park: true, score: bestScore, projectedNet: bestProjected }; // best lane too thin → park
-  gs(state, best.sym).lockedBy = ship.symbol; // lock synchronously
-  commit(state, bestCost); // reserve the cash synchronously
-  noteLaneCost(state, bestCost); // feed the rolling working-capital estimate
   return { lane: best, score: bestScore, cost: bestCost, projectedNet: bestProjected };
+}
+
+/**
+ * Atomically (no await between check and set) claim the best AFFORDABLE lane: select it
+ * (see {@link selectLane}) and, when a concrete lane wins, synchronously lock the good +
+ * commit the cash. Returns the same descriptor as `selectLane`. (bot2 `claimLane`)
+ */
+export function claimLane(ship: Ship, lanes: Lane[], markets: Record<string, Market>, deps: ClaimDeps): ClaimResult {
+  const sel = selectLane(ship, lanes, markets, deps);
+  if (sel && 'lane' in sel) {
+    gs(deps.state, sel.lane.sym).lockedBy = ship.symbol; // lock synchronously
+    commit(deps.state, sel.cost); // reserve the cash synchronously
+    noteLaneCost(deps.state, sel.cost); // feed the rolling working-capital estimate
+  }
+  return sel;
+}
+
+/**
+ * NON-MUTATING preview of {@link claimLane}: "would a profitable, affordable, unlocked lane
+ * be claimable for this ship right now?" Returns the same descriptor without locking the good
+ * or committing cash.
+ *
+ * DRIFT #26 (fixed in W6): legacy `worker()` did `const lanePref = TRADE_FIRST ? claimLane(...)`
+ * as a *peek* to decide "skip the contract this loop if a lane is available", then the normal
+ * section called `claimLane` AGAIN — leaking the first claim's lock + committed cash (the
+ * re-claim skips the just-locked good and picks a different lane). The TS port additionally
+ * dropped the skip-contract gate entirely (it discarded the peek result and always ran the
+ * contract). `peekLane` restores the legacy gate with no side effect. (rebuild/DRIFT-LOG.md #26)
+ */
+export function peekLane(ship: Ship, lanes: Lane[], markets: Record<string, Market>, deps: ClaimDeps): ClaimResult {
+  return selectLane(ship, lanes, markets, deps);
 }

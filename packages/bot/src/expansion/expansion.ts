@@ -72,8 +72,6 @@ export interface ExpansionCtx {
   homeMarkets: () => Record<string, Market>;
   fuelPx: () => number;
   launchWorker: (sym: string) => void;
-  /** Vestigial parity dep (bot2 passed it; expansion.mjs has its own `shipyardsIn`). */
-  getShipyards?: () => Promise<unknown>;
   /** Generic POST /my/ships {shipType, waypointSymbol} → bought ship symbol or null. */
   buyShip?: (shipType: string, wp: string) => Promise<string | null>;
   /** Resolve the contract negotiator so outposts never poach it. */
@@ -946,10 +944,10 @@ export function createExpansion(ctx: ExpansionCtx): Expansion {
       cfg.EXPAND_PROBES,
     ])
       for (const t of k) reserved.add(t);
-    // DRIFT #30: the legacy reserved-keys list `listEnv`'d 'MINE_BATCH' too, but MINE_BATCH is a
-    // numeric batch SIZE (default 24), not a ship roster — so legacy reserves the literal "24",
-    // wrongly excluding any ship whose symbol ends in `-24` from outpost crews. Preserved verbatim.
-    for (const t of toSet([String(cfg.MINE_BATCH)])) reserved.add(t);
+    // DRIFT #30 (FIXED in W6): the legacy reserved-keys list `listEnv`'d 'MINE_BATCH' alongside the real
+    // ship rosters, but MINE_BATCH is a numeric batch SIZE (default 24), not a roster — so legacy reserved
+    // the literal "24", wrongly excluding any ship whose symbol ends in `-24` from outpost crews. Dropped
+    // here so outpost crewing is no longer corrupted by the batch size. (rebuild/DRIFT-LOG.md #30)
     // also reserve the resolved contract negotiator (its bot2 DEFAULT isn't visible via env) — never poach it.
     try {
       const neg = typeof negotiator === 'function' ? negotiator() : null;

@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { loadConfig, type Config, type CoordsMap, type Market, type MarketGood } from '@st/shared';
 import { createRouter } from '../../routing/route.js';
 import { createState, gs } from '../../runtime/state.js';
-import { buildLanes, claimLane, planRideAlongs, cooldownFor } from '../lanes.js';
+import { buildLanes, claimLane, peekLane, planRideAlongs, cooldownFor } from '../lanes.js';
 import { makeShip } from '../../__tests__/fixtures.js';
 
 const cfg: Config = loadConfig({});
@@ -120,6 +120,33 @@ describe('lanes: claimLane net/min ranking + atomic lock', () => {
     const lanes = buildLanes(markets, s, c, D);
     const claim = claimLane(ship, lanes, markets, { state: s, cfg: c, router: router(markets), D });
     expect(claim && 'park' in claim).toBe(true);
+  });
+
+  // DRIFT #26: peekLane is the NON-mutating half of claimLane — it must rank identically but
+  // never lock the good or commit cash, so the TRADE_FIRST contract gate can preview a lane
+  // without leaking the first claim's lock/commit (which the old double-claim port did).
+  it('peekLane previews the same lane claimLane would, but mutates nothing (no leak)', () => {
+    const { c, s, ship } = setup();
+    const lanes = buildLanes(markets, s, c, D);
+
+    const peek = peekLane(ship, lanes, markets, { state: s, cfg: c, router: router(markets), D });
+    expect(peek && 'lane' in peek && peek.lane.sym).toBe('GOLD'); // same pick as claimLane
+    expect(gs(s, 'GOLD').lockedBy).toBeFalsy(); // NOT locked by the peek
+    expect(s.committed).toBe(0); // NO cash committed by the peek
+
+    // the lane is still claimable afterwards — the peek did not consume it
+    const claim = claimLane(ship, lanes, markets, { state: s, cfg: c, router: router(markets), D });
+    expect(claim && 'lane' in claim && claim.lane.sym).toBe('GOLD');
+    expect(gs(s, 'GOLD').lockedBy).toBe('SHIP-1');
+    expect(s.committed).toBe(claim && 'lane' in claim ? claim.cost : -1);
+  });
+
+  it('peekLane returns null when nothing is affordable (contract gate will NOT skip)', () => {
+    const { c, s, ship } = setup();
+    s.cachedCredits = 0;
+    s.operatingReserve = cfg.OPERATING_RESERVE;
+    const lanes = buildLanes(markets, s, c, D);
+    expect(peekLane(ship, lanes, markets, { state: s, cfg: c, router: router(markets), D })).toBeNull();
   });
 });
 

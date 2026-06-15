@@ -1,13 +1,15 @@
 import { describe, expect, it } from 'vitest';
 import type { Config, Market, Ship } from '@st/shared';
 import { loadConfig } from '@st/shared';
-import { createState, type BotState } from '../../runtime/state.js';
+import { createState, gs, type BotState } from '../../runtime/state.js';
 import type { Router } from '../../interfaces.js';
+import type { SubsystemDeps } from '../../subsystems/deps.js';
 import { makeShip } from '../../__tests__/fixtures.js';
 import {
   applyContractElection,
   contractHomeDeliverable,
   contractWorthIt,
+  createContractHooks,
   electContractOwner,
   updateContractAutoForce,
   type ContractInfo,
@@ -135,5 +137,50 @@ describe('contracts helpers', () => {
 
     expect(contractHomeDeliverable(cross, c)).toBe(false);
     expect(electContractOwner(cross, market(), [ship('RUNNER', 'X1-AA1-A')], deps(state, c))).toBeNull();
+  });
+});
+
+describe('contracts: TRADE_FIRST skip-contract gate (DRIFT #26)', () => {
+  // Legacy `worker()` peeked a lane (`lanePref = TRADE_FIRST ? claimLane(...) : null`) and, when one
+  // was available, SKIPPED the contract this loop — then the trade section re-claimed, leaking the
+  // first claim's lock + committed cash. The TS port dropped the skip gate entirely and discarded the
+  // (still-mutating) claim. The fix peeks NON-mutatingly: a claimable lane defers to the trade section
+  // (hook → false) without running the contract and without locking/committing anything here.
+  it('a claimable lane defers to trade (contract skipped, no lock/commit leak)', async () => {
+    const c = cfg({ CONTRACTS: true, TRADE_FIRST: true, FILL_BIAS: false });
+    // a fat, affordable ORE lane SRC→DST (margin 580 × 40 = 23 200 gross, well over MIN_NET 4000)
+    const markets: Record<string, Market> = {
+      'X1-AA1-SRC': { symbol: 'X1-AA1-SRC', tradeGoods: [{ symbol: 'ORE', type: 'EXPORT', tradeVolume: 40, supply: 'ABUNDANT', purchasePrice: 20, sellPrice: 18 }] },
+      'X1-AA1-DST': { symbol: 'X1-AA1-DST', tradeGoods: [{ symbol: 'ORE', type: 'IMPORT', tradeVolume: 40, supply: 'LIMITED', purchasePrice: 600, sellPrice: 600 }] },
+    };
+    const state = createState(c, { marketsRef: () => markets });
+    state.cachedCredits = 10_000_000;
+    state.operatingReserve = 0;
+    state.activeContractInfo = { ...ci, units: 40 }; // a contract that WOULD run if not skipped
+    const hooks = createContractHooks({ state, cfg: c, router, D: dist } as unknown as SubsystemDeps);
+
+    const handled = await hooks.contracts('RUNNER', ship('RUNNER', 'X1-AA1-SRC'), markets);
+
+    expect(handled).toBe(false); // deferred to the trade section, contract NOT run this loop
+    expect(state.contractOwner).toBeNull(); // contractRunnerTrip never reached → no owner claimed
+    expect(gs(state, 'ORE').lockedBy).toBeFalsy(); // peek did NOT lock the good (no leak)
+    expect(state.committed).toBe(0); // peek did NOT commit cash (no leak)
+  });
+
+  it('with no affordable lane the gate does not skip (peek is null → contract may run)', async () => {
+    const c = cfg({ CONTRACTS: true, TRADE_FIRST: true, FILL_BIAS: false });
+    const markets = market(20);
+    const state = createState(c, { marketsRef: () => markets });
+    state.cachedCredits = 0; // nothing affordable → no lane to defer to
+    state.operatingReserve = c.OPERATING_RESERVE;
+    const hooks = createContractHooks({ state, cfg: c, router, D: dist } as unknown as SubsystemDeps);
+
+    // activeContractInfo is null → contractRunnerTrip returns false immediately, but crucially the
+    // lane gate did NOT short-circuit: the hook fell through to the runner rather than deferring.
+    const handled = await hooks.contracts('RUNNER', ship('RUNNER', 'X1-AA1-SRC'), markets);
+
+    expect(handled).toBe(false);
+    expect(gs(state, 'ORE').lockedBy).toBeFalsy();
+    expect(state.committed).toBe(0);
   });
 });

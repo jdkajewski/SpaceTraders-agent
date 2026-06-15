@@ -1,7 +1,7 @@
 import type { Config, Contract, Market, Ship } from '@st/shared';
 import type { ContractHooks, SubsystemDeps } from '../subsystems/deps.js';
 import { bestSink, cheapestSrc } from '../trade/marketHelpers.js';
-import { buildLanes, claimLane, gateProducerWps, planRideAlongs } from '../trade/lanes.js';
+import { buildLanes, peekLane, gateProducerWps, planRideAlongs } from '../trade/lanes.js';
 import { availableForWork, commit, growthBudget, uncommit } from '../budget/budget.js';
 import { logger } from '../core/logger.js';
 
@@ -353,9 +353,15 @@ export function createContractHooks(deps: SubsystemDeps): ContractHooks {
   return {
     contracts: async (shipSym, ship, markets) => {
       if (!deps.cfg.CONTRACTS) return false;
+      // [TRADE_FIRST] (default OFF) DRIFT #26: legacy gates the contract behind a lane *peek* —
+      // if a profitable lane (or a park sentinel) is available this loop, skip the contract and
+      // let the normal trade section (worker.ts) make the single real claim. peekLane is
+      // NON-mutating, so unlike the old port this neither locks the good nor commits cash here
+      // (no double-claim leak), while restoring the legacy skip-contract gate the port had dropped.
       if (deps.cfg.TRADE_FIRST) {
         const lanes = buildLanes(markets, deps.state, deps.cfg, deps.D);
-        claimLane(ship, lanes, markets, { state: deps.state, cfg: deps.cfg, router: deps.router, D: deps.D });
+        const lanePref = peekLane(ship, lanes, markets, { state: deps.state, cfg: deps.cfg, router: deps.router, D: deps.D });
+        if (lanePref) return false; // lane available → defer to trade section, don't run contract
       }
       return contractRunnerTrip(shipSym, ship, markets, deps);
     },
