@@ -2755,6 +2755,14 @@ async function worker(shipSym) {
       await expansion.step(shipSym, ship);
       continue;
     }
+    // [AUTO_EXPAND GUARD] A ship physically in another system that expansion hasn't adopted YET (the brief window
+    // on boot between worker-start and setupOutposts re-adopting migrated outpost crews) must NOT run home-system
+    // recovery/trading: reconcileHeldCargo would pick a HOME sink and goTo() it, 400-ing on the cross-system
+    // navigate ("Destination X1-DB23-… is outside the X1-JH56 system") and looping. Park it until expansion owns it.
+    if (expansion && AUTO_EXPAND && ship.nav.systemSymbol !== SYSTEM) {
+      perShip[shipSym].last = `awaiting expansion adopt @${ship.nav.systemSymbol.slice(-4)}`;
+      await sleep(IDLE_WAIT_MS); continue;
+    }
     // [REPAIR] Two-tier ship maintenance (default OFF). Runs in the ship's OWN loop so it never races an external
     // manager for control. Forced (integrity critical) diverts to a shipyard; opportunistic (worn) only fires when
     // already at one. Acted → re-loop with fresh state.

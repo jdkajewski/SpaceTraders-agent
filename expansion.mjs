@@ -185,7 +185,13 @@ export function createExpansion(ctx) {
       log(`🪐 ${id(sym)} skip nav ${id(dest)} — different system than ${id(ship.nav.waypointSymbol)} (cross = jump only)`); return;
     }
     const path = planRoute(ship.nav.waypointSymbol, dest, ship.fuel.capacity, mkts) || [dest];
-    for (const hop of path) { ship = await getShip(sym); await navigate(sym, hop, chooseMode(D(ship.nav.waypointSymbol, hop), ship).mode); }
+    for (const hop of path) {
+      ship = await getShip(sym);
+      if (sysOf(hop) !== sysOf(ship.nav.waypointSymbol)) {                        // re-validate each hop: a jump/race can land us in another system mid-route
+        log(`🪐 ${id(sym)} abort nav ${id(hop)} — now in ${sysOf(ship.nav.waypointSymbol)} (cross = jump only)`); return;
+      }
+      await navigate(sym, hop, chooseMode(D(ship.nav.waypointSymbol, hop), ship).mode);
+    }
   }
 
   // sell whatever a ship is holding at the best-priced market in its current system (clears leftover cargo)
