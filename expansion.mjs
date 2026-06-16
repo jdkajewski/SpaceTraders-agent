@@ -68,7 +68,14 @@ export function createExpansion(ctx) {
   // them to hub roles (probe→PROBE, trader→LIGHT), and stop autobuy from staffing outposts. Use when we want to
   // concentrate all firepower on the fattest system before expanding again. Outpost gates stay configured (so the
   // recall jump knows the route); only the resident-trade behavior flips to "jump home to the hub".
+  // [RECALL RELEASE] EXPAND_RECALL_RELEASE = a credit threshold. While recall is active and credits are BELOW it, we
+  // keep concentrating on the hub. The moment credits reach it, recall auto-releases (latched ON-release): every ship
+  // that was recalled is sent BACK to its origin outpost (fan-out), and outpost autobuy resumes. 0 = never auto-release
+  // (recall stays until the flag is removed). This implements "concentrate to build a war chest, then fan out with it".
   const RECALL = process.env.EXPAND_RECALL === '1';
+  const RECALL_RELEASE = Number(process.env.EXPAND_RECALL_RELEASE || 0);
+  let recallReleased = false;
+  const recallActive = () => RECALL && !recallReleased;
   const outposts = new Map();          // sys -> { sys, gateWp, markets:{}, marketWps:[], loaded:false }
   let outpostsReady = false;
 
@@ -326,9 +333,10 @@ export function createExpansion(ctx) {
     const hubGate = target ? target.gateWp : null;      // PP48 D18A
 
     // [RECALL] consolidate onto the hub. Arrived at the hub → convert to a hub role and let normal hub logic run.
-    if (RECALL && hubSys && cur === hubSys) {
+    // Tag the member with recalledFrom = its origin outpost so RECALL RELEASE can fan it back out to that system.
+    if (recallActive() && hubSys && cur === hubSys) {
       const isP = ship.frame?.symbol === 'FRAME_PROBE';
-      members.set(sym, isP ? { role: 'PROBE', scanned: new Set() } : { role: 'LIGHT' });
+      members.set(sym, isP ? { role: 'PROBE', scanned: new Set(), recalledFrom: m.opSys } : { role: 'LIGHT', recalledFrom: m.opSys });
       log(`🪐 ${id(sym)} recalled to hub ${hubSys} → ${isP ? 'PROBE' : 'LIGHT'}`);
       return;
     }
@@ -338,7 +346,7 @@ export function createExpansion(ctx) {
       await loadSystemInto(op);
       if (!op.gateWp) op.gateWp = ship.nav.waypointSymbol; // fallback: we jumped in via the gate
       // [RECALL] don't trade here — jump back to the hub (outpost gate → hub gate); role converts on hub arrival above.
-      if (RECALL && hubGate) {
+      if (recallActive() && hubGate) {
         m.last = `recall ${op.sys.slice(-4)}→${hubSys.slice(-4)}`;
         await jumpVia(sym, ship, op.gateWp, hubGate, op.markets);
         return;
@@ -647,7 +655,7 @@ export function createExpansion(ctx) {
     // OUTPROBE / OUTLIGHT (system = m.opSys). Previously the hub was skipped entirely, so YK2 got NO autobuy coverage.
     const staffSystems = [];
     if (target && target.sys) staffSystems.push({ sys: target.sys, markets: tgtMarketWps.length, gateWp: target.gateWp, hub: true });
-    if (!RECALL) for (const sys of outposts.keys()) { const op = outposts.get(sys); staffSystems.push({ sys, markets: op.marketWps.length || 0, gateWp: op.gateWp, hub: false }); }   // [RECALL] hub-only buys
+    if (!recallActive()) for (const sys of outposts.keys()) { const op = outposts.get(sys); staffSystems.push({ sys, markets: op.marketWps.length || 0, gateWp: op.gateWp, hub: false }); }   // [RECALL] hub-only buys while concentrating
 
     // current resident staffing per system (counts in-transit migrators too, so we never over-order)
     const probeN = {}, traderN = {};
@@ -710,9 +718,30 @@ export function createExpansion(ctx) {
     else { boughtProbes++; log(`🛒 AUTOBUY probe ${id(bought)} @${id(action.wp)} (~${action.price.toLocaleString()}) → ${action.sys} [${where}; probes ${probeN[action.sys]}→${probeN[action.sys] + 1}/${mktCount}, bought ${boughtProbes}/${MAX_BUY_PROBES}]`); }
   }
 
+  // [RECALL RELEASE] Once credits reach EXPAND_RECALL_RELEASE, end concentration and fan the fleet back out: every
+  // ship we recalled (tagged recalledFrom) is restored to its origin outpost role. It's physically at the hub, so the
+  // existing migration state machine jumps it hub→outpost on the next step. Outpost autobuy also resumes (staffSystems
+  // includes outposts once recallActive() is false). Latched: fires exactly once. Idempotent/no-op when not recalling.
+  function checkRecallRelease() {
+    if (!RECALL || recallReleased || RECALL_RELEASE <= 0) return;
+    let credits; try { credits = getCredits(); } catch { return; }
+    if (credits < RECALL_RELEASE) return;
+    recallReleased = true;
+    outpostsReady = false;                                        // let setupOutposts re-run to fill any remaining shortfall
+    let restored = 0;
+    for (const [sym, m] of members) {
+      if (!m.recalledFrom) continue;
+      const sys = m.recalledFrom;
+      const isP = m.role === 'PROBE';
+      members.set(sym, isP ? { role: 'OUTPROBE', opSys: sys, scanned: new Set() } : { role: 'OUTLIGHT', opSys: sys });
+      restored++;
+    }
+    log(`🪐🟢 RECALL RELEASED at ${Math.round(credits).toLocaleString()}cr (≥ ${RECALL_RELEASE.toLocaleString()}) — fanning out: ${restored} ship(s) returning to outposts + outpost autobuy resumes.`);
+  }
+
   async function maybeTrigger() {
     if (!AUTO) return;
-    if (triggered) { if (OUTPOSTS.length && !outpostsReady) await setupOutposts(); await autoBuy(); return; }
+    if (triggered) { checkRecallRelease(); if (OUTPOSTS.length && !outpostsReady) await setupOutposts(); await autoBuy(); return; }
     if (!gateBuilt()) return;
     // resolve the target gate from the home gate's connections
     let conns = [];
@@ -741,6 +770,7 @@ export function createExpansion(ctx) {
       targetMarketsScanned: Object.keys(tgtMarkets).length, targetMarkets: tgtMarketWps.length,
       outposts: [...outposts.values()].map((o) => ({ sys: o.sys, gate: o.gateWp ? id(o.gateWp) : '?', markets: o.marketWps.length, scanned: Object.keys(o.markets).length })),
       autobuy: { enabled: AUTOBUY, floor: BUY_FLOOR, boughtProbes, boughtTraders, capProbes: MAX_BUY_PROBES, capTraders: MAX_BUY_TRADERS },
+      recall: RECALL ? { active: recallActive(), released: recallReleased, releaseAt: RECALL_RELEASE || null } : undefined,
     };
   }
 
