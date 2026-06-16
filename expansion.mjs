@@ -572,10 +572,24 @@ export function createExpansion(ctx) {
     return ast;
   }
 
+  // Migrate a stray mining hull to its colony via the 2-hop gate route (home → hub → mine system). Mirrors the outpost
+  // migration. Returns true if it handled (caller should return). Mining hulls bought locally never need this, but a
+  // hull stranded by an earlier home-buy (or any displacement) self-recovers here instead of parking forever.
+  async function migrateToMine(sym, ship, sys) {
+    const op = outposts.get(sys);
+    const hubGate = target ? target.gateWp : null, hubSys = target ? target.sys : null;
+    const cur = sysOf(ship.nav.waypointSymbol);
+    const m = members.get(sym);
+    if (!hubGate || !op || !op.gateWp) { m.last = `await route → ${sys.slice(-4)}`; await sleep(SLEEP_MS); return; }
+    if (cur === homeSystem) { m.last = `migrating → ${hubSys.slice(-4)} (hop1)`; await jumpVia(sym, ship, gateWp(), hubGate, homeMarkets()); return; }
+    if (cur === hubSys) { m.last = `migrating → ${sys.slice(-4)} (hop2)`; await jumpVia(sym, ship, hubGate, op.gateWp, tgtMarkets); return; }
+    m.last = `stray ${cur.slice(-4)}`; await sleep(SLEEP_MS);
+  }
+
   // SURVEYOR: park on the colony rock and keep producing surveys into the shared pool (drones consume them).
   async function stepSurveyor(sym, ship) {
     const m = members.get(sym); const sys = m.mineSys; const op = outposts.get(sys);
-    if (sysOf(ship.nav.waypointSymbol) !== sys) { m.last = 'stray'; await sleep(SLEEP_MS); return; }
+    if (sysOf(ship.nav.waypointSymbol) !== sys) return migrateToMine(sym, ship, sys);
     const ast = await ensureAtRock(sym, ship, sys, op);
     if (ast === null) { m.last = `no asteroid ${sys.slice(-4)}`; await sleep(SLEEP_MS); return; }
     if (ast === false) { m.last = '→ rock'; return; }
@@ -592,7 +606,7 @@ export function createExpansion(ctx) {
   // only if no hauler shows up (so it never deadlocks holding a full hold).
   async function stepMiner(sym, ship) {
     const m = members.get(sym); const sys = m.mineSys; const op = outposts.get(sys);
-    if (sysOf(ship.nav.waypointSymbol) !== sys) { m.last = `stray (mine ${sys.slice(-4)})`; await sleep(SLEEP_MS); return; }
+    if (sysOf(ship.nav.waypointSymbol) !== sys) return migrateToMine(sym, ship, sys);
     if (op && !op.loaded) await loadSystemInto(op);
     const ast = await ensureAtRock(sym, ship, sys, op);
     if (ast === null) { m.last = `no COMMON_METAL asteroid`; await sleep(SLEEP_MS); return; }
@@ -634,7 +648,7 @@ export function createExpansion(ctx) {
   // to the best local sink (refinery), sell, return. Keeps the drones extracting full-time.
   async function stepMineHaul(sym, ship) {
     const m = members.get(sym); const sys = m.mineSys; const op = outposts.get(sys);
-    if (sysOf(ship.nav.waypointSymbol) !== sys) { m.last = 'stray'; await sleep(SLEEP_MS); return; }
+    if (sysOf(ship.nav.waypointSymbol) !== sys) return migrateToMine(sym, ship, sys);
     if (op && !op.loaded) await loadSystemInto(op);
     const cap = ship.cargo?.capacity || 0;
     const oreUnits = (ship.cargo?.inventory || []).filter((i) => i.symbol !== 'FUEL').reduce((a, i) => a + i.units, 0);
@@ -880,7 +894,7 @@ export function createExpansion(ctx) {
         if (!outposts.has(sys)) continue;                       // need market data to sink ore
         for (const rs of roleSpec) {
           if (rs.have[sys] >= rs.want) continue;
-          const loc = await pickBuy(rs.type, [sys, homeSystem], shipWps);
+          const loc = await pickBuy(rs.type, [sys], shipWps);   // LOCAL-ONLY: a home-bought mining hull can't reach the colony
           if (loc) {
             const px = loc.price || rs.dflt;
             if (MAX_TRADER_PRICE > 0 && loc.price && loc.price > MAX_TRADER_PRICE) continue;
@@ -964,23 +978,25 @@ export function createExpansion(ctx) {
     log(`🪐🟢 RECALL RELEASED at ${Math.round(credits).toLocaleString()}cr (≥ ${RECALL_RELEASE.toLocaleString()}) — fanning out: ${restored} ship(s) returning to outposts + outpost autobuy resumes.`);
   }
 
-  // [MINE] Adopt any mining-capable hull sitting in a configured mine system that we don't already manage. Role by
-  // capability: MINING_LASER → MINEDRONE, SURVEYOR mount → MINESURVEY, else (a cargo hull we sent here) → MINEHAUL.
-  // Restart-safe: ships bought in a prior run resume their colony role instead of idling.
+  // [MINE] Adopt any non-member mining hull (MINING_LASER → MINEDRONE, SURVEYOR → MINESURVEY) ANYWHERE — in a mine
+  // system (resume), or stranded at home/hub (e.g. an earlier home-buy, or idle gate-era drones) → assign to a colony
+  // and let migrateToMine ferry it over. Safe because home mining (MINE_FEED) is off once the gate is built, so these
+  // hulls are otherwise idle. Restart-safe; pulls every spare mining hull into the colonies.
   async function adoptMiners() {
     if (!MINE_SYSTEMS.length) return;
     let all; try { all = await getAllShips(); } catch { return; }
     for (const s of all) {
       if (members.has(s.symbol)) continue;
-      if (!MINE_SYSTEMS.includes(s.nav.systemSymbol)) continue;
+      if (s.nav.status === 'IN_TRANSIT') continue;
       const mounts = (s.mounts || []).map((m) => m.symbol || m);
       const isDrone = mounts.some((x) => /MINING_LASER/.test(x));
       const isSurvey = mounts.some((x) => /SURVEYOR/.test(x));
-      if (!isDrone && !isSurvey) continue;                       // not a mining hull — leave for outpost logic
+      if (!isDrone && !isSurvey) continue;
+      const sys = MINE_SYSTEMS.includes(s.nav.systemSymbol) ? s.nav.systemSymbol : MINE_SYSTEMS[0];
       const role = isDrone ? 'MINEDRONE' : 'MINESURVEY';
-      members.set(s.symbol, { role, mineSys: s.nav.systemSymbol });
+      members.set(s.symbol, { role, mineSys: sys });
       launchWorker(s.symbol);
-      log(`⛏ adopted ${id(s.symbol)} → ${role} @${s.nav.systemSymbol.slice(-4)}`);
+      log(`⛏ adopted ${id(s.symbol)} → ${role} @${sys.slice(-4)}${s.nav.systemSymbol !== sys ? ` (migrating from ${s.nav.systemSymbol.slice(-4)})` : ''}`);
     }
   }
 
