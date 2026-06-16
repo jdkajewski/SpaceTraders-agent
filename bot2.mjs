@@ -3385,7 +3385,7 @@ async function main() {
   if (AUTO_EXPAND) {
     expansion = createExpansion({
       api, log, sleep, now,
-      navigate, refuel, buy, sell, jump, getShip, getAllShips,
+      navigate, refuel, buy, sell, jump, getShip, getAllShips, transfer,
       coords, D, chooseMode, planRoute, record,
       homeSystem: SYSTEM,
       gateWp: () => gateCache.wp,

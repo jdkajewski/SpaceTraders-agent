@@ -35,7 +35,7 @@ const SLEEP_MS = 8000;
 export function createExpansion(ctx) {
   const {
     api, log, sleep, now,
-    navigate, refuel, buy, sell, jump, getShip, getAllShips,
+    navigate, refuel, buy, sell, jump, getShip, getAllShips, transfer,
     coords, D, chooseMode, planRoute, record,
     homeSystem, gateWp, gateBuilt, getCredits, reserve, homeMarkets, launchWorker,
     fuelPx, getShipyards, buyShip, negotiator,
@@ -107,12 +107,17 @@ export function createExpansion(ctx) {
   // refinery). Ore is ~free (mined, not bought) and asteroids regenerate, so this scales without the price-compression
   // that caps pure arbitrage — exactly how the brute-scale agents field thousands of ships. Drones are bought LOCALLY
   // at the mine system's own shipyard (no migration). Off by default; enable per-system via EXPAND_MINE.
-  const MINE_SYSTEMS = [...listEnv('EXPAND_MINE')];                             // e.g. "X1-UZ64,X1-ZV87" ('' = off)
-  const MINE_DRONES_PER = Number(process.env.EXPAND_MINE_DRONES || 4);          // mining drones per mine system
-  const MAX_BUY_DRONES = Number(process.env.EXPAND_MAX_BUY_DRONES || 30);       // lifetime mining-drone buys this run
+  const MINE_SYSTEMS = [...listEnv('EXPAND_MINE')];                             // e.g. "X1-UZ64,X1-ZV87" ('' = off). Multiple colonies DON'T dilute — each mines its own asteroids → its own refinery.
+  const MINE_DRONES_PER = Number(process.env.EXPAND_MINE_DRONES || 6);          // mining drones per colony (the renewable extractor core)
+  const MINE_SURVEYORS_PER = Number(process.env.EXPAND_MINE_SURVEYORS || 1);    // surveyors per colony (fresh surveys → 2-3× yield)
+  const MINE_HAULERS_PER = Number(process.env.EXPAND_MINE_HAULERS || 2);        // ore-ferry haulers per colony (so drones stay parked)
+  const MAX_BUY_DRONES = Number(process.env.EXPAND_MAX_BUY_DRONES || 40);       // lifetime mining-ship buys this run (drones+surveyors+haulers)
   const MINE_DRONE_TYPE = process.env.EXPAND_MINE_DRONE_TYPE || 'SHIP_MINING_DRONE';
-  const mineCd = new Map();            // sym -> epoch ms (extraction cooldown)
+  const MINE_SURVEYOR_TYPE = process.env.EXPAND_MINE_SURVEYOR_TYPE || 'SHIP_SURVEYOR';
+  const MINE_HAUL_TYPE = process.env.EXPAND_MINE_HAUL_TYPE || 'SHIP_LIGHT_HAULER';
+  const mineCd = new Map();            // sym -> epoch ms (extraction/survey cooldown)
   const asteroidCache = new Map();     // sys -> { at, list:[wp] } COMMON_METAL asteroids
+  const mineColony = new Map();        // sys -> { asteroid:wp, surveys:[] } shared colony state
   let boughtDrones = 0;
 
   let triggered = false;
@@ -543,43 +548,109 @@ export function createExpansion(ctx) {
   // One mining drone: shuttle between a COMMON_METAL asteroid (extract) and the best local ore sink (sell). Pure
   // local loop — drones are bought in-system so they never migrate. Ore is mined (≈free); selling it to the refinery
   // that imports it is almost pure margin. Renewable + parallel: the scaling lever.
+  //
+  // PARK-AND-FERRY: drones stay glued to ONE shared asteroid extracting continuously and PUSH ore to a co-located
+  // hauler (transfer); the hauler ferries full loads to the refinery so drones never lose mining time. A surveyor keeps
+  // fresh surveys so extraction targets IRON/COPPER/ALUMINUM (2-3× the random yield). All colony ships converge on the
+  // same rock (mineColony[sys].asteroid) so transfers always co-locate.
+  const MINE_ORES = ['IRON_ORE', 'COPPER_ORE', 'ALUMINUM_ORE'];
+  function pruneMineSurveys(c) { const t = now(); c.surveys = (c.surveys || []).filter((s) => new Date(s.expiration).getTime() > t + 5000); }
+  function bestSurvey(c) { pruneMineSurveys(c); let best = null, bd = -1; for (const s of c.surveys) { const dep = s.deposits || []; const density = dep.filter((d) => MINE_ORES.includes(d.symbol)).length / (dep.length || 1); if (density > bd) { bd = density; best = s; } } return best; }
+  async function colonyAsteroid(sys) {
+    let c = mineColony.get(sys);
+    if (c && c.asteroid) return c.asteroid;
+    const asts = await commonMetalAsteroids(sys);
+    if (!asts.length) return null;
+    if (!c) { c = { asteroid: asts[0], surveys: [] }; mineColony.set(sys, c); } else c.asteroid = asts[0];
+    return c.asteroid;
+  }
+  async function ensureAtRock(sym, ship, sys, op) {
+    const ast = await colonyAsteroid(sys);
+    if (!ast) return null;
+    if (ship.nav.waypointSymbol !== ast) { await goToSys(sym, ast, op ? op.markets : {}); return false; }
+    if (ship.nav.status === 'DOCKED') { try { await api('POST', `/my/ships/${sym}/orbit`); } catch {} }
+    return ast;
+  }
+
+  // SURVEYOR: park on the colony rock and keep producing surveys into the shared pool (drones consume them).
+  async function stepSurveyor(sym, ship) {
+    const m = members.get(sym); const sys = m.mineSys; const op = outposts.get(sys);
+    if (sysOf(ship.nav.waypointSymbol) !== sys) { m.last = 'stray'; await sleep(SLEEP_MS); return; }
+    const ast = await ensureAtRock(sym, ship, sys, op);
+    if (ast === null) { m.last = `no asteroid ${sys.slice(-4)}`; await sleep(SLEEP_MS); return; }
+    if (ast === false) { m.last = '→ rock'; return; }
+    if (mineCd.get(sym) > now()) { await sleep(Math.min(mineCd.get(sym) - now() + 500, 30_000)); m.last = 'survey cd'; return; }
+    try {
+      const d = (await api('POST', `/my/ships/${sym}/survey`)).data;
+      const c = mineColony.get(sys); if (c) for (const s of d.surveys || []) c.surveys.push(s);
+      if (d.cooldown?.remainingSeconds) mineCd.set(sym, now() + d.cooldown.remainingSeconds * 1000);
+      m.last = `surveyed +${(d.surveys || []).length}`;
+    } catch (e) { const mm = /(\d+)\s*second/i.exec(e.message); if (mm) mineCd.set(sym, now() + (+mm[1]) * 1000 + 500); else { m.last = `survey ERR ${e.message}`; await sleep(SLEEP_MS); } }
+  }
+
+  // DRONE: park on the rock, extract (survey-biased), and PUSH ore to a co-located hauler. Falls back to selling itself
+  // only if no hauler shows up (so it never deadlocks holding a full hold).
   async function stepMiner(sym, ship) {
-    const m = members.get(sym);
-    const sys = m.mineSys;
-    const op = outposts.get(sys);
-    const cur = sysOf(ship.nav.waypointSymbol);
-    if (cur !== sys) { m.last = `stray ${cur.slice(-4)} (mine ${sys.slice(-4)})`; await sleep(SLEEP_MS); return; }
+    const m = members.get(sym); const sys = m.mineSys; const op = outposts.get(sys);
+    if (sysOf(ship.nav.waypointSymbol) !== sys) { m.last = `stray (mine ${sys.slice(-4)})`; await sleep(SLEEP_MS); return; }
     if (op && !op.loaded) await loadSystemInto(op);
+    const ast = await ensureAtRock(sym, ship, sys, op);
+    if (ast === null) { m.last = `no COMMON_METAL asteroid`; await sleep(SLEEP_MS); return; }
+    if (ast === false) { m.last = `→ rock`; return; }
 
     const capFree = (ship.cargo?.capacity || 0) - (ship.cargo?.units || 0);
-    const held = (ship.cargo?.inventory || []).filter((i) => i.symbol !== 'FUEL').reduce((a, i) => a + i.units, 0);
-    // sell when nearly full (a mining drone's hold is small; don't waste an extract on an overflow error)
-    if (held > 0 && capFree <= 3) {
-      if (op) await scanAllInto(op);
-      if (op && await dumpCargo(sym, ship, cur, op.markets)) { m.last = `sold ore @${sys.slice(-4)}`; return; }
-      // no known local sink yet (markets not scanned) — wait for probe coverage rather than hoard
-      m.last = `holding ${held} ore (no sink scanned yet)`; await sleep(SLEEP_MS); return;
+    const ore = (ship.cargo?.inventory || []).filter((i) => i.symbol !== 'FUEL');
+    const oreUnits = ore.reduce((a, i) => a + i.units, 0);
+    if (oreUnits > 0 && capFree <= 3) {
+      // push ore to a co-located hauler (keeps mining without leaving the rock)
+      const haulers = [...members.entries()].filter(([, mm]) => mm.role === 'MINEHAUL' && mm.mineSys === sys).map(([s]) => s);
+      for (const hs of haulers) {
+        try { const h = await getShip(hs); if (h.nav.waypointSymbol !== ast || h.nav.status === 'IN_TRANSIT') continue; let hFree = h.cargo.capacity - h.cargo.units; if (hFree <= 0) continue;
+          for (const it of ore) { const give = Math.min(it.units, hFree); if (give > 0) { await transfer(sym, hs, it.symbol, give); hFree -= give; } }
+          m.last = `pushed ore→${hs.slice(-3)}`; return;
+        } catch {}
+      }
+      // no hauler ready → sell ore ourselves at the local sink (fallback)
+      if (op) { await scanAllInto(op); if (await dumpCargo(sym, ship, sysOf(ship.nav.waypointSymbol), op.markets)) { m.last = 'sold ore (no hauler)'; return; } }
+      m.last = `full, awaiting hauler`; await sleep(SLEEP_MS); return;
     }
 
-    const asts = await commonMetalAsteroids(sys);
-    if (!asts.length) { m.last = `no COMMON_METAL asteroid in ${sys.slice(-4)}`; await sleep(SLEEP_MS); return; }
-    const here = ship.nav.waypointSymbol;
-    const ast = asts.slice().sort((a, b) => D(here, a) - D(here, b))[0];
-    if (here !== ast) { await goToSys(sym, ast, op ? op.markets : {}); m.last = `→ asteroid ${ast.slice(-4)}`; return; }
-
-    if (ship.nav.status === 'DOCKED') { try { await api('POST', `/my/ships/${sym}/orbit`); } catch {} }
-    if (mineCd.get(sym) > now()) { await sleep(Math.min(mineCd.get(sym) - now() + 500, 30_000)); m.last = `cooldown @${ast.slice(-4)}`; return; }
+    if (mineCd.get(sym) > now()) { await sleep(Math.min(mineCd.get(sym) - now() + 500, 30_000)); m.last = `cooldown`; return; }
+    const c = mineColony.get(sys); const survey = c ? bestSurvey(c) : null;
     try {
-      const r = (await api('POST', `/my/ships/${sym}/extract`)).data;
+      const r = (await api('POST', `/my/ships/${sym}/extract`, survey ? { survey } : undefined)).data;
       if (r.cooldown?.remainingSeconds) mineCd.set(sym, now() + r.cooldown.remainingSeconds * 1000);
-      const y = r.extraction?.yield;
-      m.last = y ? `mined ${y.units} ${y.symbol} @${ast.slice(-4)}` : `extracted @${ast.slice(-4)}`;
+      const y = r.extraction?.yield; m.last = y ? `mined ${y.units} ${y.symbol}` : `extracted`;
     } catch (e) {
       const mm = /(\d+)\s*second/i.exec(e.message);
-      if (/cooldown/i.test(e.message) && mm) mineCd.set(sym, now() + (+mm[1]) * 1000 + 500);
-      else if (/cargo|full|capacity/i.test(e.message)) { if (op) { await scanAllInto(op); await dumpCargo(sym, ship, cur, op.markets); } }
+      if (/survey/i.test(e.message)) { if (c && survey) c.surveys = c.surveys.filter((s) => s !== survey); }   // exhausted/expired survey → drop it
+      else if (mm && /cooldown/i.test(e.message)) mineCd.set(sym, now() + (+mm[1]) * 1000 + 500);
+      else if (/cargo|full|capacity/i.test(e.message)) { /* push/sell next loop */ }
       else { m.last = `mine ERR ${e.message}`; await sleep(SLEEP_MS); }
     }
+  }
+
+  // HAULER: park on the rock collecting ore the drones push; when full (or after a wait, to clear partial loads) ferry
+  // to the best local sink (refinery), sell, return. Keeps the drones extracting full-time.
+  async function stepMineHaul(sym, ship) {
+    const m = members.get(sym); const sys = m.mineSys; const op = outposts.get(sys);
+    if (sysOf(ship.nav.waypointSymbol) !== sys) { m.last = 'stray'; await sleep(SLEEP_MS); return; }
+    if (op && !op.loaded) await loadSystemInto(op);
+    const cap = ship.cargo?.capacity || 0;
+    const oreUnits = (ship.cargo?.inventory || []).filter((i) => i.symbol !== 'FUEL').reduce((a, i) => a + i.units, 0);
+    const capFree = cap - (ship.cargo?.units || 0);
+    const fullEnough = capFree <= Math.max(2, Math.floor(cap * 0.12));
+    // ferry when full, or when holding ore past the collection deadline (so partial loads still get sold)
+    if (oreUnits > 0 && (fullEnough || (m.ferryBy && now() > m.ferryBy))) {
+      if (op) { await scanAllInto(op); if (await dumpCargo(sym, ship, sysOf(ship.nav.waypointSymbol), op.markets)) { m.last = `ferried ${oreUnits} ore`; m.ferryBy = null; return; } }
+      m.last = `holding ${oreUnits} ore (no sink scanned)`; await sleep(SLEEP_MS); return;
+    }
+    // park at the rock and collect (drones push to us)
+    const ast = await ensureAtRock(sym, ship, sys, op);
+    if (ast === null) { m.last = `no asteroid`; await sleep(SLEEP_MS); return; }
+    if (ast === false) { m.last = `→ rock to collect`; return; }
+    if (oreUnits > 0 && !m.ferryBy) m.ferryBy = now() + 180_000;   // ferry a partial load if drones are slow
+    m.last = `collecting @rock (${oreUnits}/${cap})`; await sleep(SLEEP_MS);
   }
 
   // -------------------------------- public API --------------------------------
@@ -589,6 +660,8 @@ export function createExpansion(ctx) {
       if (m.role === 'PROBE') await stepProbe(sym, ship);
       else if (m.role === 'LIGHT') await stepLight(sym, ship);
       else if (m.role === 'MINEDRONE') await stepMiner(sym, ship);
+      else if (m.role === 'MINESURVEY') await stepSurveyor(sym, ship);
+      else if (m.role === 'MINEHAUL') await stepMineHaul(sym, ship);
       else if (m.role === 'OUTPROBE' || m.role === 'OUTLIGHT') await stepOutpost(sym, ship);
       else await stepHauler(sym, ship);
     } catch (e) { log(`🪐 ${id(sym)} expand step ERR ${e.message} — parking`); await sleep(SLEEP_MS); }
@@ -770,10 +843,13 @@ export function createExpansion(ctx) {
 
     // current resident staffing per system (counts in-transit migrators too, so we never over-order)
     const probeN = {}, traderN = {};
-    const droneN = {}; for (const s of MINE_SYSTEMS) droneN[s] = 0;       // [MINE] drones per mine system
+    const droneN = {}, surveyorN = {}, haulerN = {};
+    for (const s of MINE_SYSTEMS) { droneN[s] = 0; surveyorN[s] = 0; haulerN[s] = 0; }
     for (const ss of staffSystems) { probeN[ss.sys] = 0; traderN[ss.sys] = 0; }
     for (const [, m] of members) {
       if (m.role === 'MINEDRONE') { if (droneN[m.mineSys] !== undefined) droneN[m.mineSys]++; continue; }
+      if (m.role === 'MINESURVEY') { if (surveyorN[m.mineSys] !== undefined) surveyorN[m.mineSys]++; continue; }
+      if (m.role === 'MINEHAUL') { if (haulerN[m.mineSys] !== undefined) haulerN[m.mineSys]++; continue; }
       let sys = null, isP = false, isT = false;
       if (m.role === 'OUTPROBE') { sys = m.opSys; isP = true; }
       else if (m.role === 'OUTLIGHT') { sys = m.opSys; isT = true; }
@@ -788,10 +864,33 @@ export function createExpansion(ctx) {
     try { allShips = await getAllShips(); shipWps = new Set(allShips.filter((s) => s.nav.status !== 'IN_TRANSIT').map((s) => s.nav.waypointSymbol)); }
     catch (e) { lastBuyAt = now(); log(`🛒 AUTOBUY fleet read ERR ${e.message}`); return; }
 
-    // decide ONE action: trader-starved system first (earns), else worst probe-coverage gap (sharpens lanes).
-    // The hub is in this list, so it's prioritized first; outposts fill as the hub saturates. Buy LOCAL when possible.
+    // decide ONE action. PRIORITY: (1) build the mine colonies (renewable, non-diluting scaling lever), then
+    // (2) trader-starved systems (arbitrage earners), then (3) probe coverage. Buy LOCAL when possible.
     let action = null;
-    if (boughtTraders < MAX_BUY_TRADERS) {
+    // 1) [MINE COLONY] staff each colony: surveyor (yield) → haulers (park-and-ferry) → drones (scale extraction).
+    //    Mining hulls are sold ONLY at the colony's own shipyard (home can't), so always buy local (anchor if needed).
+    if (boughtDrones < MAX_BUY_DRONES) {
+      const roleSpec = [
+        { type: MINE_SURVEYOR_TYPE, role: 'MINESURVEY', have: surveyorN, want: MINE_SURVEYORS_PER, dflt: 40_000 },
+        { type: MINE_HAUL_TYPE, role: 'MINEHAUL', have: haulerN, want: MINE_HAULERS_PER, dflt: 180_000 },
+        { type: MINE_DRONE_TYPE, role: 'MINEDRONE', have: droneN, want: MINE_DRONES_PER, dflt: 80_000 },
+      ];
+      for (const sys of MINE_SYSTEMS) {
+        if (action) break;
+        if (!outposts.has(sys)) continue;                       // need market data to sink ore
+        for (const rs of roleSpec) {
+          if (rs.have[sys] >= rs.want) continue;
+          const loc = await pickBuy(rs.type, [sys, homeSystem], shipWps);
+          if (loc) {
+            const px = loc.price || rs.dflt;
+            if (MAX_TRADER_PRICE > 0 && loc.price && loc.price > MAX_TRADER_PRICE) continue;
+            if (credits - px >= BUY_FLOOR) { action = { kind: 'mine', role: rs.role, type: rs.type, wp: loc.wp, price: px, sys, local: loc.local, have: rs.have[sys], want: rs.want }; break; }
+          } else if (await anchorBuy(rs.type, sys, allShips)) { lastBuyAt = now(); return; }   // dispatch anchor, buy next window
+        }
+      }
+    }
+    // 2) trader-starved system
+    if (!action && boughtTraders < MAX_BUY_TRADERS) {
       const starved = staffSystems.find((ss) => traderN[ss.sys] < OUTPOST_TRADERS);
       if (starved) {
         for (const t of TRADER_PREF) {                          // best hull first
@@ -800,22 +899,6 @@ export function createExpansion(ctx) {
           const px = loc.price || 320_000;
           if (MAX_TRADER_PRICE > 0 && loc.price && loc.price > MAX_TRADER_PRICE) continue;   // too pricey → try next hull / wait
           if (credits - px >= BUY_FLOOR) { action = { kind: 'trader', role: starved.hub ? 'LIGHT' : 'OUTLIGHT', type: t, wp: loc.wp, price: px, sys: starved.sys, local: loc.local }; break; }
-        }
-      }
-    }
-    if (!action && boughtDrones < MAX_BUY_DRONES) {
-      // [MINE] staff each mine system toward MINE_DRONES_PER. Drones are bought LOCALLY (the mine system's own shipyard
-      // sells SHIP_MINING_DRONE) so they're on-site immediately — no migration. Only buy where we can actually sink ore
-      // (the system is an outpost we've started mapping) to avoid drones with nowhere to sell.
-      const needy = MINE_SYSTEMS.find((s) => droneN[s] < MINE_DRONES_PER && outposts.has(s));
-      if (needy) {
-        const loc = await pickBuy(MINE_DRONE_TYPE, [needy, homeSystem], shipWps);
-        if (loc && (!MAX_TRADER_PRICE || !loc.price || loc.price <= MAX_TRADER_PRICE)) {
-          const px = loc.price || 80_000;
-          if (credits - px >= BUY_FLOOR) action = { kind: 'drone', role: 'MINEDRONE', type: MINE_DRONE_TYPE, wp: loc.wp, price: px, sys: needy, local: loc.local };
-        } else if (!loc) {
-          // no ship at the mine shipyard yet → dispatch an anchor so next window's local drone buy succeeds
-          if (await anchorBuy(MINE_DRONE_TYPE, needy, allShips)) { lastBuyAt = now(); return; }
         }
       }
     }
@@ -847,6 +930,8 @@ export function createExpansion(ctx) {
     const m = action.role === 'OUTPROBE' ? { role: 'OUTPROBE', opSys: action.sys, scanned: new Set() }
             : action.role === 'PROBE' ? { role: 'PROBE', scanned: new Set() }
             : action.role === 'MINEDRONE' ? { role: 'MINEDRONE', mineSys: action.sys }
+            : action.role === 'MINESURVEY' ? { role: 'MINESURVEY', mineSys: action.sys }
+            : action.role === 'MINEHAUL' ? { role: 'MINEHAUL', mineSys: action.sys }
             : action.role === 'LIGHT' ? { role: 'LIGHT' }
             : { role: 'OUTLIGHT', opSys: action.sys };
     members.set(bought, m);
@@ -854,7 +939,7 @@ export function createExpansion(ctx) {
     const where = action.local ? `LOCAL @${action.sys.slice(-4)}` : 'home→migrate';
     const mktCount = action.sys === (target && target.sys) ? tgtMarketWps.length : (outposts.get(action.sys)?.marketWps.length || '?');
     if (action.kind === 'trader') { boughtTraders++; log(`🛒 AUTOBUY trader ${action.type} ${id(bought)} @${id(action.wp)} (~${action.price.toLocaleString()}) → ${action.sys} [${where}; traders ${traderN[action.sys]}→${traderN[action.sys] + 1}/${OUTPOST_TRADERS}, bought ${boughtTraders}/${MAX_BUY_TRADERS}]`); }
-    else if (action.kind === 'drone') { boughtDrones++; log(`⛏ AUTOBUY mining drone ${id(bought)} @${id(action.wp)} (~${action.price.toLocaleString()}) → ${action.sys} [${where}; drones ${droneN[action.sys]}→${droneN[action.sys] + 1}/${MINE_DRONES_PER}, bought ${boughtDrones}/${MAX_BUY_DRONES}]`); }
+    else if (action.kind === 'mine') { boughtDrones++; const tag = action.role === 'MINESURVEY' ? 'surveyor' : action.role === 'MINEHAUL' ? 'ore-hauler' : 'mining drone'; log(`⛏ AUTOBUY ${tag} ${id(bought)} @${id(action.wp)} (~${action.price.toLocaleString()}) → ${action.sys} [${where}; ${action.have}→${action.have + 1}/${action.want}, mine-buys ${boughtDrones}/${MAX_BUY_DRONES}]`); }
     else { boughtProbes++; log(`🛒 AUTOBUY probe ${id(bought)} @${id(action.wp)} (~${action.price.toLocaleString()}) → ${action.sys} [${where}; probes ${probeN[action.sys]}→${probeN[action.sys] + 1}/${mktCount}, bought ${boughtProbes}/${MAX_BUY_PROBES}]`); }
   }
 
@@ -879,20 +964,23 @@ export function createExpansion(ctx) {
     log(`🪐🟢 RECALL RELEASED at ${Math.round(credits).toLocaleString()}cr (≥ ${RECALL_RELEASE.toLocaleString()}) — fanning out: ${restored} ship(s) returning to outposts + outpost autobuy resumes.`);
   }
 
-  // [MINE] Adopt any mining-capable hull (MINING_LASER mount) sitting in a configured mine system that we don't already
-  // manage → MINEDRONE. Restart-safe: drones bought in a prior run resume mining instead of idling. Cheap (one fleet
-  // read, throttled with autobuy's own cadence via the maybeTrigger tick).
+  // [MINE] Adopt any mining-capable hull sitting in a configured mine system that we don't already manage. Role by
+  // capability: MINING_LASER → MINEDRONE, SURVEYOR mount → MINESURVEY, else (a cargo hull we sent here) → MINEHAUL.
+  // Restart-safe: ships bought in a prior run resume their colony role instead of idling.
   async function adoptMiners() {
     if (!MINE_SYSTEMS.length) return;
     let all; try { all = await getAllShips(); } catch { return; }
     for (const s of all) {
       if (members.has(s.symbol)) continue;
       if (!MINE_SYSTEMS.includes(s.nav.systemSymbol)) continue;
-      const isMiner = (s.mounts || []).some((m) => /MINING_LASER/.test(m.symbol || m));
-      if (!isMiner) continue;
-      members.set(s.symbol, { role: 'MINEDRONE', mineSys: s.nav.systemSymbol });
+      const mounts = (s.mounts || []).map((m) => m.symbol || m);
+      const isDrone = mounts.some((x) => /MINING_LASER/.test(x));
+      const isSurvey = mounts.some((x) => /SURVEYOR/.test(x));
+      if (!isDrone && !isSurvey) continue;                       // not a mining hull — leave for outpost logic
+      const role = isDrone ? 'MINEDRONE' : 'MINESURVEY';
+      members.set(s.symbol, { role, mineSys: s.nav.systemSymbol });
       launchWorker(s.symbol);
-      log(`⛏ adopted ${id(s.symbol)} → MINEDRONE @${s.nav.systemSymbol.slice(-4)}`);
+      log(`⛏ adopted ${id(s.symbol)} → ${role} @${s.nav.systemSymbol.slice(-4)}`);
     }
   }
 
@@ -928,7 +1016,16 @@ export function createExpansion(ctx) {
       outposts: [...outposts.values()].map((o) => ({ sys: o.sys, gate: o.gateWp ? id(o.gateWp) : '?', markets: o.marketWps.length, scanned: Object.keys(o.markets).length })),
       autobuy: { enabled: AUTOBUY, floor: BUY_FLOOR, boughtProbes, boughtTraders, capProbes: MAX_BUY_PROBES, capTraders: MAX_BUY_TRADERS },
       recall: RECALL ? { active: recallActive(), released: recallReleased, releaseAt: RECALL_RELEASE || null } : undefined,
-      mine: MINE_SYSTEMS.length ? { systems: MINE_SYSTEMS, dronesPer: MINE_DRONES_PER, boughtDrones, capDrones: MAX_BUY_DRONES, drones: [...members].filter(([, m]) => m.role === 'MINEDRONE').map(([s, m]) => ({ ship: s.slice(-3), sys: m.mineSys.slice(-4), last: m.last })) } : undefined,
+      mine: MINE_SYSTEMS.length ? {
+        systems: MINE_SYSTEMS, want: { surveyors: MINE_SURVEYORS_PER, haulers: MINE_HAULERS_PER, drones: MINE_DRONES_PER }, boughtMineShips: boughtDrones, capMineShips: MAX_BUY_DRONES,
+        colonies: MINE_SYSTEMS.map((sys) => {
+          const crew = [...members].filter(([, m]) => m.mineSys === sys);
+          const c = mineColony.get(sys);
+          return { sys: sys.slice(-4), asteroid: c && c.asteroid ? id(c.asteroid) : '?', surveys: c ? (c.surveys || []).length : 0,
+            surveyors: crew.filter(([, m]) => m.role === 'MINESURVEY').length, haulers: crew.filter(([, m]) => m.role === 'MINEHAUL').length, drones: crew.filter(([, m]) => m.role === 'MINEDRONE').length,
+            ships: crew.map(([s, m]) => ({ ship: s.slice(-3), role: m.role.replace('MINE', ''), last: m.last })) };
+        }),
+      } : undefined,
     };
   }
 
