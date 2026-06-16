@@ -358,7 +358,10 @@ export function createExpansion(ctx) {
 
     // [RECALL] consolidate onto the hub. Arrived at the hub → convert to a hub role and let normal hub logic run.
     // Tag the member with recalledFrom = its origin outpost so RECALL RELEASE can fan it back out to that system.
-    if (recallActive() && hubSys && cur === hubSys) {
+    // Mine systems are EXEMPT from recall — they keep their local crew (probes anchor mining buys, traders move the
+    // refined goods), so concentrating the thin arbitrage outposts on the hub doesn't gut the mining colony.
+    const recalling = recallActive() && !MINE_SYSTEMS.includes(m.opSys);
+    if (recalling && hubSys && cur === hubSys) {
       const isP = ship.frame?.symbol === 'FRAME_PROBE';
       members.set(sym, isP ? { role: 'PROBE', scanned: new Set(), recalledFrom: m.opSys } : { role: 'LIGHT', recalledFrom: m.opSys });
       log(`🪐 ${id(sym)} recalled to hub ${hubSys} → ${isP ? 'PROBE' : 'LIGHT'}`);
@@ -370,7 +373,7 @@ export function createExpansion(ctx) {
       await loadSystemInto(op);
       if (!op.gateWp) op.gateWp = ship.nav.waypointSymbol; // fallback: we jumped in via the gate
       // [RECALL] don't trade here — jump back to the hub (outpost gate → hub gate); role converts on hub arrival above.
-      if (recallActive() && hubGate) {
+      if (recalling && hubGate) {
         m.last = `recall ${op.sys.slice(-4)}→${hubSys.slice(-4)}`;
         await jumpVia(sym, ship, op.gateWp, hubGate, op.markets);
         return;
