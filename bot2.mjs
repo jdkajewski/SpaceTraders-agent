@@ -227,6 +227,16 @@ const GATE_RESUME_PRICE_FACTOR = Number(process.env.GATE_RESUME_PRICE_FACTOR || 
 // [GATE] Fraction of the free growth budget the gate may spend per planning pass (the rest stays liquid for trading /
 // contracts / feeds so gate buying never starves the earners that refill it). 0.8 = gate uses up to 80% of growthBudget.
 let GATE_BUDGET_FRACTION = Math.min(1, Math.max(0, Number(process.env.GATE_BUDGET_FRACTION || 0.8)));   // live-tunable via gate-levers.json (budgetFraction)
+// [GATE FINISH] Automatic home-stretch accelerator. The nest-egg credit band (FLOOR/RESUME) protects working capital
+// while there's a LOT of gate left to buy — but near the end it makes the final stretch CRAWL: buy down to the floor,
+// then sit ~20-30 min rebuilding to the resume before the next small burst. Once we can afford the ENTIRE remaining
+// gate bill while still keeping the operating reserve (× a comfort margin), the band has done its job: we drop it and
+// buy CONTINUOUSLY to completion (still bounded by OPERATING_RESERVE via growthBudget, the per-trip budget fraction,
+// and the price caps). One-way latch (the gate only gets closer to done). No manual band-tweaking needed.
+const GATE_AUTO_FINISH = process.env.GATE_AUTO_FINISH !== '0';                                  // default ON
+const GATE_FINISH_MULT = Number(process.env.GATE_FINISH_MULT || 1.0);                           // need (reserve × this) of headroom ABOVE the remaining bill to enter finish mode
+const GATE_FINISH_UNITS = Number(process.env.GATE_FINISH_UNITS || 250);                         // OR enter finish mode once total remaining gate units drop below this (home-stretch signal, price-agnostic)
+const GATE_FINISH_BUDGET_FRACTION = Math.min(1, Math.max(0, Number(process.env.GATE_FINISH_BUDGET_FRACTION || 0.9))); // budget fraction once finishing (higher → finishes faster; reserve still protected)
 // [GATE] Price-settle PATIENCE: when a capped material drops back under its cap, don't pounce on the first tick —
 // wait up to GATE_PRICE_SETTLE_MS to see if it falls further (better entry/buffer), resuming buys once it rebounds
 // off its observed low (GATE_PRICE_REBOUND_EPS) or the window elapses. A good that was never above its cap buys
@@ -652,8 +662,37 @@ function reloadGateLevers() {
 // recover to GATE_CREDIT_RESUME. Between the two thresholds we hold the previous state (the deadband), which
 // kills the at-floor sawtooth and lets buying run in sustained bursts. Updated each loop from cachedCredits.
 let gateBuyPaused = false;
+// [GATE FINISH] Estimated cost to BUY all still-needed gate material at current cheapest prices (× slippage).
+function gateRemainingCost() {
+  let cost = 0;
+  for (const [sym, units] of Object.entries(gateCache.remaining || {})) {
+    if (!(units > 0)) continue;
+    const src = cheapestSrc(marketCache.data || {}, sym);
+    cost += units * (src ? src.px : 1000) * SLIPPAGE_FACTOR;
+  }
+  return cost;
+}
+let gateFinishMode = false;   // [GATE FINISH] one-way latch: once we can afford the rest, buy continuously to done
+
 function gateCreditOk() {
   reloadGateLevers();                                                // pick up any live band edit before deciding
+  // [GATE FINISH] Auto home-stretch: once the ENTIRE remaining gate bill is affordable while keeping the operating
+  // reserve (× comfort margin), drop the nest-egg band and buy continuously to completion. One-way latch — the gate
+  // only gets closer to done, and as we buy, the remaining bill shrinks faster than credits, so it stays satisfied.
+  if (GATE_AUTO_FINISH && !gateFinishMode && gateCache.known && gateCache.exists && !gateCache.built) {
+    const remCost = gateRemainingCost();
+    const remUnits = Object.values(gateCache.remaining || {}).reduce((a, u) => a + (u > 0 ? u : 0), 0);
+    const affordable = remCost > 0 && (cachedCredits - committed - remCost) >= OPERATING_RESERVE * GATE_FINISH_MULT;
+    // Trigger on EITHER signal: (a) we can afford the whole remaining bill above reserve, OR (b) the home stretch —
+    // total remaining units are low (price-agnostic, so an expensive-but-tiny tail like the last few ADV doesn't keep
+    // us stuck in the rebuild-pause cycle). Finish mode still respects OPERATING_RESERVE + price caps; it only drops
+    // the nest-egg credit floor so the last stretch buys whenever there's free cash above the reserve.
+    if (remUnits > 0 && (remUnits <= GATE_FINISH_UNITS || affordable)) {
+      gateFinishMode = true;
+      log(`🏁 gate FINISH MODE — ${remUnits} units / ~${Math.round(remCost).toLocaleString()} bill left (${affordable ? 'affordable above reserve' : 'home stretch ≤' + GATE_FINISH_UNITS + ' units'}) → buying continuously to completion (nest-egg band bypassed)`);
+    }
+  }
+  if (gateFinishMode) { gateBuyPaused = false; return true; }              // band bypassed; only OPERATING_RESERVE + price caps gate buys now
   const was = gateBuyPaused;
   if (cachedCredits < GATE_CREDIT_FLOOR) gateBuyPaused = true;              // hard stop: arm the latch
   else if (cachedCredits >= GATE_CREDIT_RESUME) gateBuyPaused = false;     // recovered past resume band: release
@@ -1431,16 +1470,21 @@ async function haulGoTo(shipSym, dest, markets, opts = {}) {
 async function gateSupplyTrip(shipSym, ship, markets) {
   const g = gateCache;
   if (!gateSupplyActive()) return false;
-  // [GATE DELIVER-FIRST] If we're already standing AT the gate holding still-needed material (a restart caught us here
-  // mid-trip, or a prior leg ended at the gate), DELIVER it NOW rather than planning a buy trip that hauls it away on a
-  // wasteful detour (the I59→F49→D45→I59 round-trip we observed). Delivery is free, ungated by the credit floor, and
-  // always advances the gate. After dropping off we fall through next loop to a fresh (empty-hold) buy trip.
-  if (ship.nav.waypointSymbol === g.wp && ship.nav.status !== 'IN_TRANSIT') {
+  // [GATE DELIVER-FIRST] Deliver held gate material NOW (skip planning a buy trip) when EITHER:
+  //   (a) we're standing AT the gate holding still-needed material (restart/leg ended here), OR
+  //   (b) the material we already hold MEETS OR EXCEEDS the gate's remaining need for it — buying more would be
+  //       wasted (the gate can't accept over the requirement) and detouring to a source first just strands the
+  //       finishing units on a long round-trip (observed: -18 carried the final 47 FAB to F49 instead of the gate).
+  // Delivery is free, ungated by the credit floor, and always advances the gate.
+  {
     const heldNeeded = (ship.cargo.inventory || []).filter((i) => GATE_PROTECT_MATERIALS.has(i.symbol) && (g.remaining?.[i.symbol] > 0) && i.units > 0);
-    if (heldNeeded.length) {
+    const atGate = ship.nav.waypointSymbol === g.wp && ship.nav.status !== 'IN_TRANSIT';
+    const heldFinishesNeed = heldNeeded.length && heldNeeded.every((i) => i.units >= (g.remaining?.[i.symbol] || 0));
+    if (heldNeeded.length && (atGate || heldFinishesNeed)) {
       perShip[shipSym] = perShip[shipSym] || { net: 0, lanes: 0, last: '' };
-      perShip[shipSym].last = `SUPPLY_GATE(at-gate) ${heldNeeded.reduce((s, i) => s + i.units, 0)}u`;
-      log(`⛏ ${shipSym.slice(-3)} at gate holding ${heldNeeded.map((i) => `${i.units} ${i.symbol}`).join(', ')} → deliver first`);
+      perShip[shipSym].last = `SUPPLY_GATE(deliver) ${heldNeeded.reduce((s, i) => s + i.units, 0)}u`;
+      log(`⛏ ${shipSym.slice(-3)} holding ${heldNeeded.map((i) => `${i.units} ${i.symbol}`).join(', ')} (${atGate ? 'at gate' : 'covers remaining need'}) → deliver direct to ${g.wp.slice(-3)}`);
+      if (!atGate) await gateGoTo(shipSym, g.wp, markets);
       await supplyHeldToGate(shipSym, heldNeeded.map((i) => i.symbol));
       return true;
     }
@@ -1467,18 +1511,27 @@ async function gateSupplyTrip(shipSym, ship, markets) {
 
   let free = ship.cargo.capacity - (ship.cargo.units || 0);
   if (GATE_SUPPLY_MAX_UNITS > 0) free = Math.min(free, GATE_SUPPLY_MAX_UNITS);
-  const buys = planGateFill(g.remaining, gateClaims, markets, {
+  // [GATE OVER-BUY GUARD] Don't plan to buy more of a material than the gate STILL needs after counting what THIS
+  // ship already holds. Without this, a hauler holding e.g. 47 FAB (the whole remaining FAB need) would still be told
+  // to buy up to a hold's worth more, then detour to the source — wasting the trip and over-buying past the requirement.
+  const heldByMe = {};
+  for (const i of ship.cargo.inventory || []) if (GATE_PROTECT_MATERIALS.has(i.symbol)) heldByMe[i.symbol] = (heldByMe[i.symbol] || 0) + i.units;
+  const netRemaining = {};
+  for (const [sym, need] of Object.entries(g.remaining || {})) { const n = (need || 0) - (heldByMe[sym] || 0); if (n > 0) netRemaining[sym] = n; }
+  const buys = planGateFill(netRemaining, gateClaims, markets, {
     free,
     // [RESERVE] Gate spend goes through the operating reserve like every other expense: cap headroom by
     // BOTH the gate credit-floor (overspend guard) AND growthBudget() (= credits − committed in-flight −
     // OPERATING_RESERVE). Whichever is more restrictive binds, so gate buying can never dip working capital
     // below the rolling reserve (fuel + lane buffer) or double-spend cash already committed to trades.
-    // [RESERVE + 80% BUDGET] Gate spend goes through the operating reserve like every other expense, AND is limited to
-    // GATE_BUDGET_FRACTION (default 0.8) of the free growth budget so it never starves the trading/contract/feed engine
-    // that refills the pool. headroom = min( 80% × growthBudget , credits − GATE_CREDIT_FLOOR ). growthBudget already =
-    // credits − committed in-flight − OPERATING_RESERVE, so the reserve and committed cash are protected; the 80% cap
-    // leaves 20% liquid for the earners; the gate credit-floor is the separate nest-egg overspend guard.
-    headroom: Math.min(Math.floor(GATE_BUDGET_FRACTION * growthBudget()), cachedCredits - GATE_CREDIT_FLOOR),
+    // [RESERVE + BUDGET] Gate spend goes through the operating reserve like every other expense, AND is limited to a
+    // fraction of the free growth budget so it never starves the trading/contract/feed engine. NORMAL: headroom =
+    // min( fraction × growthBudget , credits − GATE_CREDIT_FLOOR ). FINISH MODE: the nest-egg floor is bypassed (the
+    // remaining bill is affordable) so headroom = finishFraction × growthBudget only — growthBudget still protects the
+    // operating reserve + committed cash, so this is safe; it just removes the floor that was making the end crawl.
+    headroom: gateFinishMode
+      ? Math.floor(GATE_FINISH_BUDGET_FRACTION * growthBudget())
+      : Math.min(Math.floor(GATE_BUDGET_FRACTION * growthBudget()), cachedCredits - GATE_CREDIT_FLOOR),
     slippage: SLIPPAGE_FACTOR,
     ceilFactor: GATE_PRICE_CEIL_FACTOR,
     absMax: GATE_MAX_PRICE,
@@ -2882,7 +2935,7 @@ function writeStatus() {
   if (now() - lastStatusAt < 4000) return; lastStatusAt = now();
   const ships = Object.entries(perShip).map(([s, v]) => ({ ship: s.slice(-3), net: v.net, projected: v.projected || 0, lanes: v.lanes, doing: v.last, route: fleetRoutes[s.slice(-3)] || null }));
   const inFlightProjected = ships.reduce((a, s) => a + (s.projected || 0), 0);   // expected net of trades currently mid-flight
-  fs.writeFileSync(here('./bot-status.json'), JSON.stringify({ updated: new Date().toISOString(), phase: currentPhase.name, phaseDesc: currentPhase.desc, runNet: totalNet, inFlightProjected, projectedTotal: totalNet + inFlightProjected, lanesRun, goal: expansionTarget, goalBreakdown: targetBreakdown, credits: cachedCredits, reserve: OPERATING_RESERVE, committed, growthBudget: growthBudget(), gate: { exists: gateCache.exists, built: gateCache.built, known: gateCache.known, remaining: gateCache.remaining, haulers: [...GATE_HAULERS], supplying: gateSupplyActive() && gateCreditOk(), buyPaused: gateBuyPaused, creditFloor: GATE_CREDIT_FLOOR, creditResume: GATE_CREDIT_RESUME }, inputFeed: { enabled: INPUT_FEED, active: inputFeedActive(), feeders: [...INPUT_FEEDERS], busy: [...inputActiveFeeders].map((s) => s.slice(-3)) }, mineFeed: { enabled: MINE_FEED, feeders: [...MINE_FEEDERS], busy: [...mineActive].map((s) => s.slice(-3)), good: MINE_GOOD || 'auto', site: mineSite, refiner: refinerSym && refinerSym.slice(-3), transport: [...MINE_TRANSPORT] }, expand: expansion ? expansion.statusBlock() : { enabled: false }, ships }, null, 1));
+  fs.writeFileSync(here('./bot-status.json'), JSON.stringify({ updated: new Date().toISOString(), phase: currentPhase.name, phaseDesc: currentPhase.desc, runNet: totalNet, inFlightProjected, projectedTotal: totalNet + inFlightProjected, lanesRun, goal: expansionTarget, goalBreakdown: targetBreakdown, credits: cachedCredits, reserve: OPERATING_RESERVE, committed, growthBudget: growthBudget(), gate: { exists: gateCache.exists, built: gateCache.built, known: gateCache.known, remaining: gateCache.remaining, haulers: [...GATE_HAULERS], supplying: gateSupplyActive() && gateCreditOk(), buyPaused: gateBuyPaused, finishMode: gateFinishMode, creditFloor: GATE_CREDIT_FLOOR, creditResume: GATE_CREDIT_RESUME }, inputFeed: { enabled: INPUT_FEED, active: inputFeedActive(), feeders: [...INPUT_FEEDERS], busy: [...inputActiveFeeders].map((s) => s.slice(-3)) }, mineFeed: { enabled: MINE_FEED, feeders: [...MINE_FEEDERS], busy: [...mineActive].map((s) => s.slice(-3)), good: MINE_GOOD || 'auto', site: mineSite, refiner: refinerSym && refinerSym.slice(-3), transport: [...MINE_TRANSPORT] }, expand: expansion ? expansion.statusBlock() : { enabled: false }, ships }, null, 1));
   const rows = ships.sort((a, b) => b.net - a.net).map((s) => `| ${s.ship} | ${s.net.toLocaleString()} | ${(s.projected || 0) ? '+' + s.projected.toLocaleString() : '—'} | ${s.lanes} | ${s.doing} |`).join('\n');
   const block = `\n\n## 🤖 AUTOTRADER v2 live (continuous)\n_run net **+${totalNet.toLocaleString()}** + in-flight projected **+${inFlightProjected.toLocaleString()}** · updated ${new Date().toISOString().slice(11, 19)}_\n\n| Ship | Run net | In-flight proj | Lanes | Last/now |\n|---|---:|---:|---:|---|\n${rows}\n`;
   const base = fs.readFileSync(here('./tracker.md'), 'utf8').split('\n## 🤖 AUTOTRADER')[0];

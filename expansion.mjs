@@ -606,13 +606,26 @@ export function createExpansion(ctx) {
     let credits; try { credits = getCredits(); } catch { return; }
     if (credits <= BUY_FLOOR) return;                            // no surplus over the safety floor — never buy
 
-    // current resident staffing per outpost (counts in-transit migrators too, so we never over-order)
+    // [HUB + OUTPOSTS] Staff the HUB (target.sys — the primary new system, most markets+shipyards) AND every outpost.
+    // Including the hub here means the worst-coverage-gap logic naturally PRIORITIZES it first (it has the biggest gap),
+    // then fans OUTWARD to the outposts as the hub saturates — exactly the "concentrate on the fattest system first,
+    // then expand outward" strategy. Hub crew use roles PROBE / LIGHT|HAULER (system = target.sys); outposts use
+    // OUTPROBE / OUTLIGHT (system = m.opSys). Previously the hub was skipped entirely, so YK2 got NO autobuy coverage.
+    const staffSystems = [];
+    if (target && target.sys) staffSystems.push({ sys: target.sys, markets: tgtMarketWps.length, gateWp: target.gateWp, hub: true });
+    for (const sys of outposts.keys()) { const op = outposts.get(sys); staffSystems.push({ sys, markets: op.marketWps.length || 0, gateWp: op.gateWp, hub: false }); }
+
+    // current resident staffing per system (counts in-transit migrators too, so we never over-order)
     const probeN = {}, traderN = {};
-    for (const sys of outposts.keys()) { probeN[sys] = 0; traderN[sys] = 0; }
+    for (const ss of staffSystems) { probeN[ss.sys] = 0; traderN[ss.sys] = 0; }
     for (const [, m] of members) {
-      if (!m.opSys || !outposts.has(m.opSys)) continue;
-      if (m.role === 'OUTPROBE') probeN[m.opSys]++;
-      else if (m.role === 'OUTLIGHT') traderN[m.opSys]++;
+      let sys = null, isP = false, isT = false;
+      if (m.role === 'OUTPROBE') { sys = m.opSys; isP = true; }
+      else if (m.role === 'OUTLIGHT') { sys = m.opSys; isT = true; }
+      else if (m.role === 'PROBE') { sys = target && target.sys; isP = true; }     // hub probe
+      else if (m.role === 'LIGHT' || m.role === 'HAULER') { sys = target && target.sys; isT = true; }  // hub trader
+      if (sys == null || probeN[sys] === undefined) continue;
+      if (isP) probeN[sys]++; else if (isT) traderN[sys]++;
     }
 
     // waypoints where we have a ship present right now (purchase needs a hull at the yard)
@@ -620,32 +633,30 @@ export function createExpansion(ctx) {
     try { shipWps = new Set((await getAllShips()).filter((s) => s.nav.status !== 'IN_TRANSIT').map((s) => s.nav.waypointSymbol)); }
     catch (e) { lastBuyAt = now(); log(`🛒 AUTOBUY fleet read ERR ${e.message}`); return; }
 
-    // decide ONE action: trader-starved outpost first (earns), else worst probe-coverage gap (sharpens lanes).
-    // Buy LOCAL to the needy system when possible (prefSys = [sys, home]) → no migration, ship already on-site.
+    // decide ONE action: trader-starved system first (earns), else worst probe-coverage gap (sharpens lanes).
+    // The hub is in this list, so it's prioritized first; outposts fill as the hub saturates. Buy LOCAL when possible.
     let action = null;
     if (boughtTraders < MAX_BUY_TRADERS) {
-      const starved = [...outposts.keys()].find((sys) => traderN[sys] < OUTPOST_TRADERS);
+      const starved = staffSystems.find((ss) => traderN[ss.sys] < OUTPOST_TRADERS);
       if (starved) {
         for (const t of TRADER_PREF) {                          // best hull first
-          const loc = await pickBuy(t, [starved, homeSystem], shipWps);
-          if (loc && credits - (loc.price || 320_000) >= BUY_FLOOR) { action = { kind: 'trader', role: 'OUTLIGHT', type: t, wp: loc.wp, price: loc.price || 320_000, sys: starved, local: loc.local }; break; }
+          const loc = await pickBuy(t, [starved.sys, homeSystem], shipWps);
+          if (loc && credits - (loc.price || 320_000) >= BUY_FLOOR) { action = { kind: 'trader', role: starved.hub ? 'LIGHT' : 'OUTLIGHT', type: t, wp: loc.wp, price: loc.price || 320_000, sys: starved.sys, local: loc.local }; break; }
         }
       }
     }
     if (!action && boughtProbes < MAX_BUY_PROBES) {
       let worst = null, worstGap = 0;
-      for (const sys of outposts.keys()) {
-        const op = outposts.get(sys);
-        const markets = op.marketWps.length || 0;
-        if (!markets) continue;                                 // unmapped — don't buy probes blind
-        const tgt = PROBE_TARGET_CAP > 0 ? Math.min(markets, PROBE_TARGET_CAP) : markets;
-        const gap = tgt - probeN[sys];
-        if (gap > worstGap) { worstGap = gap; worst = sys; }
+      for (const ss of staffSystems) {
+        if (!ss.markets) continue;                              // unmapped — don't buy probes blind
+        const tgt = PROBE_TARGET_CAP > 0 ? Math.min(ss.markets, PROBE_TARGET_CAP) : ss.markets;
+        const gap = tgt - probeN[ss.sys];
+        if (gap > worstGap) { worstGap = gap; worst = ss; }
       }
       if (worst) {
-        const loc = await pickBuy('SHIP_PROBE', [worst, homeSystem], shipWps);
+        const loc = await pickBuy('SHIP_PROBE', [worst.sys, homeSystem], shipWps);
         const price = loc ? (loc.price || 26_000) : 0;
-        if (loc && credits - price >= BUY_FLOOR) action = { kind: 'probe', role: 'OUTPROBE', type: 'SHIP_PROBE', wp: loc.wp, price, sys: worst, local: loc.local };
+        if (loc && credits - price >= BUY_FLOOR) action = { kind: 'probe', role: worst.hub ? 'PROBE' : 'OUTPROBE', type: 'SHIP_PROBE', wp: loc.wp, price, sys: worst.sys, local: loc.local };
       }
     }
     if (!action) return;
@@ -653,12 +664,16 @@ export function createExpansion(ctx) {
     lastBuyAt = now();                                          // throttle regardless of outcome (avoid retry spam)
     let bought; try { bought = await buyShip(action.type, action.wp); } catch (e) { log(`🛒 AUTOBUY ${action.type} @${id(action.wp)} ERR ${e.message}`); return; }
     if (!bought) { log(`🛒 AUTOBUY ${action.type} @${id(action.wp)} → no hull (retry next window)`); return; }
-    const m = action.role === 'OUTPROBE' ? { role: 'OUTPROBE', opSys: action.sys, scanned: new Set() } : { role: 'OUTLIGHT', opSys: action.sys };
+    const m = action.role === 'OUTPROBE' ? { role: 'OUTPROBE', opSys: action.sys, scanned: new Set() }
+            : action.role === 'PROBE' ? { role: 'PROBE', scanned: new Set() }
+            : action.role === 'LIGHT' ? { role: 'LIGHT' }
+            : { role: 'OUTLIGHT', opSys: action.sys };
     members.set(bought, m);
     launchWorker(bought);
     const where = action.local ? `LOCAL @${action.sys.slice(-4)}` : 'home→migrate';
+    const mktCount = action.sys === (target && target.sys) ? tgtMarketWps.length : (outposts.get(action.sys)?.marketWps.length || '?');
     if (action.kind === 'trader') { boughtTraders++; log(`🛒 AUTOBUY trader ${action.type} ${id(bought)} @${id(action.wp)} (~${action.price.toLocaleString()}) → ${action.sys} [${where}; traders ${traderN[action.sys]}→${traderN[action.sys] + 1}/${OUTPOST_TRADERS}, bought ${boughtTraders}/${MAX_BUY_TRADERS}]`); }
-    else { boughtProbes++; const op = outposts.get(action.sys); log(`🛒 AUTOBUY probe ${id(bought)} @${id(action.wp)} (~${action.price.toLocaleString()}) → ${action.sys} [${where}; probes ${probeN[action.sys]}→${probeN[action.sys] + 1}/${op.marketWps.length || '?'}, bought ${boughtProbes}/${MAX_BUY_PROBES}]`); }
+    else { boughtProbes++; log(`🛒 AUTOBUY probe ${id(bought)} @${id(action.wp)} (~${action.price.toLocaleString()}) → ${action.sys} [${where}; probes ${probeN[action.sys]}→${probeN[action.sys] + 1}/${mktCount}, bought ${boughtProbes}/${MAX_BUY_PROBES}]`); }
   }
 
   async function maybeTrigger() {
