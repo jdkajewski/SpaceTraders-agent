@@ -64,6 +64,11 @@ export function createExpansion(ctx) {
   const OUTPOSTS = [...listEnv('EXPAND_OUTPOSTS')];                              // e.g. "X1-DF86,X1-MB89" ('' = off)
   const OUTPOST_PROBES = Number(process.env.EXPAND_OUTPOST_PROBES || 2);        // probes per outpost (live market data)
   const OUTPOST_TRADERS = Number(process.env.EXPAND_OUTPOST_TRADERS || 1);      // local traders per outpost
+  // [RECALL] Consolidate everything onto the HUB (target system): pull every outpost crew back to the hub and convert
+  // them to hub roles (probe→PROBE, trader→LIGHT), and stop autobuy from staffing outposts. Use when we want to
+  // concentrate all firepower on the fattest system before expanding again. Outpost gates stay configured (so the
+  // recall jump knows the route); only the resident-trade behavior flips to "jump home to the hub".
+  const RECALL = process.env.EXPAND_RECALL === '1';
   const outposts = new Map();          // sys -> { sys, gateWp, markets:{}, marketWps:[], loaded:false }
   let outpostsReady = false;
 
@@ -320,10 +325,24 @@ export function createExpansion(ctx) {
     const hubSys = target ? target.sys : null;          // PP48
     const hubGate = target ? target.gateWp : null;      // PP48 D18A
 
+    // [RECALL] consolidate onto the hub. Arrived at the hub → convert to a hub role and let normal hub logic run.
+    if (RECALL && hubSys && cur === hubSys) {
+      const isP = ship.frame?.symbol === 'FRAME_PROBE';
+      members.set(sym, isP ? { role: 'PROBE', scanned: new Set() } : { role: 'LIGHT' });
+      log(`🪐 ${id(sym)} recalled to hub ${hubSys} → ${isP ? 'PROBE' : 'LIGHT'}`);
+      return;
+    }
+
     // ---- arrived at the outpost system → resident local trading ----
     if (cur === op.sys) {
       await loadSystemInto(op);
       if (!op.gateWp) op.gateWp = ship.nav.waypointSymbol; // fallback: we jumped in via the gate
+      // [RECALL] don't trade here — jump back to the hub (outpost gate → hub gate); role converts on hub arrival above.
+      if (RECALL && hubGate) {
+        m.last = `recall ${op.sys.slice(-4)}→${hubSys.slice(-4)}`;
+        await jumpVia(sym, ship, op.gateWp, hubGate, op.markets);
+        return;
+      }
       if (m.role === 'OUTPROBE') {
         // 1:1 market partition: each OUTPROBE owns a contiguous arc of this outpost's markets and only refreshes
         // ITS arc when stale. When probes>=markets each owns ONE market → it parks there (presence = live prices)
@@ -628,7 +647,7 @@ export function createExpansion(ctx) {
     // OUTPROBE / OUTLIGHT (system = m.opSys). Previously the hub was skipped entirely, so YK2 got NO autobuy coverage.
     const staffSystems = [];
     if (target && target.sys) staffSystems.push({ sys: target.sys, markets: tgtMarketWps.length, gateWp: target.gateWp, hub: true });
-    for (const sys of outposts.keys()) { const op = outposts.get(sys); staffSystems.push({ sys, markets: op.marketWps.length || 0, gateWp: op.gateWp, hub: false }); }
+    if (!RECALL) for (const sys of outposts.keys()) { const op = outposts.get(sys); staffSystems.push({ sys, markets: op.marketWps.length || 0, gateWp: op.gateWp, hub: false }); }   // [RECALL] hub-only buys
 
     // current resident staffing per system (counts in-transit migrators too, so we never over-order)
     const probeN = {}, traderN = {};
