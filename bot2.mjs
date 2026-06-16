@@ -935,6 +935,50 @@ function electContractOwner(ci, markets, ships) {
   return best;
 }
 
+// [NEGOTIATOR @ HQ] Contract negotiation requires a ship DOCKED at a faction-presence waypoint; the agent HQ always
+// qualifies. The designated NEGOTIATOR can drift out of the home system (e.g. poached by expansion), which makes the
+// old dock-in-place approach 400 with "does not have a faction presence". This resolves a negotiation ship that lives
+// in the HQ system (prefer the designated negotiator, else a parked home probe, else any idle home ship), parks it at
+// HQ, docks, and negotiates — self-healing. Returns the contract, or null if not ready this cycle (still en route).
+let hqWaypoint = null;
+let activeNegotiatorSym = null;
+async function getHqWaypoint() {
+  if (hqWaypoint) return hqWaypoint;
+  try { hqWaypoint = (await api('GET', '/my/agent')).data.headquarters; } catch {}
+  return hqWaypoint;
+}
+async function negotiateAtHq() {
+  const hqWp = await getHqWaypoint();
+  if (!hqWp) {                                                  // agent read failed — fall back to dock-in-place
+    try { await api('POST', `/my/ships/${NEGOTIATOR}/dock`); } catch {}
+    return (await api('POST', `/my/ships/${NEGOTIATOR}/negotiate/contract`)).data.contract;
+  }
+  const hqSys = hqWp.split('-').slice(0, 2).join('-');
+  const all = await getAllShips();
+  const isProbeHull = (s) => s.frame?.symbol === 'FRAME_PROBE';
+  // keep the current negotiation ship while it still lives in the HQ system (it may be mid-flight to HQ)
+  let pick = activeNegotiatorSym ? all.find((s) => s.symbol === activeNegotiatorSym && s.nav.systemSymbol === hqSys) : null;
+  if (!pick) {
+    const idleInHq = (s) => s.nav.systemSymbol === hqSys && s.nav.status !== 'IN_TRANSIT';
+    pick = all.find((s) => s.symbol === NEGOTIATOR && idleInHq(s))
+        || all.find((s) => s.nav.waypointSymbol === hqWp && isProbeHull(s))
+        || all.find((s) => s.nav.waypointSymbol === hqWp)
+        || all.find((s) => isProbeHull(s) && idleInHq(s))
+        || all.find(idleInHq);
+    if (!pick) { log(`📜 no negotiation ship available in HQ system ${hqSys} yet — will retry`); return null; }
+    activeNegotiatorSym = pick.symbol;
+    if (pick.symbol !== NEGOTIATOR) log(`📜 negotiator ${NEGOTIATOR} not in ${hqSys}; using ${pick.symbol} parked at HQ for contracts`);
+  }
+  if (pick.nav.status === 'IN_TRANSIT') return null;           // en route to HQ — negotiate next cycle
+  if (pick.nav.waypointSymbol !== hqWp) {                      // bring it to HQ (faction presence), then negotiate next cycle
+    try { if (pick.nav.status === 'DOCKED') await api('POST', `/my/ships/${pick.symbol}/orbit`); await goTo(pick.symbol, hqWp); }
+    catch (e) { log(`📜 negotiator ${pick.symbol} →HQ ERR ${e.message}`); }
+    return null;
+  }
+  try { await api('POST', `/my/ships/${pick.symbol}/dock`); } catch {}   // negotiate requires DOCKED
+  return (await api('POST', `/my/ships/${pick.symbol}/negotiate/contract`)).data.contract;
+}
+
 async function contractManager() {
   if (!CONTRACTS) { log('📜 contracts DISABLED (CONTRACTS=0) — trading only'); return; }
   while (!stop) {
@@ -963,14 +1007,16 @@ async function contractManager() {
           // Negotiate the next contract whenever no freighter is mid-delivery. (We intentionally do NOT gate on
           // contractClaim here: contractClaim's only consumer, tryClaimContract, is disabled, so a stale claim would
           // otherwise permanently block negotiation — the bug that stalled contracts after 00:54.)
-          // [NEGOTIATOR DOCK] negotiate/contract requires the negotiator DOCKED. When it's a parked price-feed probe
-          // (greenfield) it sits in ORBIT → 400 "not docked". Dock it first (docking keeps its market price feed).
-          try { await api('POST', `/my/ships/${NEGOTIATOR}/dock`); } catch {}
-          const r = await api('POST', `/my/ships/${NEGOTIATOR}/negotiate/contract`);
-          const c = r.data.contract; await api('POST', `/my/contracts/${c.id}/accept`);
-          const d = c.terms.deliver[0];
-          log(`📜 contract ${c.id}: ${d.unitsRequired} ${d.tradeSymbol} -> ${d.destinationSymbol} pay ${c.terms.payment.onAccepted + c.terms.payment.onFulfilled}`);
-          activeContractInfo = { id: c.id, good: d.tradeSymbol, dest: d.destinationSymbol, units: d.unitsRequired - d.unitsFulfilled, pay: c.terms.payment.onFulfilled };
+          // [NEGOTIATOR @ HQ] negotiate/contract requires a ship DOCKED at a faction-presence waypoint. negotiateAtHq()
+          // resolves a ship in the HQ system, parks it at HQ, docks, and negotiates — self-healing if the designated
+          // negotiator drifted out of the home system (e.g. poached by expansion). Returns null while still en route.
+          const c = await negotiateAtHq();
+          if (c) {
+            await api('POST', `/my/contracts/${c.id}/accept`);
+            const d = c.terms.deliver[0];
+            log(`📜 contract ${c.id}: ${d.unitsRequired} ${d.tradeSymbol} -> ${d.destinationSymbol} pay ${c.terms.payment.onAccepted + c.terms.payment.onFulfilled}`);
+            activeContractInfo = { id: c.id, good: d.tradeSymbol, dest: d.destinationSymbol, units: d.unitsRequired - d.unitsFulfilled, pay: c.terms.payment.onFulfilled };
+          }
         }
       }
     } catch (e) { log('contractManager:', e.message); }

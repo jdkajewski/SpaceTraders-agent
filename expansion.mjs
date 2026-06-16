@@ -478,22 +478,31 @@ export function createExpansion(ctx) {
     const isProbe = (s) => s.frame?.symbol === 'FRAME_PROBE';
     const byId = (set, s) => { for (const t of set) if (s.symbol === t || s.symbol.endsWith('-' + t)) return true; return false; };
 
+    // [NEGOTIATOR GUARD] Never migrate the contract negotiator into the hub. Unlike gate haulers/feeders (which are
+    // legitimately repurposed for expansion once the gate is built), the negotiator has a HOME-ONLY job: contract
+    // negotiation requires it DOCKED at a faction-presence waypoint (the HQ system). If it gets poached to another
+    // system, every negotiate/contract call 400s with "does not have a faction presence" and contracts stall.
+    const negSet = new Set();
+    for (const k of ['NEGOTIATOR', 'CONTRACT_NEGOTIATOR']) for (const t of listEnv(k)) negSet.add(t);
+    try { const neg = typeof negotiator === 'function' ? negotiator() : null; if (neg) negSet.add(neg); } catch {}
+    const isNeg = (s) => [...negSet].some((t) => s.symbol === t || s.symbol.endsWith('-' + t));
+
     // HAULER: explicit, else largest-cargo non-probe with fuel>=400 (can clear the long gate legs)
     let haulers;
-    if (EXPLICIT_HAULERS.size) haulers = all.filter((s) => byId(EXPLICIT_HAULERS, s));
-    else { const cand = all.filter((s) => !isProbe(s) && s.cargo.capacity >= 40 && s.fuel.capacity >= 400).sort((a, b) => (b.fuel.capacity - a.fuel.capacity) || (b.cargo.capacity - a.cargo.capacity)); haulers = cand.slice(0, 1); }
+    if (EXPLICIT_HAULERS.size) haulers = all.filter((s) => byId(EXPLICIT_HAULERS, s) && !isNeg(s));
+    else { const cand = all.filter((s) => !isProbe(s) && !isNeg(s) && s.cargo.capacity >= 40 && s.fuel.capacity >= 400).sort((a, b) => (b.fuel.capacity - a.fuel.capacity) || (b.cargo.capacity - a.cargo.capacity)); haulers = cand.slice(0, 1); }
     const haulerSet = new Set(haulers.map((s) => s.symbol));
 
     // LIGHT: explicit, else a smaller non-probe hull not already chosen as hauler
     let light;
-    if (EXPLICIT_LIGHT.size) light = all.filter((s) => byId(EXPLICIT_LIGHT, s));
-    else { const cand = all.filter((s) => !isProbe(s) && !haulerSet.has(s.symbol) && s.cargo.capacity >= 20 && s.fuel.capacity >= 200).sort((a, b) => a.cargo.capacity - b.cargo.capacity); light = cand.slice(0, 1); }
+    if (EXPLICIT_LIGHT.size) light = all.filter((s) => byId(EXPLICIT_LIGHT, s) && !isNeg(s));
+    else { const cand = all.filter((s) => !isProbe(s) && !isNeg(s) && !haulerSet.has(s.symbol) && s.cargo.capacity >= 20 && s.fuel.capacity >= 200).sort((a, b) => a.cargo.capacity - b.cargo.capacity); light = cand.slice(0, 1); }
     const lightSet = new Set(light.map((s) => s.symbol));
 
-    // PROBES: explicit, else up to MAX_PROBES idle probes
+    // PROBES: explicit, else up to MAX_PROBES idle probes — never the negotiator (it must stay home to negotiate)
     let probes;
-    if (EXPLICIT_PROBES.size) probes = all.filter((s) => byId(EXPLICIT_PROBES, s));
-    else probes = all.filter(isProbe).slice(0, MAX_PROBES);
+    if (EXPLICIT_PROBES.size) probes = all.filter((s) => byId(EXPLICIT_PROBES, s) && !isNeg(s));
+    else probes = all.filter((s) => isProbe(s) && !isNeg(s)).slice(0, MAX_PROBES);
 
     for (const s of haulers) members.set(s.symbol, { role: 'HAULER' });
     for (const s of light) if (!members.has(s.symbol)) members.set(s.symbol, { role: 'LIGHT' });
