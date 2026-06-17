@@ -77,6 +77,8 @@ export function createExpansion(ctx) {
   let recallReleased = false;
   const recallActive = () => RECALL && !recallReleased;
   const outposts = new Map();          // sys -> { sys, gateWp, markets:{}, marketWps:[], loaded:false }
+  const pendingOutposts = new Set();   // configured systems not yet path-resolved (deep/frontier — retried over time)
+  let lastResolveAt = 0;
   let outpostsReady = false;
 
   // ---- AUTO-BUY (default OFF) -------------------------------------------------
@@ -347,7 +349,77 @@ export function createExpansion(ctx) {
     }
   }
 
-  // drive one outpost member: 2-hop migrate (home→PP48→outer) then trade/scan PURELY LOCAL in the outer system.
+  // ===================== [N-DEEP GATE TRAVERSAL + EXPLORATION] =====================
+  // The gate network is a graph we DISCOVER by charting: reading a gate's connections requires the gate to be charted
+  // (or a ship present). So a seed PROBE explores outward — each gate it reaches we chart, revealing the next frontier.
+  // To JUMP cur→next we use the destination gate WAYPOINT from cur's connection list (cur must be charted; it is, since
+  // it's on our occupied frontier). gateInfo caches: gateWp (own gate, from public waypoint listing — works uncharted),
+  // conns [{sys,wp}] (needs charted), readable. We only persist-cache READABLE results so uncharted gates retry later.
+  const gateGraph = new Map();         // sys -> { gateWp, conns:[{sys,wp}], readable }
+  async function gateInfo(sys) {
+    const cached = gateGraph.get(sys);
+    if (cached && cached.readable) return cached;                 // only trust a readable (charted) cache
+    const info = { gateWp: cached?.gateWp || null, conns: [], readable: false };
+    try {
+      if (!info.gateWp) {
+        let page = 1, total = Infinity, seen = 0;                 // find own gate via public waypoint listing (works uncharted)
+        while (seen < total && !info.gateWp) {
+          const r = await api('GET', `/systems/${sys}/waypoints?limit=20&page=${page}`);
+          total = r.meta?.total ?? (r.data || []).length; seen += (r.data || []).length;
+          const g = (r.data || []).find((w) => w.type === 'JUMP_GATE'); if (g) info.gateWp = g.symbol;
+          if (!r.data || !r.data.length) break; page++;
+        }
+      }
+      if (info.gateWp) {                                          // read connections (needs charted / ship present)
+        const jg = await api('GET', `/systems/${sys}/waypoints/${info.gateWp}/jump-gate`);
+        if (jg.data && jg.data.connections) { info.conns = jg.data.connections.map((c) => ({ sys: sysOf(c), wp: c })); info.readable = true; }
+      }
+    } catch { /* uncharted/no-ship → not readable, will retry */ }
+    gateGraph.set(sys, info);
+    return info;
+  }
+  // BFS the CHARTED gate graph for the shortest system path from→to. Only expands through readable (charted) systems,
+  // so it can always resolve targets up to 1 hop beyond our charted frontier — exactly how far a seed probe can reach.
+  async function gatePath(from, to) {
+    if (from === to) return [from];
+    const prev = { [from]: null }; const q = [from]; let guard = 0;
+    while (q.length && guard++ < 120) {
+      const s = q.shift();
+      const info = await gateInfo(s);
+      if (!info.readable) continue;                              // can't see past an uncharted gate
+      for (const { sys: c } of info.conns) {
+        if (prev[c] !== undefined) continue;
+        prev[c] = s;
+        if (c === to) { const p = []; let n = to; while (n !== null) { p.unshift(n); n = prev[n]; } return p; }
+        q.push(c);
+      }
+    }
+    return null;
+  }
+  // advance a ship one hop along `path`. Jumps cur→next using the destination gate WAYPOINT from cur's connection list
+  // (cur is charted). Charts the gate on arrival at a new system so the next frontier becomes visible.
+  async function followPath(sym, ship, path) {
+    const cur = sysOf(ship.nav.waypointSymbol);
+    let idx = path.indexOf(cur);
+    if (idx === -1) { if (cur === path[0]) idx = 0; else return 'stray'; }
+    if (idx >= path.length - 1) return 'arrived';
+    const next = path[idx + 1];
+    const ci = await gateInfo(cur);
+    const fromG = ci.gateWp;
+    const toG = (ci.conns.find((c) => c.sys === next) || {}).wp;  // exact next-gate waypoint from cur's charted connections
+    if (!fromG || !toG) return 'no-gate';
+    const mkts = cur === homeSystem ? homeMarkets() : (target && cur === target.sys ? tgtMarkets : (outposts.get(cur)?.markets || {}));
+    await jumpVia(sym, ship, fromG, toG, mkts);
+    return 'moving';
+  }
+  // chart a gate we're sitting on but can't yet read (extends the frontier for the next expansion).
+  async function chartGate(sym, ship, sys) {
+    const gi = await gateInfo(sys);
+    if (gi.readable) return;
+    if (gi.gateWp && ship.nav.waypointSymbol === gi.gateWp) { try { await api('POST', `/my/ships/${sym}/chart`); gateGraph.delete(sys); } catch { /* already charted or not at gate */ } }
+  }
+
+  // drive one outpost member: migrate along the gate path (N-deep) then trade/scan PURELY LOCAL in the outpost system.
   async function stepOutpost(sym, ship) {
     const m = members.get(sym);
     const op = outposts.get(m.opSys);
@@ -372,6 +444,7 @@ export function createExpansion(ctx) {
     if (cur === op.sys) {
       await loadSystemInto(op);
       if (!op.gateWp) op.gateWp = ship.nav.waypointSymbol; // fallback: we jumped in via the gate
+      if (op.deep && m.role === 'OUTPROBE' && !gateGraph.get(op.sys)?.readable) await chartGate(sym, ship, op.sys);  // chart on arrival → opens the next frontier
       // [RECALL] don't trade here — jump back to the hub (outpost gate → hub gate); role converts on hub arrival above.
       if (recalling && hubGate) {
         m.last = `recall ${op.sys.slice(-4)}→${hubSys.slice(-4)}`;
@@ -410,16 +483,11 @@ export function createExpansion(ctx) {
       return;
     }
 
-    // ---- migration: home → PP48 (hop 1), then PP48 → outpost (hop 2) ----
-    if (!hubGate) { m.last = 'await hub'; await sleep(SLEEP_MS); return; }
-    if (cur === homeSystem) { m.last = `migrating → ${hubSys} (hop1)`; await jumpVia(sym, ship, gateWp(), hubGate, homeMarkets()); return; }
-    if (cur === hubSys) {
-      if (!op.gateWp) { await loadSystemInto(op); }     // need the outpost gate wp before hop 2
-      if (!op.gateWp) { m.last = 'await outpost gate'; await sleep(SLEEP_MS); return; }
-      m.last = `migrating → ${op.sys} (hop2)`;
-      await jumpVia(sym, ship, hubGate, op.gateWp, tgtMarkets); return;
-    }
-    m.last = `stray in ${cur}`; await sleep(SLEEP_MS);   // unexpected system → park (recoverable)
+    // ---- migration: follow the gate path home → ... → outpost (N-deep) ----
+    if (!op.path || !op.path.length) { m.last = 'await path'; await sleep(SLEEP_MS); return; }
+    const r = await followPath(sym, ship, op.path);
+    if (r === 'moving') { const i = op.path.indexOf(cur); m.last = `migrating → ${op.sys.slice(-4)} (hop ${i + 1}/${op.path.length - 1})`; return; }
+    m.last = `${r} → ${op.sys.slice(-4)}`; await sleep(SLEEP_MS);   // stray / no-gate → park (recoverable)
   }
 
   async function stepProbe(sym, ship) {
@@ -580,13 +648,13 @@ export function createExpansion(ctx) {
   // hull stranded by an earlier home-buy (or any displacement) self-recovers here instead of parking forever.
   async function migrateToMine(sym, ship, sys) {
     const op = outposts.get(sys);
-    const hubGate = target ? target.gateWp : null, hubSys = target ? target.sys : null;
-    const cur = sysOf(ship.nav.waypointSymbol);
     const m = members.get(sym);
-    if (!hubGate || !op || !op.gateWp) { m.last = `await route → ${sys.slice(-4)}`; await sleep(SLEEP_MS); return; }
-    if (cur === homeSystem) { m.last = `migrating → ${hubSys.slice(-4)} (hop1)`; await jumpVia(sym, ship, gateWp(), hubGate, homeMarkets()); return; }
-    if (cur === hubSys) { m.last = `migrating → ${sys.slice(-4)} (hop2)`; await jumpVia(sym, ship, hubGate, op.gateWp, tgtMarkets); return; }
-    m.last = `stray ${cur.slice(-4)}`; await sleep(SLEEP_MS);
+    let path = op && op.path;
+    if (!path) { try { path = await gatePath(homeSystem, sys); if (op && path) op.path = path; } catch {} }
+    if (!path || !path.length) { m.last = `await route → ${sys.slice(-4)}`; await sleep(SLEEP_MS); return; }
+    const r = await followPath(sym, ship, path);
+    if (r === 'moving') { const i = path.indexOf(sysOf(ship.nav.waypointSymbol)); m.last = `migrating → ${sys.slice(-4)} (mine hop ${i + 1}/${path.length - 1})`; return; }
+    m.last = `${r} → ${sys.slice(-4)}`; await sleep(SLEEP_MS);
   }
 
   // SURVEYOR: park on the colony rock and keep producing surveys into the shared pool (drones consume them).
@@ -727,10 +795,6 @@ export function createExpansion(ctx) {
   // remaining slots fill from idle ships at home/hub.
   async function setupOutposts() {
     if (!OUTPOSTS.length || outpostsReady) return;
-    let conns = [];
-    try { conns = (await api('GET', `/systems/${target.sys}/waypoints/${target.gateWp}/jump-gate`)).data?.connections || []; }
-    catch (e) { log(`🛰 outpost gate read ERR ${e.message} — will retry`); return; }
-    if (!conns.length) { log('🛰 hub gate has no connections yet — will retry outposts'); return; }
     let all;
     try { all = await getAllShips(); } catch (e) { log(`🛰 outpost fleet read ERR ${e.message}`); return; }
     const isProbe = (s) => s.frame?.symbol === 'FRAME_PROBE';
@@ -745,14 +809,22 @@ export function createExpansion(ctx) {
     const isTrader = (s) => !isProbe(s) && s.cargo.capacity >= 20 && s.fuel.capacity >= 200 && !/MINING_LASER|SURVEYOR/.test(JSON.stringify(s.mounts || []));
     const assign = (s, sys) => { const role = isProbe(s) ? 'OUTPROBE' : 'OUTLIGHT'; members.set(s.symbol, role === 'OUTPROBE' ? { role, opSys: sys, scanned: new Set() } : { role, opSys: sys }); launchWorker(s.symbol); return s.symbol.slice(-3) + (isProbe(s) ? ':P' : ':T'); };
 
+    // [N-DEEP] resolve a gate PATH home→outpost for each configured system (any depth, not just hub-adjacent).
+    // A path needs every intermediate gate CHARTED; deep frontier systems may not resolve at boot (gates not charted
+    // yet) → park them in pendingOutposts and resolvePending() retries over time as our probes chart the frontier.
     for (const sys of OUTPOSTS) {
-      const gw = conns.find((c) => sysOf(c) === sys);
-      if (!gw) { log(`🛰 outpost ${sys} not among hub connections [${conns.map(sysOf).join(', ')}] — skip`); continue; }
-      outposts.set(sys, { sys, gateWp: gw, markets: {}, marketWps: [], loaded: false });
+      if (outposts.has(sys)) continue;
+      let path = null; try { path = await gatePath(homeSystem, sys); } catch {}
+      if (!path) { pendingOutposts.add(sys); log(`🛰 outpost ${sys} — path not chartable yet → pending (will retry as frontier charts)`); continue; }
+      const gInfo = await gateInfo(sys);
+      const deep = (path.length - 1) > 2;
+      outposts.set(sys, { sys, gateWp: gInfo.gateWp, path, deep, markets: {}, marketWps: [], loaded: false });
+      log(`🛰 outpost ${sys} path ${path.map((s) => s.slice(-4)).join('→')} (${path.length - 1} jumps${deep ? ', DEEP→probe-seed+buy-local' : ''})`);
     }
+    if (!outposts.size) { log('🛰 no reachable outposts yet — will retry'); return; }
     // Per-outpost probe target = 1:1 with markets (fresh data on every market); fall back to OUTPOST_PROBES until
-    // the system's markets are mapped so pass-2 never over-pulls blindly.
-    const probeTgt = (sys) => { const op = outposts.get(sys); const m = (op && op.marketWps.length) || 0; return m > 0 ? m : OUTPOST_PROBES; };
+    // the system's markets are mapped so pass-2 never over-pulls blindly. Deep systems seed only a couple probes.
+    const probeTgt = (sys) => { const op = outposts.get(sys); const m = (op && op.marketWps.length) || 0; const base = m > 0 ? m : OUTPOST_PROBES; return op && op.deep ? Math.min(base, 2) : base; };
     // pass 1 — adopt ALL ships already sitting in an outpost system (local residents = zero migration: this is where
     // manually/locally-bought probes & haulers get put to work immediately, converging the system toward 1:1).
     const crews = {}; const probeCnt = {}, traderCnt = {};
@@ -763,20 +835,43 @@ export function createExpansion(ctx) {
       if (isProbe(s)) { crews[sys].push(assign(s, sys)); probeCnt[sys]++; }
       else if (isTrader(s)) { crews[sys].push(assign(s, sys)); traderCnt[sys]++; }
     }
-    // pass 2 — fill the SHORTFALL from idle ships elsewhere. Probes: pull toward 1:1 but ONLY from non-home idle
-    // probes (never strip the home system's market scanners); surplus hub probes flow to probe-starved outposts.
-    // Traders: pull toward OUTPOST_TRADERS from any idle trader (home haulers ARE allowed to migrate out to fat lanes).
+    // pass 2 — fill the SHORTFALL from idle ships elsewhere. Probes: pull toward target ONLY from non-home idle probes
+    // (never strip the home system's market scanners). Traders: migrate idle traders to NEAR (≤2-jump) outposts only;
+    // DEEP outposts get NO migrated traders — autobuy buys them LOCALLY (cheap), seeded by the migrated probe.
     const idleProbes = all.filter((s) => isProbe(s) && free(s) && s.nav.systemSymbol !== homeSystem);
     const idleTraders = all.filter((s) => isTrader(s) && free(s)).sort((a, b) => a.cargo.capacity - b.cargo.capacity);
     let pi = 0, ti = 0;
     for (const sys of outposts.keys()) {
-      const ptgt = probeTgt(sys);
-      while (traderCnt[sys] < OUTPOST_TRADERS && ti < idleTraders.length) { crews[sys].push(assign(idleTraders[ti++], sys)); traderCnt[sys]++; }
+      const op = outposts.get(sys); const ptgt = probeTgt(sys);
+      if (!op.deep) while (traderCnt[sys] < OUTPOST_TRADERS && ti < idleTraders.length) { crews[sys].push(assign(idleTraders[ti++], sys)); traderCnt[sys]++; }
       while (probeCnt[sys] < ptgt && pi < idleProbes.length) { crews[sys].push(assign(idleProbes[pi++], sys)); probeCnt[sys]++; }
-      const op = outposts.get(sys);
-      log(`🛰 OUTPOST ${sys} (gate ${id(op.gateWp)}) crew[P${probeCnt[sys]}/${ptgt} T${traderCnt[sys]}/${OUTPOST_TRADERS}]: ${crews[sys].join(' ') || 'NONE (no idle ships)'}`);
+      log(`🛰 OUTPOST ${sys} (gate ${id(op.gateWp)}${op.deep ? ', DEEP' : ''}) crew[P${probeCnt[sys]}/${ptgt} T${traderCnt[sys]}/${op.deep ? 'local' : OUTPOST_TRADERS}]: ${crews[sys].join(' ') || 'NONE (seed by autobuy)'}`);
     }
     outpostsReady = true;
+  }
+
+  // [FRONTIER RETRY] resolve pending (deep/frontier) outposts as our probes chart the way. Once a path resolves, add the
+  // outpost and seed it with the nearest idle probe (it traverses the gate path, charting the destination on arrival).
+  // Rate-limited. This is what makes expansion N-deep AND automatic: each newly-charted system opens the next frontier.
+  async function resolvePending() {
+    if (!pendingOutposts.size || now() - lastResolveAt < 45_000) return;
+    lastResolveAt = now();
+    let all = null;
+    for (const sys of [...pendingOutposts]) {
+      let path = null; try { path = await gatePath(homeSystem, sys); } catch {}
+      if (!path) continue;                                       // still not chartable — keep pending
+      const gInfo = await gateInfo(sys);
+      const deep = (path.length - 1) > 2;
+      outposts.set(sys, { sys, gateWp: gInfo.gateWp, path, deep, markets: {}, marketWps: [], loaded: false });
+      pendingOutposts.delete(sys);
+      log(`🛰 RESOLVED frontier ${sys} path ${path.map((s) => s.slice(-4)).join('→')} (${path.length - 1} jumps) — seeding probe`);
+      // seed: assign the nearest idle non-home probe to this new outpost (it migrates + charts on arrival)
+      try { all = all || await getAllShips(); } catch { all = []; }
+      const seed = all.find((s) => s.frame?.symbol === 'FRAME_PROBE' && !members.has(s.symbol) && s.nav.status !== 'IN_TRANSIT' && s.nav.systemSymbol !== homeSystem)
+                || all.find((s) => s.frame?.symbol === 'FRAME_PROBE' && !members.has(s.symbol) && s.nav.status !== 'IN_TRANSIT');
+      if (seed) { members.set(seed.symbol, { role: 'OUTPROBE', opSys: sys, scanned: new Set() }); launchWorker(seed.symbol); log(`🛰 seed ${id(seed.symbol)} → ${sys.slice(-4)} (deep probe)`); }
+      else log(`🛰 no idle probe to seed ${sys.slice(-4)} — autobuy will buy/migrate one`);
+    }
   }
 
   // Grow the fleet to fill the staffing/coverage SHORTFALL left after setupOutposts exhausted idle ships. One
@@ -906,17 +1001,25 @@ export function createExpansion(ctx) {
         }
       }
     }
-    // 2) trader-starved system
+    // 2) trader-starved system. For DEEP outposts (probe-seeded), buy traders LOCAL-ONLY (anchor a probe at the yard);
+    //    never fall back to a home buy + long migration. Near outposts/hub keep the local→home fallback.
     if (!action && boughtTraders < MAX_BUY_TRADERS) {
       const starved = staffSystems.find((ss) => traderN[ss.sys] < OUTPOST_TRADERS);
       if (starved) {
+        const op = outposts.get(starved.sys);
+        const deep = op && op.deep;
+        const prefSys = deep ? [starved.sys] : [starved.sys, homeSystem];
+        let anyYard = false;
         for (const t of TRADER_PREF) {                          // best hull first
-          const loc = await pickBuy(t, [starved.sys, homeSystem], shipWps);
+          const loc = await pickBuy(t, prefSys, shipWps);
           if (!loc) continue;
+          anyYard = true;
           const px = loc.price || 320_000;
           if (MAX_TRADER_PRICE > 0 && loc.price && loc.price > MAX_TRADER_PRICE) continue;   // too pricey → try next hull / wait
           if (credits - px >= BUY_FLOOR) { action = { kind: 'trader', role: starved.hub ? 'LIGHT' : 'OUTLIGHT', type: t, wp: loc.wp, price: px, sys: starved.sys, local: loc.local }; break; }
         }
+        // deep outpost with no ship at a trader-selling yard → dispatch a probe anchor so next window buys local
+        if (!action && deep && !anyYard) { for (const t of TRADER_PREF) { if (await anchorBuy(t, starved.sys, allShips)) { lastBuyAt = now(); return; } } }
       }
     }
     if (!action && boughtProbes < MAX_BUY_PROBES) {
@@ -1005,7 +1108,7 @@ export function createExpansion(ctx) {
 
   async function maybeTrigger() {
     if (!AUTO) return;
-    if (triggered) { checkRecallRelease(); if (OUTPOSTS.length && !outpostsReady) await setupOutposts(); await adoptMiners(); await autoBuy(); return; }
+    if (triggered) { checkRecallRelease(); if (OUTPOSTS.length && !outpostsReady) await setupOutposts(); await resolvePending(); await adoptMiners(); await autoBuy(); return; }
     if (!gateBuilt()) return;
     // resolve the target gate from the home gate's connections
     let conns = [];
