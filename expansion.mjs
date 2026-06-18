@@ -540,7 +540,14 @@ export function createExpansion(ctx) {
     if (!op.path || !op.path.length) { m.last = 'await path'; await sleep(SLEEP_MS); return; }
     const r = await followPath(sym, ship, op.path);
     if (r === 'moving') { const i = op.path.indexOf(cur); m.last = `migrating → ${op.sys.slice(-4)} (hop ${i + 1}/${op.path.length - 1})`; return; }
-    m.last = `${r} → ${op.sys.slice(-4)}`; await sleep(SLEEP_MS);   // stray / no-gate → park (recoverable)
+    // [STRAY RECOVERY] A ship sitting OFF the outpost's gate path (e.g. parked at the hub on the wrong branch) returns
+    // 'stray' from followPath and would park forever. Re-route it onto the path: walk it back toward home (path[0]) via a
+    // fresh gate route from where it actually is, so it can then follow op.path correctly. This rescues hub-stranded crews.
+    if (r === 'stray' && cur !== op.path[0]) {
+      let back = null; try { back = await gatePath(cur, op.path[0]); } catch {}
+      if (back && back.length > 1) { const mv = await followPath(sym, ship, back); m.last = `stray→home (${mv}) to rejoin ${op.sys.slice(-4)}`; if (mv === 'moving') return; }
+    }
+    m.last = `${r} → ${op.sys.slice(-4)}`; await sleep(SLEEP_MS);   // no-gate / unrecoverable → park (recoverable next tick)
   }
 
   async function stepProbe(sym, ship) {
