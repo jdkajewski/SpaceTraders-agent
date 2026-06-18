@@ -50,7 +50,30 @@ export function createExpansion(ctx) {
   const MAX_PROBES = Number(process.env.EXPAND_MAX_PROBES || 4);
   const MIN_NET = Number(process.env.EXPAND_MIN_NET || 1000);                   // min realized net per trade (after fuel + antimatter)
   const PROBE_DWELL_MS = Number(process.env.EXPAND_PROBE_DWELL_MS || 90_000);
-  const SCAN_TTL_MS = Number(process.env.EXPAND_SCAN_TTL_MS || 120_000);
+  const SCAN_TTL_MS = Number(process.env.EXPAND_SCAN_TTL_MS || 120_000);          // MIN rescan interval (volatile markets)
+  const SCAN_TTL_MAX_MS = Number(process.env.EXPAND_SCAN_TTL_MAX_MS || 900_000);  // MAX interval — calm markets back off to here
+  const SCAN_VOLATILE_PCT = Number(process.env.EXPAND_SCAN_VOLATILE_PCT || 3);    // price move ≥ this% since last scan → snap back to MIN
+  // [ADAPTIVE SCAN] Fixed 2-min rescans of every market burned ~a third of the 2 req/s budget re-reading prices that
+  // hadn't moved. Instead, back OFF stable markets (scan rarely) and snap volatile ones to the floor (scan often).
+  // This never goes blind on what matters: any market we actively trade shifts >SCAN_VOLATILE_PCT → it auto-refreshes;
+  // and execution always re-reads the live market before buying/selling, so a stale cache only affects lane *scoring*.
+  function priceDelta(prev, next) {
+    if (!prev?.tradeGoods || !next?.tradeGoods) return Infinity;                   // no baseline → treat as volatile
+    const pm = new Map(prev.tradeGoods.map((g) => [g.symbol, g]));
+    let max = 0;
+    for (const g of next.tradeGoods) {
+      const p = pm.get(g.symbol); if (!p) { max = 100; break; }
+      for (const k of ['purchasePrice', 'sellPrice']) { const a = p[k], b = g[k]; if (a > 0 && b > 0) max = Math.max(max, Math.abs(b - a) / a * 100); }
+    }
+    return max;
+  }
+  function nextScan(prevRec, freshM) {
+    if (!freshM?.tradeGoods) return { ttl: SCAN_TTL_MS, nextAt: now() + SCAN_TTL_MS };  // priceless far-scan → re-check soon
+    const moved = priceDelta(prevRec, freshM);
+    const ttl = moved >= SCAN_VOLATILE_PCT ? SCAN_TTL_MS : Math.min(SCAN_TTL_MAX_MS, Math.round((prevRec?.ttl || SCAN_TTL_MS) * 1.8));
+    return { ttl, nextAt: now() + ttl };
+  }
+  const isStale = (rec) => !rec || now() >= (rec.nextAt || 0);
   let antimatterPx = Number(process.env.EXPAND_JUMP_COST || 12_000);            // est. for scoring; LEARNED from real jumps
   let jumpCooldownMin = Number(process.env.EXPAND_JUMP_COOLDOWN_MIN || 8.2);    // est. cross-system jump dead-time; LEARNED from real cooldowns
   const OP_OVERHEAD_MIN = Number(process.env.EXPAND_OP_OVERHEAD_MIN || 1.5);    // buy+sell market handling baked into every lane
@@ -131,6 +154,20 @@ export function createExpansion(ctx) {
   const mineColony = new Map();        // sys -> { asteroid:wp, surveys:[] } shared colony state
   let boughtDrones = 0;
 
+  // [CHAIN-FEED] Cross-system distribution layer: bulk freighters carry goods (ideally our MINED metal, cost~0) from a
+  // source/colony to STARVED factory sinks across systems, multi-dropping so no single market saturates. Validated live:
+  // a single feed trip netted +170k; mining-integrated feed captures ~2.4x margin (no source-price climb). Feeders are
+  // RESERVED hulls (never trade-pool members). Off by default; enable with CHAIN_FEED=1 + FEEDER_SHIPS=<symbols>.
+  const CHAIN_FEED = process.env.CHAIN_FEED === '1';
+  const FEEDER_SHIPS = new Set((process.env.FEEDER_SHIPS || '').split(',').map((s) => s.trim()).filter(Boolean));
+  const isFeeder = (sym) => { for (const f of FEEDER_SHIPS) { if (sym === f || sym.endsWith('-' + f)) return true; } return false; };
+  const FEED_MIN_MARGIN_PCT = Number(process.env.FEED_MIN_MARGIN_PCT || 25);    // ignore loops thinner than this
+  const FEED_SATURATION_N = Number(process.env.FEED_SATURATION_N || 2);         // per-market sell cap = tradeVolume × N
+  const FEED_PREFER_MINED = process.env.FEED_PREFER_MINED !== '0';              // bias source toward our mined metals
+  const FEED_GOODS = (process.env.FEED_GOODS || 'IRON,COPPER,ALUMINUM,MACHINERY,ELECTRONICS,EQUIPMENT,FABRICS,FAB_MATS').split(',').map((s) => s.trim()).filter(Boolean);
+  let feedPlan = [];                   // ranked loops built by the scanner (shared)
+  const exportClaims = new Map();      // mineSys -> { good, feederSym, qty, until } active export reservation (contention guard)
+
   let triggered = false;
   let triggerLogged = false;
   let target = null;                  // { sys, gateWp }
@@ -166,11 +203,11 @@ export function createExpansion(ctx) {
 
   // scan a single target market (presence required for live prices; probes provide it as they roam)
   async function scanMarket(wp) {
-    try { const m = (await api('GET', `/systems/${sysOf(wp)}/waypoints/${wp}/market`)).data; tgtMarkets[wp] = { ...m, at: now() }; return m; }
+    try { const m = (await api('GET', `/systems/${sysOf(wp)}/waypoints/${wp}/market`)).data; const ns = nextScan(tgtMarkets[wp], m); tgtMarkets[wp] = { ...m, at: now(), ttl: ns.ttl, nextAt: ns.nextAt }; return m; }
     catch { return null; }
   }
   async function scanAllTargets() {
-    for (const wp of tgtMarketWps) { if (!tgtMarkets[wp] || now() - tgtMarkets[wp].at > SCAN_TTL_MS) await scanMarket(wp); }
+    for (const wp of tgtMarketWps) { if (isStale(tgtMarkets[wp])) await scanMarket(wp); }
   }
 
   // ---- generic per-system bring-up (used by outposts; hub uses loadTargetSystem above) ----
@@ -196,12 +233,12 @@ export function createExpansion(ctx) {
   async function scanMarketInto(wp, op) {
     try {
       const m = (await api('GET', `/systems/${sysOf(wp)}/waypoints/${wp}/market`)).data;
-      if (m.tradeGoods || !op.markets[wp]) op.markets[wp] = { ...m, at: now() };  // never clobber priced data with a priceless far-scan
+      if (m.tradeGoods || !op.markets[wp]) { const ns = nextScan(op.markets[wp], m); op.markets[wp] = { ...m, at: now(), ttl: ns.ttl, nextAt: ns.nextAt }; }  // never clobber priced data with a priceless far-scan
       return m;
     } catch { return null; }
   }
   async function scanAllInto(op) {
-    for (const wp of op.marketWps) { if (!op.markets[wp] || now() - op.markets[wp].at > SCAN_TTL_MS) await scanMarketInto(wp, op); }
+    for (const wp of op.marketWps) { if (isStale(op.markets[wp])) await scanMarketInto(wp, op); }
   }
 
   // fuel-credits for a within-system trip on the tank; null if not tank-reachable (would DRIFT) → lane rejected
@@ -326,7 +363,7 @@ export function createExpansion(ctx) {
   async function helpScan(sym, ship) {
     await loadTargetSystem(target.sys);
     const here = ship.nav.waypointSymbol;
-    const todo = tgtMarketWps.filter((w) => !tgtMarkets[w] || now() - tgtMarkets[w].at > SCAN_TTL_MS);
+    const todo = tgtMarketWps.filter((w) => isStale(tgtMarkets[w]));
     if (!todo.length) return false;
     todo.sort((a, b) => D(here, a) - D(here, b));
     const dest = todo[0];
@@ -471,8 +508,15 @@ export function createExpansion(ctx) {
         const lo = Math.floor((idx * wps.length) / n), hi = Math.max(Math.floor(((idx + 1) * wps.length) / n), lo + 1);
         const arc = wps.slice(lo, hi);
         m.scanned = new Set(arc);
-        const stale = arc.filter((w) => !op.markets[w] || now() - op.markets[w].at > SCAN_TTL_MS);
-        if (!stale.length) { await sleep(PROBE_DWELL_MS); m.last = `1:1 ${op.sys.slice(-4)} arc[${arc.length}] fresh`; return; }
+        const stale = arc.filter((w) => isStale(op.markets[w]));
+        if (!stale.length) {
+          // [BUDGET] Dwell until the SOONEST arc market actually needs a refresh (its adaptive nextAt), not a fixed 90s.
+          // A probe parked on calm markets shouldn't wake — and burn a worker ship-GET — every 90s. Capped at 4 min so
+          // it still re-evaluates (and stays STOP-responsive) reasonably often.
+          const soon = Math.min(...arc.map((w) => op.markets[w]?.nextAt || 0));
+          const dwell = Math.max(PROBE_DWELL_MS, Math.min(240_000, (Number.isFinite(soon) && soon > 0 ? soon - now() : PROBE_DWELL_MS)));
+          await sleep(dwell); m.last = `1:1 ${op.sys.slice(-4)} arc[${arc.length}] fresh`; return;
+        }
         const here = ship.nav.waypointSymbol; stale.sort((a, b) => D(here, a) - D(here, b));
         const dest = stale[0];
         try { await goToSys(sym, dest, op.markets); await scanMarketInto(dest, op); log(`🛰 ${id(sym)} refreshed ${id(dest)} @${op.sys.slice(-4)} (arc ${arc.length}/${wps.length})`); }
@@ -484,7 +528,7 @@ export function createExpansion(ctx) {
       if (await dumpCargo(sym, ship, cur, op.markets)) return;
       const lane = bestLane(ship, op.markets, cur, op.markets, cur, null);
       if (!lane) {
-        const todo = op.marketWps.filter((w) => !op.markets[w] || now() - op.markets[w].at > SCAN_TTL_MS);
+        const todo = op.marketWps.filter((w) => isStale(op.markets[w]));
         if (todo.length) { const here = ship.nav.waypointSymbol; todo.sort((a, b) => D(here, a) - D(here, b)); try { await goToSys(sym, todo[0], op.markets); await scanMarketInto(todo[0], op); } catch {} m.last = `scanning ${op.sys.slice(-4)} (no lane)`; return; }
         m.last = `parked ${op.sys.slice(-4)} (no lane)`; await sleep(SLEEP_MS); return;
       }
@@ -736,6 +780,20 @@ export function createExpansion(ctx) {
     const fullEnough = capFree <= Math.max(2, Math.floor(cap * 0.12));
     // ferry when full, or when holding ore past the collection deadline (so partial loads still get sold)
     if (oreUnits > 0 && (fullEnough || (m.ferryBy && now() > m.ferryBy))) {
+      // [CHAIN-FEED contention guard] If a feeder has an active export claim on this colony, TRANSFER our ore to it
+      // (co-located at the rock) instead of selling to the local sink — preserves the mined metal for high-margin export.
+      const claim = exportClaims.get(sys);
+      if (claim && now() < claim.until) {
+        try {
+          const f = await getShip(claim.feederSym);
+          if (f && f.nav.waypointSymbol === ship.nav.waypointSymbol && f.nav.status !== 'IN_TRANSIT') {
+            let fFree = (f.cargo.capacity || 0) - (f.cargo.units || 0);
+            if (fFree > 0) { for (const it of (ship.cargo?.inventory || []).filter((i) => i.symbol !== 'FUEL')) { const give = Math.min(it.units, fFree); if (give > 0) { await transfer(sym, claim.feederSym, it.symbol, give); fFree -= give; } } m.last = `staged ore→feeder ${id(claim.feederSym)}`; return; }
+          }
+        } catch {}
+        // feeder not co-located / full → keep collecting; only spill to local sink if we're truly maxed (drones must not deadlock)
+        if (!fullEnough) { m.last = `holding for feeder (${oreUnits})`; await sleep(SLEEP_MS); return; }
+      }
       if (op) { await scanAllInto(op); if (await dumpCargo(sym, ship, sysOf(ship.nav.waypointSymbol), op.markets)) { m.last = `ferried ${oreUnits} ore`; m.ferryBy = null; return; } }
       m.last = `holding ${oreUnits} ore (no sink scanned)`; await sleep(SLEEP_MS); return;
     }
@@ -745,6 +803,162 @@ export function createExpansion(ctx) {
     if (ast === false) { m.last = `→ rock to collect`; return; }
     if (oreUnits > 0 && !m.ferryBy) m.ferryBy = now() + 180_000;   // ferry a partial load if drones are slow
     m.last = `collecting @rock (${oreUnits}/${cap})`; await sleep(SLEEP_MS);
+  }
+
+  // -------------------------------- [CHAIN-FEED] feeder executor --------------------------------
+  // Build a ranked list of cross-system feed loops from live (probe-covered) market data. Each loop:
+  // { good, srcSys, srcWp, srcPrice, mined, sinkSys, sinks:[{wp,price,vol}], margin, pct, cap }.
+  // Prefers MINED goods (a colony exports the metal we mine → source cost ~0, no buy-climb → full margin).
+  let lastPlanAt = 0, lastPlanLog = 0;
+  async function buildFeedPlan() {
+    if (now() - lastPlanAt < 30_000 && feedPlan.length) return;           // refresh from cache every 30s (cheap)
+    lastPlanAt = now();
+    // [PERF] Read the market data our PROBES already cache (op.markets / tgtMarkets) — no live API calls, so the scan is
+    // instant and never competes with the fleet's rate budget. Falls back to skipping a system if its markets aren't loaded yet.
+    const src = {}, sink = {};                                            // good -> best source / [sinks]
+    const minedGoods = new Set();
+    for (const sys of MINE_SYSTEMS) for (const g of ['IRON', 'COPPER', 'ALUMINUM']) minedGoods.add(g + '@' + sys);
+    const sysMarkets = [];                                                // [{sys, markets:{wp:{tradeGoods}}}]
+    if (target?.sys && tgtMarketWps.length) sysMarkets.push({ sys: target.sys, markets: tgtMarkets });
+    for (const sys of outposts.keys()) { const op = outposts.get(sys); if (op?.markets) sysMarkets.push({ sys, markets: op.markets }); }
+    for (const { sys, markets } of sysMarkets) {
+      for (const wp of Object.keys(markets)) {
+        const g = markets[wp]?.tradeGoods; if (!g) continue;
+        for (const t of g) {
+          if (!FEED_GOODS.includes(t.symbol)) continue;
+          if (t.type === 'EXPORT' || t.type === 'EXCHANGE') { const mined = minedGoods.has(t.symbol + '@' + sys); if (!src[t.symbol] || (mined && !src[t.symbol].mined) || t.purchasePrice < src[t.symbol].p) src[t.symbol] = { sys, wp, p: t.purchasePrice, vol: t.tradeVolume, mined }; }
+          if (t.type === 'IMPORT' || t.type === 'EXCHANGE') { (sink[t.symbol] = sink[t.symbol] || []).push({ sys, wp, p: t.sellPrice, vol: t.tradeVolume }); }
+        }
+      }
+    }
+    const loops = [];
+    for (const good of FEED_GOODS) {
+      const s = src[good]; if (!s || !sink[good]) continue;
+      const xs = sink[good].filter((x) => x.sys !== s.sys).sort((a, b) => b.p - a.p);   // cross-system sinks only
+      if (!xs.length) continue;
+      const best = xs[0]; const refCost = s.mined && FEED_PREFER_MINED ? Math.round(s.p * 0.25) : s.p;   // mined ≈ near-free
+      const margin = best.p - refCost; if (margin <= 0) continue;
+      const pct = Math.round(margin / Math.max(1, refCost) * 100); if (pct < FEED_MIN_MARGIN_PCT) continue;
+      const cap = xs.slice(0, 6).reduce((a, x) => a + (x.vol || 0) * FEED_SATURATION_N, 0);
+      loops.push({ good, srcSys: s.sys, srcWp: s.wp, srcPrice: s.p, mined: !!s.mined, sinkSys: best.sys, sinks: xs.slice(0, 6), margin, pct, cap });
+    }
+    loops.sort((a, b) => (b.margin * Math.min(b.cap, 490)) - (a.margin * Math.min(a.cap, 490)));
+    if (loops.length) { feedPlan = loops; if (now() - (lastPlanLog || 0) > 60_000) { lastPlanLog = now(); log(`🚚 feedPlan: ${loops.slice(0, 3).map((l) => `${l.good} ${l.srcSys.slice(-4)}→${l.sinkSys.slice(-4)} +${l.margin}(${l.pct}%)${l.mined ? '⛏' : ''}`).join(' | ')}`); } }
+  }
+
+  // [DELIVER-WHAT-YOU-HOLD] Build a delivery loop for a good we ALREADY carry. The purchase is a sunk cost, so we ignore
+  // the profit-margin threshold entirely — ANY sink beats hauling it forever as ballast. Scans cached markets for the
+  // best sellPrice (cross-system preferred so we don't just dump back where we bought, but same-system allowed as a last
+  // resort). Returns a loop shaped like buildFeedPlan's, or null if no market anywhere imports the good.
+  function bestSinkLoop(good, fromSys) {
+    const sysMarkets = [];
+    if (target?.sys && tgtMarketWps.length) sysMarkets.push({ sys: target.sys, markets: tgtMarkets });
+    for (const sys of outposts.keys()) { const op = outposts.get(sys); if (op?.markets) sysMarkets.push({ sys, markets: op.markets }); }
+    const sinks = [];
+    for (const { sys, markets } of sysMarkets) for (const wp of Object.keys(markets)) {
+      for (const t of (markets[wp]?.tradeGoods || [])) { if (t.symbol === good && (t.type === 'IMPORT' || t.type === 'EXCHANGE')) sinks.push({ sys, wp, p: t.sellPrice, vol: t.tradeVolume }); }
+    }
+    if (!sinks.length) return null;
+    const cross = sinks.filter((x) => x.sys !== fromSys);
+    const pool = (cross.length ? cross : sinks).sort((a, b) => b.p - a.p);
+    const best = pool[0];
+    return { good, srcSys: fromSys, srcWp: null, srcPrice: 0, mined: false, sinkSys: best.sys, sinks: pool.slice(0, 6), margin: best.p, pct: 0, cap: 0, deliverOnly: true };
+  }
+  // [LOCAL DELIVERY] If the system we're STANDING IN already imports the good we hold, deliver it here — no cross-system
+  // haul. Used for stranded-cargo recovery so a feeder sitting on a valid sink sells in place instead of jumping away.
+  function localSinkLoop(good, sys) {
+    const op = sys === target?.sys ? { markets: tgtMarkets } : outposts.get(sys);
+    if (!op?.markets) return null;
+    const sinks = [];
+    for (const wp of Object.keys(op.markets)) for (const t of (op.markets[wp]?.tradeGoods || [])) { if (t.symbol === good && (t.type === 'IMPORT' || t.type === 'EXCHANGE')) sinks.push({ sys, wp, p: t.sellPrice, vol: t.tradeVolume }); }
+    if (!sinks.length) return null;
+    sinks.sort((a, b) => b.p - a.p);
+    return { good, srcSys: sys, srcWp: null, srcPrice: 0, mined: false, sinkSys: sys, sinks: sinks.slice(0, 6), margin: sinks[0].p, pct: 0, cap: 0, deliverOnly: true };
+  }
+  // path to the sink system → multi-DROP across sinks (per-market cap = tradeVolume × N, the saturation guard) → repeat.
+  async function feederTrip(sym, ship) {
+    const m = members.get(sym);
+    await buildFeedPlan();
+    if (!feedPlan.length) { m.last = 'no feed loop'; await sleep(SLEEP_MS); return; }
+    // [LOOP LOCK] Pick a fresh loop ONLY when idle (no loop yet, or a stale empty-handed LOAD). Never re-pick while we're
+    // already carrying cargo for the current loop — feedPlan re-sorts every 30s, and switching mid-load would strand a
+    // half-loaded good (e.g. drop a FABRICS loop for EQUIPMENT and never deliver the FABRICS). Cargo commits the loop.
+    const carrying = (ship.cargo?.units || 0) > 0;
+    if (!m.loop || (!carrying && m.phase === 'LOAD' && now() - (m.loopAt || 0) > 120_000) || (carrying && m.loop && m.phase === 'LOAD' && !((ship.cargo.inventory || []).some((i) => i.symbol === m.loop.good)))) {
+      // [CARGO RECOVERY] After a restart (m.loop gone) or when we're holding a good whose profit-loop fell off the plan
+      // (our own buy raised its source price below threshold), DELIVER what we hold rather than strand it. bestSinkLoop
+      // ignores the margin gate — the buy is sunk cost, so any sink beats ballast. Empty hold → pick a fresh feedPlan loop.
+      let pick;
+      if (carrying) {
+        const heldGood = (ship.cargo.inventory || []).sort((a, b) => b.units - a.units)[0]?.symbol;
+        const cs = sysOf(ship.nav.waypointSymbol);
+        // Prefer selling in the system we're ALREADY in (no wasted cross-system haul); then a matching profit loop; then
+        // any reachable sink. All ignore the margin gate — held cargo is sunk cost, so any delivery beats ballast.
+        pick = localSinkLoop(heldGood, cs) || feedPlan.find((l) => l.good === heldGood) || bestSinkLoop(heldGood, cs) || feedPlan[0];
+        m.phase = 'HAUL';
+      } else { pick = feedPlan[0]; m.phase = 'LOAD'; }
+      m.loop = pick; m.loopAt = now(); m.soldHere = 0;
+    }
+    const loop = m.loop; const curSys = sysOf(ship.nav.waypointSymbol);
+    const held = (ship.cargo?.inventory || []).filter((i) => i.symbol === loop.good).reduce((a, i) => a + i.units, 0);
+    const cap = ship.cargo?.capacity || 0;
+    if (now() - (m.dbgAt || 0) > 25_000) { m.dbgAt = now(); log(`🚚dbg ${id(sym)} ${m.phase} loop=${loop.good} src=${loop.srcWp ? id(loop.srcWp) : 'deliver'}(${loop.srcSys.slice(-4)}) sink=${loop.sinkSys.slice(-4)} cap=${loop.cap} held=${held} at=${id(ship.nav.waypointSymbol)}/${ship.nav.status}`); }
+
+    // ---- LOAD phase ----
+    if (m.phase === 'LOAD') {
+      if (held >= Math.min(cap, loop.cap)) { m.phase = 'HAUL'; m.last = `loaded ${held} ${loop.good}`; return; }
+      if (curSys !== loop.srcSys) { const path = await gatePath(curSys, loop.srcSys); if (path) { const r = await followPath(sym, ship, path); m.last = `→ source ${loop.srcSys.slice(-4)} (${r})`; return; } m.last = `no path → ${loop.srcSys.slice(-4)}`; await sleep(SLEEP_MS); return; }
+      // at source system: set an export claim if mined (so local haulers stage for us, not sell out from under us)
+      if (loop.mined && MINE_SYSTEMS.includes(loop.srcSys)) exportClaims.set(loop.srcSys, { good: loop.good, feederSym: sym, qty: Math.min(cap, loop.cap), until: now() + 300_000 });
+      if (ship.nav.waypointSymbol !== loop.srcWp) { await goToSys(sym, loop.srcWp, outposts.get(loop.srcSys)?.markets || {}); m.last = `→ ${id(loop.srcWp)}`; return; }
+      if (ship.nav.status !== 'DOCKED') { try { await api('POST', `/my/ships/${sym}/dock`); } catch {} }
+      // buy up to cap (mined goods still buyable at the export market; the claim keeps haulers from draining it)
+      try {
+        const mk = (await api('GET', `/systems/${loop.srcSys}/waypoints/${loop.srcWp}/market`)).data;
+        const g = (mk.tradeGoods || []).find((x) => x.symbol === loop.good);
+        const free = cap - (ship.cargo?.units || 0);
+        if (g && free > 0 && g.purchasePrice <= loop.srcPrice * 1.6) { const units = Math.min(g.tradeVolume, free); await api('POST', `/my/ships/${sym}/purchase`, { symbol: loop.good, units }); m.last = `+${units} ${loop.good}@${g.purchasePrice}`; return; }
+        m.phase = 'HAUL'; m.last = `load done (${held})`; return;                  // price climbed or full → haul what we have
+      } catch (e) { m.last = `load ERR ${e.message}`; await sleep(SLEEP_MS); return; }
+    }
+
+    // ---- HAUL phase ----
+    if (m.phase === 'HAUL') {
+      if (held <= 0) { m.phase = 'LOAD'; return; }
+      if (curSys !== loop.sinkSys) { const path = await gatePath(curSys, loop.sinkSys); if (path) { const r = await followPath(sym, ship, path); m.last = `haul → ${loop.sinkSys.slice(-4)} (${r})`; return; } m.last = `no path → ${loop.sinkSys.slice(-4)}`; await sleep(SLEEP_MS); return; }
+      m.phase = 'SELL'; m.sinkIdx = 0; return;
+    }
+
+    // ---- SELL phase: multi-drop across sinks, capped per market ----
+    if (m.phase === 'SELL') {
+      if (held <= 0) { m.phase = 'LOAD'; m.last = `circuit done`; m.soldHere = 0; if (exportClaims.get(loop.srcSys)?.feederSym === sym) exportClaims.delete(loop.srcSys); return; }
+      const sink = loop.sinks[m.sinkIdx || 0];
+      if (!sink) { /* out of sinks but still holding → dump at best local */ const op = outposts.get(curSys); if (op) { await scanAllInto(op); await dumpCargo(sym, ship, curSys, op.markets); } m.phase = 'LOAD'; m.soldHere = 0; return; }
+      if (ship.nav.waypointSymbol !== sink.wp) { await goToSys(sym, sink.wp, outposts.get(loop.sinkSys)?.markets || {}); m.last = `→ sink ${id(sink.wp)}`; return; }
+      if (ship.nav.status !== 'DOCKED') { try { await api('POST', `/my/ships/${sym}/dock`); } catch (e) { log(`🚚 ${id(sym)} dock ERR @${id(sink.wp)}: ${e.message}`); await sleep(SLEEP_MS); return; } }
+      try {
+        const mk = (await api('GET', `/systems/${curSys}/waypoints/${sink.wp}/market`)).data;
+        const g = (mk.tradeGoods || []).find((x) => x.symbol === loop.good);
+        if (g && (g.type === 'IMPORT' || g.type === 'EXCHANGE')) {
+          // [SELL CAP] API rejects any single sell larger than tradeVolume, so each transaction is capped at tradeVolume.
+          // FEED_SATURATION_N is the TOTAL we'll dump at THIS market across repeated ticks (m.soldHere) before moving on —
+          // that's the anti-saturation guard (don't crash one market's price), not a per-transaction size.
+          const perMarketCap = g.tradeVolume * FEED_SATURATION_N;
+          const room = perMarketCap - (m.soldHere || 0);
+          const units = Math.max(0, Math.min(g.tradeVolume, held, room));
+          if (units > 0) {
+            const r = (await api('POST', `/my/ships/${sym}/sell`, { symbol: loop.good, units })).data;
+            m.soldHere = (m.soldHere || 0) + units;
+            log(`🚚 ${id(sym)} sold ${units} ${loop.good} @${g.sellPrice} ${id(sink.wp)} (${m.soldHere}/${perMarketCap} here, ${held - units} left)`);
+            if (units >= held) { m.phase = 'LOAD'; m.soldHere = 0; if (exportClaims.get(loop.srcSys)?.feederSym === sym) exportClaims.delete(loop.srcSys); }  // circuit done
+            else if (m.soldHere >= perMarketCap || units < g.tradeVolume) { m.sinkIdx = (m.sinkIdx || 0) + 1; m.soldHere = 0; }  // this market full → next sink
+            return;
+          }
+        }
+        m.sinkIdx = (m.sinkIdx || 0) + 1; m.soldHere = 0; log(`🚚 ${id(sym)} skip ${id(sink.wp)} — ${g ? g.type : 'no '+loop.good} (not importer) → next sink`); return;   // not an importer / capped → next sink
+      } catch (e) { log(`🚚 ${id(sym)} sell ERR @${id(sink.wp)}: ${e.message} — next sink`); m.sinkIdx = (m.sinkIdx || 0) + 1; m.soldHere = 0; await sleep(SLEEP_MS); return; }
+    }
+    m.phase = 'LOAD';
   }
 
   // -------------------------------- public API --------------------------------
@@ -757,6 +971,7 @@ export function createExpansion(ctx) {
       else if (m.role === 'MINESURVEY') await stepSurveyor(sym, ship);
       else if (m.role === 'MINEHAUL') await stepMineHaul(sym, ship);
       else if (m.role === 'OUTPROBE' || m.role === 'OUTLIGHT') await stepOutpost(sym, ship);
+      else if (m.role === 'FEEDER') await feederTrip(sym, ship);
       else await stepHauler(sym, ship);
     } catch (e) { log(`🪐 ${id(sym)} expand step ERR ${e.message} — parking`); await sleep(SLEEP_MS); }
   }
@@ -776,16 +991,16 @@ export function createExpansion(ctx) {
     try { const neg = typeof negotiator === 'function' ? negotiator() : null; if (neg) negSet.add(neg); } catch {}
     const isNeg = (s) => [...negSet].some((t) => s.symbol === t || s.symbol.endsWith('-' + t));
 
-    // HAULER: explicit, else largest-cargo non-probe with fuel>=400 (can clear the long gate legs)
+    // HAULER: explicit, else largest-cargo non-probe with fuel>=400 (can clear the long gate legs). [CHAIN-FEED] never a feeder.
     let haulers;
-    if (EXPLICIT_HAULERS.size) haulers = all.filter((s) => byId(EXPLICIT_HAULERS, s) && !isNeg(s));
-    else { const cand = all.filter((s) => !isProbe(s) && !isNeg(s) && s.cargo.capacity >= 40 && s.fuel.capacity >= 400).sort((a, b) => (b.fuel.capacity - a.fuel.capacity) || (b.cargo.capacity - a.cargo.capacity)); haulers = cand.slice(0, 1); }
+    if (EXPLICIT_HAULERS.size) haulers = all.filter((s) => byId(EXPLICIT_HAULERS, s) && !isNeg(s) && !isFeeder(s.symbol));
+    else { const cand = all.filter((s) => !isProbe(s) && !isNeg(s) && !isFeeder(s.symbol) && s.cargo.capacity >= 40 && s.fuel.capacity >= 400).sort((a, b) => (b.fuel.capacity - a.fuel.capacity) || (b.cargo.capacity - a.cargo.capacity)); haulers = cand.slice(0, 1); }
     const haulerSet = new Set(haulers.map((s) => s.symbol));
 
-    // LIGHT: explicit, else a smaller non-probe hull not already chosen as hauler
+    // LIGHT: explicit, else a smaller non-probe hull not already chosen as hauler. [CHAIN-FEED] never a feeder.
     let light;
-    if (EXPLICIT_LIGHT.size) light = all.filter((s) => byId(EXPLICIT_LIGHT, s) && !isNeg(s));
-    else { const cand = all.filter((s) => !isProbe(s) && !isNeg(s) && !haulerSet.has(s.symbol) && s.cargo.capacity >= 20 && s.fuel.capacity >= 200).sort((a, b) => a.cargo.capacity - b.cargo.capacity); light = cand.slice(0, 1); }
+    if (EXPLICIT_LIGHT.size) light = all.filter((s) => byId(EXPLICIT_LIGHT, s) && !isNeg(s) && !isFeeder(s.symbol));
+    else { const cand = all.filter((s) => !isProbe(s) && !isNeg(s) && !isFeeder(s.symbol) && !haulerSet.has(s.symbol) && s.cargo.capacity >= 20 && s.fuel.capacity >= 200).sort((a, b) => a.cargo.capacity - b.cargo.capacity); light = cand.slice(0, 1); }
     const lightSet = new Set(light.map((s) => s.symbol));
 
     // PROBES: explicit, else up to MAX_PROBES idle probes — never the negotiator (it must stay home to negotiate)
@@ -796,6 +1011,8 @@ export function createExpansion(ctx) {
     for (const s of haulers) members.set(s.symbol, { role: 'HAULER' });
     for (const s of light) if (!members.has(s.symbol)) members.set(s.symbol, { role: 'LIGHT' });
     for (const s of probes) if (!members.has(s.symbol)) members.set(s.symbol, { role: 'PROBE', scanned: new Set() });
+    // [CHAIN-FEED] adopt reserved feeders as FEEDER members (so bot2 routes them through expansion.step, not the home trade loop)
+    if (CHAIN_FEED) for (const s of all) if (isFeeder(s.symbol) && !members.has(s.symbol)) members.set(s.symbol, { role: 'FEEDER' });
     return members.size > 0;
   }
 
@@ -1128,6 +1345,29 @@ export function createExpansion(ctx) {
       members.set(s.symbol, { role, mineSys: sys });
       launchWorker(s.symbol);
       log(`⛏ adopted ${id(s.symbol)} → ${role} @${sys.slice(-4)}${s.nav.systemSymbol !== sys ? ` (migrating from ${s.nav.systemSymbol.slice(-4)})` : ''}`);
+    }
+    // [MINEHAUL] Adopt a non-member, non-probe cargo hull that is PHYSICALLY IN a mine system as an ore-ferry (MINEHAUL),
+    // up to MINE_HAULERS_PER. Mine-system yards on the frontier don't sell haulers, so the only way a colony gets a ferry
+    // is a MANUALLY MIGRATED hauler — this adopts it. Guards: only ships already in the mine system (zero migration), and
+    // existing trader members are skipped (they were claimed by setupOutposts first), so this never strips a trade fleet.
+    if (MINE_HAULERS_PER > 0) {
+      const haulN = {}; for (const s of MINE_SYSTEMS) haulN[s] = 0;
+      for (const [, m] of members) if (m.role === 'MINEHAUL' && haulN[m.mineSys] !== undefined) haulN[m.mineSys]++;
+      for (const s of all) {
+        if (members.has(s.symbol)) continue;
+        if (s.nav.status === 'IN_TRANSIT') continue;
+        const sys = s.nav.systemSymbol;
+        if (!MINE_SYSTEMS.includes(sys)) continue;               // only adopt a hauler already AT a colony (no migration)
+        if (haulN[sys] >= MINE_HAULERS_PER) continue;
+        if (s.frame?.symbol === 'FRAME_PROBE') continue;
+        const mounts = (s.mounts || []).map((m) => m.symbol || m);
+        if (mounts.some((x) => /MINING_LASER|SURVEYOR/.test(x))) continue;   // mining hulls handled above
+        if ((s.cargo?.capacity || 0) < 20) continue;             // must actually carry ore
+        members.set(s.symbol, { role: 'MINEHAUL', mineSys: sys });
+        launchWorker(s.symbol);
+        haulN[sys]++;
+        log(`⛏ adopted ${id(s.symbol)} → MINEHAUL @${sys.slice(-4)} (ore-ferry; ${haulN[sys]}/${MINE_HAULERS_PER})`);
+      }
     }
   }
 

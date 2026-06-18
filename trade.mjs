@@ -10,8 +10,11 @@
 //   {"sell":"MICROPROCESSORS"}                  sell all of a symbol (or "ALL")
 //   {"refuel":true}
 import { api } from './st.mjs';
+import fs from 'node:fs';
 
 const SYSTEM = 'X1-PP30';
+// [BUDGET] STOP is a filesystem flag (no API cost) — lets a long local transit-sleep bail promptly on shutdown.
+const stopRequested = () => { try { return fs.existsSync(new URL('./STOP', import.meta.url)); } catch { return false; } };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const log = (...a) => console.error(new Date().toISOString().slice(11, 19), ...a);
 
@@ -38,7 +41,17 @@ async function waitArrival(sym, ship) {
     if (ship.nav.status !== 'IN_TRANSIT') return ship;
     const arrivalMs = Date.parse(ship.nav.route.arrival);
     const waitMs = arrivalMs - Date.now();
-    if (waitMs > 0) { log(`${sym} in transit -> ${ship.nav.route.destination.symbol}, ETA ${Math.ceil(waitMs/1000)}s`); await sleep(Math.min(waitMs + 1500, 60000)); }
+    if (waitMs > 0) {
+      log(`${sym} in transit -> ${ship.nav.route.destination.symbol}, ETA ${Math.ceil(waitMs/1000)}s`);
+      // [BUDGET] Sleep the FULL transit locally instead of re-GETting the ship every 60s. The API already gave us the
+      // arrival time, so mid-flight polling only burns request budget other ships need to trade. Wake every 15s ONLY
+      // to honor a STOP file (a filesystem check, not a request), then confirm arrival with a SINGLE GET below.
+      const deadline = Date.now() + waitMs + 1200;
+      while (Date.now() < deadline) {
+        if (stopRequested()) return ship;
+        await sleep(Math.min(15000, deadline - Date.now()));
+      }
+    }
     ship = await getShip(sym);
     if (ship.nav.status !== 'IN_TRANSIT') return ship;
   }
