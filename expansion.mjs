@@ -63,7 +63,16 @@ export function createExpansion(ctx) {
   // the ship (recoverable). Fully additive — with EXPAND_OUTPOSTS unset the hub/home earner is byte-for-byte same.
   const OUTPOSTS = [...listEnv('EXPAND_OUTPOSTS')];                              // e.g. "X1-DF86,X1-MB89" ('' = off)
   const OUTPOST_PROBES = Number(process.env.EXPAND_OUTPOST_PROBES || 2);        // probes per outpost (live market data)
-  const OUTPOST_TRADERS = Number(process.env.EXPAND_OUTPOST_TRADERS || 1);      // local traders per outpost
+  const OUTPOST_TRADERS = Number(process.env.EXPAND_OUTPOST_TRADERS || 1);      // default local traders per system
+  // [PER-SYSTEM TRADERS] Optional override of trader target per system, sized to each system's profitable intra-system
+  // lane count (more lanes → more traders without saturating any single good). Format: "X1-ZV87:7,X1-JH56:6,X1-YK2:6,X1-YS20:1".
+  // Any system not listed falls back to OUTPOST_TRADERS. Set via EXPAND_TRADERS_PER_SYS.
+  const TRADERS_PER_SYS = {};
+  for (const pair of (process.env.EXPAND_TRADERS_PER_SYS || '').split(',').map((s) => s.trim()).filter(Boolean)) {
+    const [sys, n] = pair.split(':'); const v = Number(n);
+    if (sys && Number.isFinite(v)) TRADERS_PER_SYS[sys.trim()] = v;
+  }
+  const traderTarget = (sys) => (TRADERS_PER_SYS[sys] !== undefined ? TRADERS_PER_SYS[sys] : OUTPOST_TRADERS);
   // [RECALL] Consolidate everything onto the HUB (target system): pull every outpost crew back to the hub and convert
   // them to hub roles (probe→PROBE, trader→LIGHT), and stop autobuy from staffing outposts. Use when we want to
   // concentrate all firepower on the fattest system before expanding again. Outpost gates stay configured (so the
@@ -146,13 +155,13 @@ export function createExpansion(ctx) {
       if (!batch || !batch.length) break;
       for (const w of batch) {
         coords[w.symbol] = [w.x, w.y];                                          // make D()/planRoute work in the new system
-        if ((w.traits || []).some((t) => t.symbol === 'MARKETPLACE')) wps.push(w.symbol);
+        if ((w.traits || []).some((t) => t.symbol === 'MARKETPLACE' || t.symbol === 'SHIPYARD')) wps.push(w.symbol);  // cover every market AND shipyard (a probe at a yard also unlocks live ship-purchase prices)
       }
       if (batch.length < 20) break;
     }
     tgtMarketWps = wps;
     tgtLoaded = true;
-    log(`🪐 target system ${sys} mapped: ${wps.length} markets, gate ${id(target.gateWp)}`);
+    log(`🪐 target system ${sys} mapped: ${wps.length} markets+yards, gate ${id(target.gateWp)}`);
   }
 
   // scan a single target market (presence required for live prices; probes provide it as they roam)
@@ -175,14 +184,14 @@ export function createExpansion(ctx) {
       if (!batch || !batch.length) break;
       for (const w of batch) {
         coords[w.symbol] = [w.x, w.y];
-        if ((w.traits || []).some((t) => t.symbol === 'MARKETPLACE')) wps.push(w.symbol);
+        if ((w.traits || []).some((t) => t.symbol === 'MARKETPLACE' || t.symbol === 'SHIPYARD')) wps.push(w.symbol);  // cover every market AND shipyard
         if (w.type === 'JUMP_GATE' && !op.gateWp) op.gateWp = w.symbol;
       }
       if (batch.length < 20) break;
     }
     op.marketWps = wps;
     op.loaded = true;
-    log(`🛰 outpost ${op.sys} mapped: ${wps.length} markets, gate ${op.gateWp ? id(op.gateWp) : '?'}`);
+    log(`🛰 outpost ${op.sys} mapped: ${wps.length} markets+yards, gate ${op.gateWp ? id(op.gateWp) : '?'}`);
   }
   async function scanMarketInto(wp, op) {
     try {
@@ -843,9 +852,9 @@ export function createExpansion(ctx) {
     let pi = 0, ti = 0;
     for (const sys of outposts.keys()) {
       const op = outposts.get(sys); const ptgt = probeTgt(sys);
-      if (!op.deep) while (traderCnt[sys] < OUTPOST_TRADERS && ti < idleTraders.length) { crews[sys].push(assign(idleTraders[ti++], sys)); traderCnt[sys]++; }
+      if (!op.deep) while (traderCnt[sys] < traderTarget(sys) && ti < idleTraders.length) { crews[sys].push(assign(idleTraders[ti++], sys)); traderCnt[sys]++; }
       while (probeCnt[sys] < ptgt && pi < idleProbes.length) { crews[sys].push(assign(idleProbes[pi++], sys)); probeCnt[sys]++; }
-      log(`🛰 OUTPOST ${sys} (gate ${id(op.gateWp)}${op.deep ? ', DEEP' : ''}) crew[P${probeCnt[sys]}/${ptgt} T${traderCnt[sys]}/${op.deep ? 'local' : OUTPOST_TRADERS}]: ${crews[sys].join(' ') || 'NONE (seed by autobuy)'}`);
+      log(`🛰 OUTPOST ${sys} (gate ${id(op.gateWp)}${op.deep ? ', DEEP' : ''}) crew[P${probeCnt[sys]}/${ptgt} T${traderCnt[sys]}/${op.deep ? 'local' : traderTarget(sys)}]: ${crews[sys].join(' ') || 'NONE (seed by autobuy)'}`);
     }
     outpostsReady = true;
   }
@@ -932,11 +941,12 @@ export function createExpansion(ctx) {
     const cand = inSys.find((s) => s.frame?.symbol === 'FRAME_PROBE') || inSys[0];
     if (!cand) return false;
     anchorSent.set(yard, now());
-    try { await goToSys(cand.symbol, yard, outposts.get(sys)?.markets || {}); log(`🛒 anchoring ${id(cand.symbol)} → ${id(yard)} (so local ${type.replace('SHIP_', '')} buys work)`); } catch {}
+    try { await goToSys(cand.symbol, yard, outposts.get(sys)?.markets || {}); log(`🛒 anchoring ${id(cand.symbol)} → ${id(yard)} (so local ${type.replace('SHIP_', '')} buys work)`); }
+    catch (e) { log(`🛒 anchor ${id(cand.symbol)} → ${id(yard)} FAILED: ${e.message}`); }
     return true;
   }
 
-  async function autoBuy() {
+  async function autoBuy(fleet) {
     if (!AUTOBUY || !triggered || !outpostsReady) return;
     if (!buyShip) return;                                        // ctx not wired (older bot2)
     if (now() - lastBuyAt < BUY_EVERY_MS) return;
@@ -973,15 +983,71 @@ export function createExpansion(ctx) {
 
     // waypoints where we have a ship present right now (purchase needs a hull at the yard)
     let allShips, shipWps;
-    try { allShips = await getAllShips(); shipWps = new Set(allShips.filter((s) => s.nav.status !== 'IN_TRANSIT').map((s) => s.nav.waypointSymbol)); }
-    catch (e) { lastBuyAt = now(); log(`🛒 AUTOBUY fleet read ERR ${e.message}`); return; }
+    allShips = fleet; if (!allShips) { try { allShips = await getAllShips(); } catch (e) { lastBuyAt = now(); log(`🛒 AUTOBUY fleet read ERR ${e.message}`); return; } }
+    shipWps = new Set(allShips.filter((s) => s.nav.status !== 'IN_TRANSIT').map((s) => s.nav.waypointSymbol));
 
-    // decide ONE action. PRIORITY: (1) build the mine colonies (renewable, non-diluting scaling lever), then
-    // (2) trader-starved systems (arbitrage earners), then (3) probe coverage. Buy LOCAL when possible.
+    // decide ONE action. PRIORITY (user-set): (1) probe 1:1 coverage FIRST — establish market visibility everywhere,
+    // then (2) trader-starved systems (arbitrage earners), then (3) the mine colony fills LAST. Buy LOCAL when possible.
     let action = null;
-    // 1) [MINE COLONY] staff each colony: surveyor (yield) → haulers (park-and-ferry) → drones (scale extraction).
+    // 1) probe 1:1 coverage — buy LOCAL & cheap (anchor a ship at the system's own probe yard; hub included).
+    if (!action && boughtProbes < MAX_BUY_PROBES) {
+      let worst = null, worstGap = 0;
+      for (const ss of staffSystems) {
+        if (!ss.markets) continue;                              // unmapped — don't buy probes blind
+        const tgt = PROBE_TARGET_CAP > 0 ? Math.min(ss.markets, PROBE_TARGET_CAP) : ss.markets;
+        const gap = tgt - probeN[ss.sys];
+        if (gap > worstGap) { worstGap = gap; worst = ss; }
+      }
+      if (worst) {
+        // LOCAL-FIRST: buy the probe IN the system it will live (find the local shipyard that sells probes) so it needs no
+        // migration. Only systems with NO probe-selling yard of their own (e.g. JH56) fall back to home + migrate. This kills
+        // the home-gate pile-up while still covering yard-less systems. Home's own coverage buys at home (worst.sys==home).
+        const localYards = await shipyardsIn(worst.sys);
+        const hasLocalProbeYard = localYards.some((y) => y.sells.has('SHIP_PROBE'));
+        const srcSystems = hasLocalProbeYard ? [worst.sys] : [worst.sys, homeSystem];
+        const loc = await pickBuy('SHIP_PROBE', srcSystems, shipWps);
+        const price = loc ? (loc.price || 26_000) : 0;
+        const tooPricey = loc && MAX_PROBE_PRICE > 0 && loc.price && loc.price > MAX_PROBE_PRICE;
+        if (tooPricey) log(`🛒 AUTOBUY probe @${id(loc.wp)} ${loc.price.toLocaleString()} > cap ${MAX_PROBE_PRICE.toLocaleString()} — waiting for cheaper`);
+        if (loc && !tooPricey && credits - price >= BUY_FLOOR) action = { kind: 'probe', role: worst.hub ? 'PROBE' : 'OUTPROBE', type: 'SHIP_PROBE', wp: loc.wp, price, sys: worst.sys, local: loc.local };
+        else if ((!loc || tooPricey) && hasLocalProbeYard) {
+          // local yard exists but no ship there yet → anchor a ship at it (side-effect, NON-blocking: fall through so
+          // trader/mining buys still proceed this window). The anchored ship unlocks live prices for next window's buy.
+          await anchorBuy('SHIP_PROBE', worst.sys, allShips);
+        }
+      }
+    }
+    // 2) trader-starved system. LOCAL-FIRST (same rule as probes): if the system has a yard selling a preferred trader
+    //    hull, buy IN-SYSTEM (anchor a ship at the yard to unlock live prices) — never home+migrate. Only systems with NO
+    //    local trader yard at all fall back to a home buy + migration.
+    if (!action && boughtTraders < MAX_BUY_TRADERS) {
+      const starved = staffSystems.find((ss) => traderN[ss.sys] < traderTarget(ss.sys));
+      if (starved) {
+        const op = outposts.get(starved.sys);
+        const deep = op && op.deep;
+        const yards = await shipyardsIn(starved.sys);
+        const localHulls = TRADER_PREF.filter((t) => yards.some((y) => y.sells.has(t)));   // preferred hulls this system sells
+        const hasLocalTraderYard = localHulls.length > 0;
+        const buyInSystem = deep || hasLocalTraderYard;
+        const prefSys = buyInSystem ? [starved.sys] : [starved.sys, homeSystem];
+        const hullList = hasLocalTraderYard ? localHulls : TRADER_PREF;
+        let anyYard = false;
+        for (const t of hullList) {                             // best available hull first
+          const loc = await pickBuy(t, prefSys, shipWps);
+          if (!loc) continue;
+          anyYard = true;
+          const px = loc.price || 320_000;
+          if (MAX_TRADER_PRICE > 0 && loc.price && loc.price > MAX_TRADER_PRICE) continue;   // too pricey → try next hull / wait
+          if (credits - px >= BUY_FLOOR) { action = { kind: 'trader', role: starved.hub ? 'LIGHT' : 'OUTLIGHT', type: t, wp: loc.wp, price: px, sys: starved.sys, local: loc.local }; break; }
+        }
+        // local trader yard exists but no ship parked there yet → anchor one (side-effect, NON-blocking) so a NEXT window buys in-system
+        if (!action && buyInSystem && !anyYard) { for (const t of hullList) { if (await anchorBuy(t, starved.sys, allShips)) break; } }
+      }
+    }
+    // 3) [MINE COLONY] LAST priority: staff each colony surveyor (yield) → haulers (park-and-ferry) → drones (scale).
     //    Mining hulls are sold ONLY at the colony's own shipyard (home can't), so always buy local (anchor if needed).
-    if (boughtDrones < MAX_BUY_DRONES) {
+    //    Anchors are dispatched as a side-effect even when this isn't the chosen buy, so the yard is ready when its turn comes.
+    if (!action && boughtDrones < MAX_BUY_DRONES) {
       const roleSpec = [
         { type: MINE_SURVEYOR_TYPE, role: 'MINESURVEY', have: surveyorN, want: MINE_SURVEYORS_PER, dflt: 40_000 },
         { type: MINE_HAUL_TYPE, role: 'MINEHAUL', have: haulerN, want: MINE_HAULERS_PER, dflt: 180_000 },
@@ -997,48 +1063,7 @@ export function createExpansion(ctx) {
             const px = loc.price || rs.dflt;
             if (MAX_TRADER_PRICE > 0 && loc.price && loc.price > MAX_TRADER_PRICE) continue;
             if (credits - px >= BUY_FLOOR) { action = { kind: 'mine', role: rs.role, type: rs.type, wp: loc.wp, price: px, sys, local: loc.local, have: rs.have[sys], want: rs.want }; break; }
-          } else if (await anchorBuy(rs.type, sys, allShips)) { lastBuyAt = now(); return; }   // dispatch anchor, buy next window
-        }
-      }
-    }
-    // 2) trader-starved system. For DEEP outposts (probe-seeded), buy traders LOCAL-ONLY (anchor a probe at the yard);
-    //    never fall back to a home buy + long migration. Near outposts/hub keep the local→home fallback.
-    if (!action && boughtTraders < MAX_BUY_TRADERS) {
-      const starved = staffSystems.find((ss) => traderN[ss.sys] < OUTPOST_TRADERS);
-      if (starved) {
-        const op = outposts.get(starved.sys);
-        const deep = op && op.deep;
-        const prefSys = deep ? [starved.sys] : [starved.sys, homeSystem];
-        let anyYard = false;
-        for (const t of TRADER_PREF) {                          // best hull first
-          const loc = await pickBuy(t, prefSys, shipWps);
-          if (!loc) continue;
-          anyYard = true;
-          const px = loc.price || 320_000;
-          if (MAX_TRADER_PRICE > 0 && loc.price && loc.price > MAX_TRADER_PRICE) continue;   // too pricey → try next hull / wait
-          if (credits - px >= BUY_FLOOR) { action = { kind: 'trader', role: starved.hub ? 'LIGHT' : 'OUTLIGHT', type: t, wp: loc.wp, price: px, sys: starved.sys, local: loc.local }; break; }
-        }
-        // deep outpost with no ship at a trader-selling yard → dispatch a probe anchor so next window buys local
-        if (!action && deep && !anyYard) { for (const t of TRADER_PREF) { if (await anchorBuy(t, starved.sys, allShips)) { lastBuyAt = now(); return; } } }
-      }
-    }
-    if (!action && boughtProbes < MAX_BUY_PROBES) {
-      let worst = null, worstGap = 0;
-      for (const ss of staffSystems) {
-        if (!ss.markets) continue;                              // unmapped — don't buy probes blind
-        const tgt = PROBE_TARGET_CAP > 0 ? Math.min(ss.markets, PROBE_TARGET_CAP) : ss.markets;
-        const gap = tgt - probeN[ss.sys];
-        if (gap > worstGap) { worstGap = gap; worst = ss; }
-      }
-      if (worst) {
-        const loc = await pickBuy('SHIP_PROBE', [worst.sys, homeSystem], shipWps);
-        const price = loc ? (loc.price || 26_000) : 0;
-        const tooPricey = loc && MAX_PROBE_PRICE > 0 && loc.price && loc.price > MAX_PROBE_PRICE;
-        if (tooPricey) log(`🛒 AUTOBUY probe @${id(loc.wp)} ${loc.price.toLocaleString()} > cap ${MAX_PROBE_PRICE.toLocaleString()} — waiting for cheaper`);
-        if (loc && !tooPricey && credits - price >= BUY_FLOOR) action = { kind: 'probe', role: worst.hub ? 'PROBE' : 'OUTPROBE', type: 'SHIP_PROBE', wp: loc.wp, price, sys: worst.sys, local: loc.local };
-        else if ((!loc || tooPricey) && !worst.hub && worst.sys !== homeSystem) {
-          // home is blocked (no local sink / above ceiling) → anchor a ship at the outpost's own probe-selling yard for cheap local buys
-          if (await anchorBuy('SHIP_PROBE', worst.sys, allShips)) { lastBuyAt = now(); return; }
+          } else { await anchorBuy(rs.type, sys, allShips); }   // dispatch a mining anchor (side-effect); don't block
         }
       }
     }
@@ -1058,7 +1083,7 @@ export function createExpansion(ctx) {
     launchWorker(bought);
     const where = action.local ? `LOCAL @${action.sys.slice(-4)}` : 'home→migrate';
     const mktCount = action.sys === (target && target.sys) ? tgtMarketWps.length : (outposts.get(action.sys)?.marketWps.length || '?');
-    if (action.kind === 'trader') { boughtTraders++; log(`🛒 AUTOBUY trader ${action.type} ${id(bought)} @${id(action.wp)} (~${action.price.toLocaleString()}) → ${action.sys} [${where}; traders ${traderN[action.sys]}→${traderN[action.sys] + 1}/${OUTPOST_TRADERS}, bought ${boughtTraders}/${MAX_BUY_TRADERS}]`); }
+    if (action.kind === 'trader') { boughtTraders++; log(`🛒 AUTOBUY trader ${action.type} ${id(bought)} @${id(action.wp)} (~${action.price.toLocaleString()}) → ${action.sys} [${where}; traders ${traderN[action.sys]}→${traderN[action.sys] + 1}/${traderTarget(action.sys)}, bought ${boughtTraders}/${MAX_BUY_TRADERS}]`); }
     else if (action.kind === 'mine') { boughtDrones++; const tag = action.role === 'MINESURVEY' ? 'surveyor' : action.role === 'MINEHAUL' ? 'ore-hauler' : 'mining drone'; log(`⛏ AUTOBUY ${tag} ${id(bought)} @${id(action.wp)} (~${action.price.toLocaleString()}) → ${action.sys} [${where}; ${action.have}→${action.have + 1}/${action.want}, mine-buys ${boughtDrones}/${MAX_BUY_DRONES}]`); }
     else { boughtProbes++; log(`🛒 AUTOBUY probe ${id(bought)} @${id(action.wp)} (~${action.price.toLocaleString()}) → ${action.sys} [${where}; probes ${probeN[action.sys]}→${probeN[action.sys] + 1}/${mktCount}, bought ${boughtProbes}/${MAX_BUY_PROBES}]`); }
   }
@@ -1088,9 +1113,9 @@ export function createExpansion(ctx) {
   // system (resume), or stranded at home/hub (e.g. an earlier home-buy, or idle gate-era drones) → assign to a colony
   // and let migrateToMine ferry it over. Safe because home mining (MINE_FEED) is off once the gate is built, so these
   // hulls are otherwise idle. Restart-safe; pulls every spare mining hull into the colonies.
-  async function adoptMiners() {
+  async function adoptMiners(fleet) {
     if (!MINE_SYSTEMS.length) return;
-    let all; try { all = await getAllShips(); } catch { return; }
+    let all = fleet; if (!all) { try { all = await getAllShips(); } catch { return; } }
     for (const s of all) {
       if (members.has(s.symbol)) continue;
       if (s.nav.status === 'IN_TRANSIT') continue;
@@ -1106,9 +1131,45 @@ export function createExpansion(ctx) {
     }
   }
 
+  // [HUB ADOPTION] The hub (target.sys) — unlike outposts — has no pass-1 "adopt in-system idle probes" step; selectMembers
+  // only claims MAX_PROBES at trigger time, so probes that ARRIVE at the hub later (e.g. migrated/redistributed) sit idle.
+  // This adopts free idle probes already AT the hub as PROBE-role scanners (zero migration), up to 1:1 with hub markets+yards.
+  async function adoptHubProbes(fleet) {
+    if (!target || !target.sys || !tgtMarketWps.length || recallActive()) return;
+    let all = fleet; if (!all) { try { all = await getAllShips(); } catch { return; } }
+    let have = 0; for (const [, m] of members) if (m.role === 'PROBE') have++;
+    const want = tgtMarketWps.length;
+    if (have >= want) return;
+    let neg = null; try { neg = typeof negotiator === 'function' ? negotiator() : null; } catch {}
+    for (const s of all) {
+      if (have >= want) break;
+      if (members.has(s.symbol)) continue;
+      if (s.frame?.symbol !== 'FRAME_PROBE') continue;
+      if (s.nav.status === 'IN_TRANSIT') continue;
+      if (s.nav.systemSymbol !== target.sys) continue;        // only probes already at the hub → zero migration
+      if (neg && (s.symbol === neg || s.symbol.endsWith('-' + neg))) continue;
+      members.set(s.symbol, { role: 'PROBE', scanned: new Set() });
+      launchWorker(s.symbol);
+      have++;
+      log(`🛰 adopted ${id(s.symbol)} → PROBE @${target.sys.slice(-4)} (hub coverage ${have}/${want})`);
+    }
+  }
+
   async function maybeTrigger() {
     if (!AUTO) return;
-    if (triggered) { checkRecallRelease(); if (OUTPOSTS.length && !outpostsReady) await setupOutposts(); await resolvePending(); await adoptMiners(); await autoBuy(); return; }
+    if (triggered) {
+      checkRecallRelease();
+      if (OUTPOSTS.length && !outpostsReady) await setupOutposts();
+      await resolvePending();
+      // [PERF] One fleet snapshot shared by adoptMiners + adoptHubProbes + autoBuy. Previously each call did its own
+      // getAllShips() (3 paginated reads/tick); under 100+ ship API contention that starved the 2 req/s limit and the
+      // expansion tick stalled (autoBuy entered but never finished). Sharing one read keeps the tick fast + responsive.
+      let fleet = null; try { fleet = await getAllShips(); } catch {}
+      await adoptMiners(fleet);
+      await adoptHubProbes(fleet);
+      await autoBuy(fleet);
+      return;
+    }
     if (!gateBuilt()) return;
     // resolve the target gate from the home gate's connections
     let conns = [];
