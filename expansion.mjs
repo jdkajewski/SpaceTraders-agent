@@ -1264,20 +1264,29 @@ export function createExpansion(ctx) {
       }
       if (worst) {
         // LOCAL-FIRST: buy the probe IN the system it will live (find the local shipyard that sells probes) so it needs no
-        // migration. Only systems with NO probe-selling yard of their own (e.g. JH56) fall back to home + migrate. This kills
-        // the home-gate pile-up while still covering yard-less systems. Home's own coverage buys at home (worst.sys==home).
+        // migration. [NEAR-SEED] If the target has NO probe yard of its own, DON'T drag a probe from the spiked home yard
+        // 7-11 jumps away — walk the outpost's gate path BACKWARD (target → … → home) and buy at the NEAREST system that
+        // sells probes where we have a ship. Migration becomes the shortest possible (often a single hop). Home stays the
+        // last-resort tail (it's the final element of every path). Hub/home coverage still buys at home (no op.path).
+        const op = outposts.get(worst.sys);
         const localYards = await shipyardsIn(worst.sys);
         const hasLocalProbeYard = localYards.some((y) => y.sells.has('SHIP_PROBE'));
-        const srcSystems = hasLocalProbeYard ? [worst.sys] : [worst.sys, homeSystem];
+        const pathBack = (op && op.path && op.path.length > 1) ? op.path.slice(0, -1).reverse() : [homeSystem];  // nearest→…→home
+        const srcSystems = hasLocalProbeYard ? [worst.sys] : [worst.sys, ...pathBack];
         const loc = await pickBuy('SHIP_PROBE', srcSystems, shipWps);
         const price = loc ? (loc.price || 26_000) : 0;
         const tooPricey = loc && MAX_PROBE_PRICE > 0 && loc.price && loc.price > MAX_PROBE_PRICE;
         if (tooPricey) log(`🛒 AUTOBUY probe @${id(loc.wp)} ${loc.price.toLocaleString()} > cap ${MAX_PROBE_PRICE.toLocaleString()} — waiting for cheaper`);
         if (loc && !tooPricey && credits - price >= BUY_FLOOR) action = { kind: 'probe', role: worst.hub ? 'PROBE' : 'OUTPROBE', type: 'SHIP_PROBE', wp: loc.wp, price, sys: worst.sys, local: loc.local };
-        else if ((!loc || tooPricey) && hasLocalProbeYard) {
-          // local yard exists but no ship there yet → anchor a ship at it (side-effect, NON-blocking: fall through so
-          // trader/mining buys still proceed this window). The anchored ship unlocks live prices for next window's buy.
-          await anchorBuy('SHIP_PROBE', worst.sys, allShips);
+        else if (!loc || tooPricey) {
+          // No buyable yard with a ship present (or only the over-priced home yard). Anchor a ship at the NEAREST
+          // path-system that sells probes (target first, then back toward home) so next window buys there cheaply.
+          const anchorCandidates = hasLocalProbeYard ? [worst.sys] : [worst.sys, ...pathBack];
+          for (const cs of anchorCandidates) {
+            let ys; try { ys = await shipyardsIn(cs); } catch { continue; }
+            if (!ys.some((y) => y.sells.has('SHIP_PROBE'))) continue;   // this path-system can't sell probes — try next
+            if (await anchorBuy('SHIP_PROBE', cs, allShips)) break;      // dispatched/awaiting an anchor here → stop
+          }
         }
       }
     }
