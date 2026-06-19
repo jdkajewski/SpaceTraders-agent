@@ -87,6 +87,11 @@ export function createExpansion(ctx) {
   const OUTPOSTS = [...listEnv('EXPAND_OUTPOSTS')];                              // e.g. "X1-DF86,X1-MB89" ('' = off)
   const OUTPOST_PROBES = Number(process.env.EXPAND_OUTPOST_PROBES || 2);        // probes per outpost (live market data)
   const OUTPOST_TRADERS = Number(process.env.EXPAND_OUTPOST_TRADERS || 1);      // default local traders per system
+  // [LARGE-MARKETS-ONLY] Only SEED (staff probes/traders + autobuy) a system once we've confirmed it has at least this
+  // many markets+yards. A candidate outpost is still CHARTED (cheap drift-probe) so exploration keeps revealing the
+  // frontier, but small systems are skipped for colonization so the 2 req/s budget concentrates on the fat markets.
+  // 0 = off (seed every configured outpost regardless of size — original behavior). Set via EXPAND_MIN_MARKETS.
+  const MIN_MARKETS = Number(process.env.EXPAND_MIN_MARKETS || 0);
   // [PER-SYSTEM TRADERS] Optional override of trader target per system, sized to each system's profitable intra-system
   // lane count (more lanes → more traders without saturating any single good). Format: "X1-ZV87:7,X1-JH56:6,X1-YK2:6,X1-YS20:1".
   // Any system not listed falls back to OUTPOST_TRADERS. Set via EXPAND_TRADERS_PER_SYS.
@@ -161,6 +166,10 @@ export function createExpansion(ctx) {
   const CHAIN_FEED = process.env.CHAIN_FEED === '1';
   const FEEDER_SHIPS = new Set((process.env.FEEDER_SHIPS || '').split(',').map((s) => s.trim()).filter(Boolean));
   const isFeeder = (sym) => { for (const f of FEEDER_SHIPS) { if (sym === f || sym.endsWith('-' + f)) return true; } return false; };
+  // [RESERVE] Hulls that the expansion engine must NEVER adopt into any role — parked for a special purpose (e.g. a
+  // warp-capable EXPLORER kept free for off-gate missions). Excluded from hauler/light/probe selection AND outpost crews.
+  const RESERVE_SHIPS = new Set((process.env.EXPAND_RESERVE || '').split(',').map((s) => s.trim()).filter(Boolean));
+  const isReservedShip = (sym) => { for (const r of RESERVE_SHIPS) { if (sym === r || sym.endsWith('-' + r)) return true; } return false; };
   const FEED_MIN_MARGIN_PCT = Number(process.env.FEED_MIN_MARGIN_PCT || 25);    // ignore loops thinner than this
   const FEED_SATURATION_N = Number(process.env.FEED_SATURATION_N || 2);         // per-market sell cap = tradeVolume × N
   const FEED_PREFER_MINED = process.env.FEED_PREFER_MINED !== '0';              // bias source toward our mined metals
@@ -229,6 +238,23 @@ export function createExpansion(ctx) {
     op.marketWps = wps;
     op.loaded = true;
     log(`🛰 outpost ${op.sys} mapped: ${wps.length} markets+yards, gate ${op.gateWp ? id(op.gateWp) : '?'}`);
+  }
+  // [LARGE-MARKETS-ONLY] Map a freshly-resolved outpost (public waypoint listing — needs no ship present) and decide
+  // whether it's worth colonizing. Sets op.tooSmall when its market+yard count is below MIN_MARKETS so every staffing
+  // path (crew adoption, idle-fill, autobuy) skips it. Returns true when the outpost should be SEEDED. With MIN_MARKETS=0
+  // this always returns true (original behavior). Failures to map default to KEEP (don't strand a system on a transient
+  // listing error) — it'll be re-evaluated by the lazy worker mapping.
+  async function seedWorthy(op) {
+    if (!MIN_MARKETS) return true;
+    if (op.tooSmall) return false;
+    if (!op.loaded) { try { await loadSystemInto(op); } catch { return true; } }
+    const n = op.marketWps.length;
+    if (n > 0 && n < MIN_MARKETS) {
+      op.tooSmall = true;
+      log(`🛰 SKIP-SEED ${op.sys} — only ${n} markets+yards (< EXPAND_MIN_MARKETS=${MIN_MARKETS}); charted but not colonized`);
+      return false;
+    }
+    return true;
   }
   async function scanMarketInto(wp, op) {
     try {
@@ -401,18 +427,18 @@ export function createExpansion(ctx) {
   // To JUMP cur→next we use the destination gate WAYPOINT from cur's connection list (cur must be charted; it is, since
   // it's on our occupied frontier). gateInfo caches: gateWp (own gate, from public waypoint listing — works uncharted),
   // conns [{sys,wp}] (needs charted), readable. We only persist-cache READABLE results so uncharted gates retry later.
-  const gateGraph = new Map();         // sys -> { gateWp, conns:[{sys,wp}], readable }
+  const gateGraph = new Map();         // sys -> { gateWp, conns:[{sys,wp}], readable, underCon }
   async function gateInfo(sys) {
     const cached = gateGraph.get(sys);
     if (cached && cached.readable) return cached;                 // only trust a readable (charted) cache
-    const info = { gateWp: cached?.gateWp || null, conns: [], readable: false };
+    const info = { gateWp: cached?.gateWp || null, conns: [], readable: false, underCon: cached?.underCon };
     try {
-      if (!info.gateWp) {
+      if (!info.gateWp || info.underCon === undefined) {
         let page = 1, total = Infinity, seen = 0;                 // find own gate via public waypoint listing (works uncharted)
-        while (seen < total && !info.gateWp) {
+        while (seen < total && (!info.gateWp || info.underCon === undefined)) {
           const r = await api('GET', `/systems/${sys}/waypoints?limit=20&page=${page}`);
           total = r.meta?.total ?? (r.data || []).length; seen += (r.data || []).length;
-          const g = (r.data || []).find((w) => w.type === 'JUMP_GATE'); if (g) info.gateWp = g.symbol;
+          const g = (r.data || []).find((w) => w.type === 'JUMP_GATE'); if (g) { info.gateWp = g.symbol; info.underCon = !!g.isUnderConstruction; }
           if (!r.data || !r.data.length) break; page++;
         }
       }
@@ -433,10 +459,15 @@ export function createExpansion(ctx) {
       const s = q.shift();
       const info = await gateInfo(s);
       if (!info.readable) continue;                              // can't see past an uncharted gate
+      // [REACHABILITY] A jump needs BOTH gates BUILT: you jump OUT of s's gate INTO c's gate. An under-construction
+      // gate still LISTS its connections (the API returns them), but any jump from/into it is rejected. So: (a) never
+      // expand OUT of an under-construction transit system, and (b) never accept a destination whose own gate is unbuilt
+      // (the UZ64 trap). This is what stranded the GX17/UG37 probes — the bot routed THROUGH unbuilt HC40/XM56 gates.
+      if (info.underCon && s !== from) continue;                 // (a) can't jump out of an unbuilt gate
       for (const { sys: c } of info.conns) {
         if (prev[c] !== undefined) continue;
         prev[c] = s;
-        if (c === to) { const p = []; let n = to; while (n !== null) { p.unshift(n); n = prev[n]; } return p; }
+        if (c === to) { const ci = await gateInfo(to); if (ci.underCon) { prev[c] = undefined; continue; } const p = []; let n = to; while (n !== null) { p.unshift(n); n = prev[n]; } return p; }  // (b) dest gate must be built to jump IN
         q.push(c);
       }
     }
@@ -1000,14 +1031,14 @@ export function createExpansion(ctx) {
 
     // HAULER: explicit, else largest-cargo non-probe with fuel>=400 (can clear the long gate legs). [CHAIN-FEED] never a feeder.
     let haulers;
-    if (EXPLICIT_HAULERS.size) haulers = all.filter((s) => byId(EXPLICIT_HAULERS, s) && !isNeg(s) && !isFeeder(s.symbol));
-    else { const cand = all.filter((s) => !isProbe(s) && !isNeg(s) && !isFeeder(s.symbol) && s.cargo.capacity >= 40 && s.fuel.capacity >= 400).sort((a, b) => (b.fuel.capacity - a.fuel.capacity) || (b.cargo.capacity - a.cargo.capacity)); haulers = cand.slice(0, 1); }
+    if (EXPLICIT_HAULERS.size) haulers = all.filter((s) => byId(EXPLICIT_HAULERS, s) && !isNeg(s) && !isFeeder(s.symbol) && !isReservedShip(s.symbol));
+    else { const cand = all.filter((s) => !isProbe(s) && !isNeg(s) && !isFeeder(s.symbol) && !isReservedShip(s.symbol) && s.cargo.capacity >= 40 && s.fuel.capacity >= 400).sort((a, b) => (b.fuel.capacity - a.fuel.capacity) || (b.cargo.capacity - a.cargo.capacity)); haulers = cand.slice(0, 1); }
     const haulerSet = new Set(haulers.map((s) => s.symbol));
 
     // LIGHT: explicit, else a smaller non-probe hull not already chosen as hauler. [CHAIN-FEED] never a feeder.
     let light;
-    if (EXPLICIT_LIGHT.size) light = all.filter((s) => byId(EXPLICIT_LIGHT, s) && !isNeg(s) && !isFeeder(s.symbol));
-    else { const cand = all.filter((s) => !isProbe(s) && !isNeg(s) && !isFeeder(s.symbol) && !haulerSet.has(s.symbol) && s.cargo.capacity >= 20 && s.fuel.capacity >= 200).sort((a, b) => a.cargo.capacity - b.cargo.capacity); light = cand.slice(0, 1); }
+    if (EXPLICIT_LIGHT.size) light = all.filter((s) => byId(EXPLICIT_LIGHT, s) && !isNeg(s) && !isFeeder(s.symbol) && !isReservedShip(s.symbol));
+    else { const cand = all.filter((s) => !isProbe(s) && !isNeg(s) && !isFeeder(s.symbol) && !isReservedShip(s.symbol) && !haulerSet.has(s.symbol) && s.cargo.capacity >= 20 && s.fuel.capacity >= 200).sort((a, b) => a.cargo.capacity - b.cargo.capacity); light = cand.slice(0, 1); }
     const lightSet = new Set(light.map((s) => s.symbol));
 
     // PROBES: explicit, else up to MAX_PROBES idle probes — never the negotiator (it must stay home to negotiate)
@@ -1032,7 +1063,7 @@ export function createExpansion(ctx) {
     try { all = await getAllShips(); } catch (e) { log(`🛰 outpost fleet read ERR ${e.message}`); return; }
     const isProbe = (s) => s.frame?.symbol === 'FRAME_PROBE';
     const reserved = new Set();
-    for (const k of ['GATE_HAULERS', 'INPUT_FEEDERS', 'MINE_TRANSPORT', 'MINE_FUNNEL', 'MINE_BATCH', 'CONTRACT_RUNNER', 'NEGOTIATOR', 'CONTRACT_NEGOTIATOR', 'EXPAND_HAULERS', 'EXPAND_LIGHT', 'EXPAND_PROBES'])
+    for (const k of ['GATE_HAULERS', 'INPUT_FEEDERS', 'MINE_TRANSPORT', 'MINE_FUNNEL', 'MINE_BATCH', 'CONTRACT_RUNNER', 'NEGOTIATOR', 'CONTRACT_NEGOTIATOR', 'EXPAND_HAULERS', 'EXPAND_LIGHT', 'EXPAND_PROBES', 'EXPAND_RESERVE'])
       for (const t of listEnv(k)) reserved.add(t);
     // also reserve the resolved contract negotiator (its bot2 DEFAULT isn't visible via env) — never poach it,
     // or contracts stall with "ship not docked" errors. Passed from bot2 ctx as negotiator().
@@ -1051,8 +1082,10 @@ export function createExpansion(ctx) {
       if (!path) { pendingOutposts.add(sys); log(`🛰 outpost ${sys} — path not chartable yet → pending (will retry as frontier charts)`); continue; }
       const gInfo = await gateInfo(sys);
       const deep = (path.length - 1) > 2;
-      outposts.set(sys, { sys, gateWp: gInfo.gateWp, path, deep, markets: {}, marketWps: [], loaded: false });
-      log(`🛰 outpost ${sys} path ${path.map((s) => s.slice(-4)).join('→')} (${path.length - 1} jumps${deep ? ', DEEP→probe-seed+buy-local' : ''})`);
+      const op = { sys, gateWp: gInfo.gateWp, path, deep, markets: {}, marketWps: [], loaded: false };
+      outposts.set(sys, op);
+      await seedWorthy(op);   // [LARGE-MARKETS-ONLY] map now + flag tooSmall so staffing below skips small systems
+      log(`🛰 outpost ${sys} path ${path.map((s) => s.slice(-4)).join('→')} (${path.length - 1} jumps${deep ? ', DEEP→probe-seed+buy-local' : ''}${op.tooSmall ? ', TOO-SMALL→skip-seed' : ''})`);
     }
     if (!outposts.size) { log('🛰 no reachable outposts yet — will retry'); return; }
     // Per-outpost probe target = 1:1 with markets (fresh data on every market); fall back to OUTPOST_PROBES until
@@ -1065,6 +1098,7 @@ export function createExpansion(ctx) {
     for (const s of all) {
       if (!free(s)) continue; const sys = s.nav.systemSymbol;
       if (!outposts.has(sys)) continue;
+      if (outposts.get(sys).tooSmall) continue;                 // [LARGE-MARKETS-ONLY] don't colonize small systems
       if (isProbe(s)) { crews[sys].push(assign(s, sys)); probeCnt[sys]++; }
       else if (isTrader(s)) { crews[sys].push(assign(s, sys)); traderCnt[sys]++; }
     }
@@ -1076,6 +1110,7 @@ export function createExpansion(ctx) {
     let pi = 0, ti = 0;
     for (const sys of outposts.keys()) {
       const op = outposts.get(sys); const ptgt = probeTgt(sys);
+      if (op.tooSmall) continue;                                // [LARGE-MARKETS-ONLY] skip idle-fill for small systems
       if (!op.deep) while (traderCnt[sys] < traderTarget(sys) && ti < idleTraders.length) { crews[sys].push(assign(idleTraders[ti++], sys)); traderCnt[sys]++; }
       while (probeCnt[sys] < ptgt && pi < idleProbes.length) { crews[sys].push(assign(idleProbes[pi++], sys)); probeCnt[sys]++; }
       log(`🛰 OUTPOST ${sys} (gate ${id(op.gateWp)}${op.deep ? ', DEEP' : ''}) crew[P${probeCnt[sys]}/${ptgt} T${traderCnt[sys]}/${op.deep ? 'local' : traderTarget(sys)}]: ${crews[sys].join(' ') || 'NONE (seed by autobuy)'}`);
@@ -1095,8 +1130,13 @@ export function createExpansion(ctx) {
       if (!path) continue;                                       // still not chartable — keep pending
       const gInfo = await gateInfo(sys);
       const deep = (path.length - 1) > 2;
-      outposts.set(sys, { sys, gateWp: gInfo.gateWp, path, deep, markets: {}, marketWps: [], loaded: false });
+      const op = { sys, gateWp: gInfo.gateWp, path, deep, markets: {}, marketWps: [], loaded: false };
+      outposts.set(sys, op);
       pendingOutposts.delete(sys);
+      if (!(await seedWorthy(op))) {                              // [LARGE-MARKETS-ONLY] charted but too small — don't seed
+        log(`🛰 RESOLVED frontier ${sys} (${path.length - 1} jumps) — TOO-SMALL (${op.marketWps.length} markets), charted not seeded`);
+        continue;
+      }
       log(`🛰 RESOLVED frontier ${sys} path ${path.map((s) => s.slice(-4)).join('→')} (${path.length - 1} jumps) — seeding probe`);
       // seed: assign the nearest idle non-home probe to this new outpost (it migrates + charts on arrival)
       try { all = all || await getAllShips(); } catch { all = []; }
@@ -1185,7 +1225,7 @@ export function createExpansion(ctx) {
     // OUTPROBE / OUTLIGHT (system = m.opSys). Previously the hub was skipped entirely, so YK2 got NO autobuy coverage.
     const staffSystems = [];
     if (target && target.sys) staffSystems.push({ sys: target.sys, markets: tgtMarketWps.length, gateWp: target.gateWp, hub: true });
-    if (!recallActive()) for (const sys of outposts.keys()) { const op = outposts.get(sys); staffSystems.push({ sys, markets: op.marketWps.length || 0, gateWp: op.gateWp, hub: false }); }   // [RECALL] hub-only buys while concentrating
+    if (!recallActive()) for (const sys of outposts.keys()) { const op = outposts.get(sys); if (op.tooSmall) continue; staffSystems.push({ sys, markets: op.marketWps.length || 0, gateWp: op.gateWp, hub: false }); }   // [RECALL] hub-only buys while concentrating; [LARGE-MARKETS-ONLY] never autobuy crew for small systems
 
     // current resident staffing per system (counts in-transit migrators too, so we never over-order)
     const probeN = {}, traderN = {};
@@ -1367,6 +1407,7 @@ export function createExpansion(ctx) {
         if (!MINE_SYSTEMS.includes(sys)) continue;               // only adopt a hauler already AT a colony (no migration)
         if (haulN[sys] >= MINE_HAULERS_PER) continue;
         if (s.frame?.symbol === 'FRAME_PROBE') continue;
+        if (isFeeder(s.symbol) || isReservedShip(s.symbol)) continue;   // never poach a feeder/reserved (e.g. warp EXPLORER)
         const mounts = (s.mounts || []).map((m) => m.symbol || m);
         if (mounts.some((x) => /MINING_LASER|SURVEYOR/.test(x))) continue;   // mining hulls handled above
         if ((s.cargo?.capacity || 0) < 20) continue;             // must actually carry ore
