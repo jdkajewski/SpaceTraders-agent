@@ -60,6 +60,16 @@ export interface PriceSettleState {
   low?: number;
 }
 
+/** [RECOVERY] Per-ship orphan-salvage loop-break guard (marketless-waypoint fix). */
+export interface SalvageGuard {
+  /** Signature of the held sellable cargo this guard tracks; reset when it changes. */
+  sig: string;
+  /** Count of at-sink resell attempts on this cargo, capped to stop a stale-sink loop. */
+  attempts: number;
+  /** Set once the "no market buys this yet" release has been logged, to avoid per-tick spam. */
+  released?: boolean;
+}
+
 /** Active-contract pipeline state (bot2 `activeContractInfo`). */
 export interface ActiveContractInfo {
   id: string;
@@ -129,6 +139,14 @@ export interface BotState {
   // ── recovery ───────────────────────────────────────────────────────────────
   /** In-memory mirror of persisted per-ship intents (shipSym -> intent). */
   intents: Record<string, Intent>;
+  /**
+   * [RECOVERY] Per-ship orphan-salvage loop-break guard. Keyed by shipSym; `sig` is the held
+   * sellable-cargo signature, `attempts` caps at-sink resell retries (stale sink can't loop us),
+   * and `released` de-dupes the "no buyer yet" release log. Reset whenever the cargo signature
+   * changes so a ship is re-evaluated as markets are discovered. Prevents the marketless-waypoint
+   * salvage loop (mined ore parked at an asteroid with no market 404'd `GET /market` forever).
+   */
+  salvageGuard: Record<string, SalvageGuard>;
 
   // ── contracts (Wave-4 fills these; discovered pre-workers in main) ──────────
   activeContractInfo: ActiveContractInfo | null;
@@ -246,6 +264,7 @@ export function createState(cfg: Config, opts: CreateStateOptions = {}): BotStat
     currentPhase: PHASES.BOOTSTRAP,
 
     intents: {},
+    salvageGuard: {},
 
     activeContractInfo: null,
     contractOwner: null,

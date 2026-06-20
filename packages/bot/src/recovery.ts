@@ -19,6 +19,14 @@ import { logger } from './core/logger.js';
 
 const log = logger.child({ mod: 'recovery' });
 
+/**
+ * [RECOVERY] Max at-sink resell attempts on the same orphan-cargo signature before recovery gives up
+ * and releases the ship to the normal loop. Bounds the salvage path so a stale/unsupplied sink can't
+ * make a ship re-fly + re-`sell` forever. Not an env lever (kept local; the marketless case never
+ * even reaches a sink, so this only guards the rarer stale-sink loop).
+ */
+const SALVAGE_MAX_ATTEMPTS = 3;
+
 /** Ride-along entry stored inside `intent.extras.rideAlongs` (DRIFT #21). */
 export interface StoredRideAlong {
   good: string;
@@ -256,6 +264,7 @@ export async function reconcileHeldCargo(
   const intent = state.intents[shipSym];
   if (!sellable.length) {
     if (intent) await clearIntent(state, persistence, shipSym); // nothing held → stale intent is moot
+    delete state.salvageGuard[shipSym]; // hold is clear → reset the loop-break guard
     return false;
   }
 
@@ -301,20 +310,68 @@ export async function reconcileHeldCargo(
     await clearIntent(state, persistence, shipSym); // intent good not actually held → drop stale intent, fall through to salvage
   }
 
-  // Case 2: orphan cargo with no usable intent → salvage at the best sink so capital isn't stranded.
+  // Case 2: orphan cargo with no usable intent → salvage at a market that BUYS it so capital isn't
+  // stranded. Two loop-breaks (issue: marketless-waypoint salvage): (1) NEVER sell in place at a
+  // waypoint with no buyer — a mining hull parked at an asteroid would 404 `GET /market` every tick
+  // forever; instead step aside and let the normal loop route the cargo. (2) Cap at-sink resell
+  // retries so a stale/unsupplied sink can't loop us either.
   const ps = (state.perShip[shipSym] = state.perShip[shipSym] || { net: 0, lanes: 0, last: '' });
-  ps.last = `SALVAGE ${sellable.map((i) => i.symbol).join(',')}`;
-  log.info(`⤓ ${shipSym.slice(-3)} salvaging orphan cargo: ${sellable.map((i) => `${i.units} ${i.symbol}`).join(', ')}`);
+  const here = ship.nav.waypointSymbol;
+  const sig = sellable.map((i) => i.symbol).slice().sort().join(',');
+  let guard = state.salvageGuard[shipSym];
+  if (!guard || guard.sig !== sig) guard = state.salvageGuard[shipSym] = { sig, attempts: 0 };
+
+  // Partition held goods into "a known market buys this" vs "nothing buys it yet".
+  const targets: { item: { symbol: string; units: number }; wp: string }[] = [];
   for (const item of sellable) {
     const sink = bestSink(markets, item.symbol);
+    if (sink) targets.push({ item, wp: sink.wp });
+  }
+
+  // [MARKETLESS LOOP-BREAK] No known buyer for ANY held good (e.g. mined ore sitting at a marketless
+  // asteroid on a cold DB). Selling in place would 404 forever, so release the ship to the normal
+  // loop (mining/trade routes cargo) and don't re-attempt until a buyer is actually known. Cheap to
+  // re-check each tick, so it auto-promotes to salvage once a market for the good is discovered.
+  if (!targets.length) {
+    if (!guard.released) {
+      guard.released = true;
+      ps.last = `HOLD ${sellable.map((i) => i.symbol).join(',')} (no buyer)`;
+      log.info(
+        `⤓ ${shipSym.slice(-3)} holding orphan cargo no market buys yet (${sellable.map((i) => `${i.units} ${i.symbol}`).join(', ')}) — releasing to normal loop`,
+      );
+    }
+    await clearIntent(state, persistence, shipSym);
+    return false; // step aside; recovery did not act
+  }
+
+  // [RETRY CAP] A real sink exists but resells keep failing (stale price / no supply) → don't re-fly
+  // and re-404 forever. After the cap, release to the normal loop instead of looping.
+  if (guard.attempts >= SALVAGE_MAX_ATTEMPTS) {
+    log.warn(`⤓ ${shipSym.slice(-3)} salvage gave up after ${guard.attempts} attempt(s) on ${sig} — releasing to normal loop`);
+    await clearIntent(state, persistence, shipSym);
+    return false;
+  }
+  guard.attempts++;
+
+  ps.last = `SALVAGE ${targets.map((t) => t.item.symbol).join(',')}`;
+  log.info(`⤓ ${shipSym.slice(-3)} salvaging orphan cargo: ${targets.map((t) => `${t.item.units} ${t.item.symbol}`).join(', ')}`);
+  let soldAny = false;
+  for (const { item, wp } of targets) {
     try {
-      if (sink && sink.wp !== ship.nav.waypointSymbol) await goTo(shipSym, sink.wp);
+      if (wp !== here) await goTo(shipSym, wp);
       const s = await sell(shipSym, item.symbol);
-      log.info(`⤓ ${shipSym.slice(-3)} salvaged ${item.units} ${item.symbol} (+${(s.got || 0).toLocaleString()})`);
+      if ((s.got || 0) > 0) {
+        soldAny = true;
+        log.info(`⤓ ${shipSym.slice(-3)} salvaged ${item.units} ${item.symbol} (+${(s.got || 0).toLocaleString()})`);
+      } else {
+        // Don't log a phantom `(+0)` success — the good is still aboard; the retry cap bounds re-tries.
+        log.warn(`⤓ ${shipSym.slice(-3)} salvage ${item.symbol}: market did not buy (kept aboard)`);
+      }
     } catch (e) {
       log.warn(`${shipSym} salvage ${item.symbol} ERR ${(e as Error).message}`);
     }
   }
+  if (soldAny) delete state.salvageGuard[shipSym]; // made progress → fresh slate (cargo sig changes next tick anyway)
   await clearIntent(state, persistence, shipSym);
   return true;
 }
