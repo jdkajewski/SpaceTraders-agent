@@ -130,6 +130,15 @@ const RawConfigSchema = z.object({
   COVERAGE_RECHECK_MIN_MS: num(600_000), // floor — promising uncovered market re-visited at most this often (10 min)
   COVERAGE_RECHECK_MAX_MS: num(21_600_000), // ceiling — even a dead market is re-checked this often, never forgotten (6 h)
 
+  // ── global scan-budget priority scheduler (issue #2, phase 5) ──────────────────────────────────
+  // PR1 gave each market a per-market interval; this makes the SHARED ~2 req/s budget explicit. When
+  // many markets are due in one sweep, scans are granted highest value×staleness first (not FIFO) up
+  // to a per-sweep budget that reserves headroom for trade/nav. Default OFF ⇒ legacy fetch-all-due.
+  SCAN_BUDGET_ON: boolOff, // gate the priority scheduler; off ⇒ refreshDue fetches every due market in order
+  SCAN_BUDGET_REQ_PER_SEC: num(2), // account request ceiling the budget is computed against (mirror the client)
+  SCAN_BUDGET_REQ_FRACTION: num(0.6), // fraction of sweep capacity scans may spend (rest reserved for trades)
+  SCAN_BUDGET_MAX_PER_SWEEP: num(0), // absolute hard cap on reads per sweep; 0 ⇒ fraction-derived only
+
   // ── phase / budget ──────────────────────────────────────────────────────
   BOOTSTRAP_FLEET_MIN: num(2),
   CREDIT_TARGET: num(0),

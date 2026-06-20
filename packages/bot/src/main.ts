@@ -117,6 +117,7 @@ export async function main(): Promise<void> {
         trips: l.trips,
       })),
       ...(state.coverage !== undefined ? { coverage: state.coverage } : {}),
+      ...(markets.scanBudgetStatus() !== null ? { scanBudget: markets.scanBudgetStatus() } : {}),
     };
   };
 

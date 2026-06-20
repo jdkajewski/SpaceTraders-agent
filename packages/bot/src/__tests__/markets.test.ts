@@ -73,6 +73,48 @@ describe('markets: coveragePlan (issue #2 phases 4+7 wiring)', () => {
   });
 });
 
+describe('markets: scan-budget priority scheduler (issue #2 phase 5 wiring)', () => {
+  const fresh: Market = { symbol: 'A', tradeGoods: [{ symbol: 'X', purchasePrice: 50, sellPrice: 70 }] } as unknown as Market;
+  const counting = () => {
+    let gets = 0;
+    const c = {
+      api: async (_m: string, path: string) => {
+        if (path.includes('/market')) {
+          gets += 1;
+          return { data: fresh } as ApiEnvelope<Market>;
+        }
+        return { data: {} } as ApiEnvelope<unknown>;
+      },
+    } as unknown as SpaceTradersClient;
+    return { client: c, gets: () => gets };
+  };
+
+  it('is null without the lever (legacy fetch-all-due, no budget metric)', async () => {
+    // value budget on (cfg) but SCAN_BUDGET_ON unset → every due market fetched, no scanBudget status.
+    const cfg = loadConfig({});
+    const { client: c } = counting();
+    const m = createMarketsService({ client: c, persistence, coords, maxd: 2000, cfg, marketWaypoints: ['A', 'B', 'C'] });
+    await m.getMarkets();
+    expect(m.scanBudgetStatus()).toBeNull();
+  });
+
+  it('caps a due-burst to the per-sweep budget and defers the rest', async () => {
+    // Three never-scanned (all due) markets, budget hard-capped to 1 → fetch 1, defer 2.
+    const cfg = loadConfig({ SCAN_BUDGET_ON: '1', SCAN_BUDGET_MAX_PER_SWEEP: '1' });
+    const { client: c, gets } = counting();
+    const m = createMarketsService({ client: c, persistence, coords, maxd: 2000, cfg, marketWaypoints: ['A', 'B', 'C'] });
+    await m.getMarkets();
+    expect(gets()).toBe(1); // spent exactly the budget, not all 3 due markets
+    const st = m.scanBudgetStatus();
+    expect(st).not.toBeNull();
+    expect(st!.perSweep).toBe(1);
+    expect(st!.due).toBe(3);
+    expect(st!.granted).toBe(1);
+    expect(st!.deferred).toBe(2);
+  });
+});
+
+
 describe('markets: recheckScan (issue #2 phase 7)', () => {
   const cfg: Config = loadConfig({});
 
