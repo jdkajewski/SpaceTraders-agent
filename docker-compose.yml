@@ -46,16 +46,28 @@ services:
       context: .
       dockerfile: packages/bot/Dockerfile
     restart: unless-stopped
-    # Operator launch profile (live token + flag set) lives in ./deploy/bot.env, loaded if present.
-    # Left absent, the bot comes up in DRY_RUN (no live SpaceTraders calls, no token needed) so
-    # `docker compose up` smoke-tests the full stack out of the box.
+    # Operator launch profiles (live token + flag set) live in ./deploy/*.env, loaded if present and
+    # injected straight into the container (this is how the FLEET_SCALE/CONTRACTS/GALAXY_CRAWL/etc.
+    # levers reach the bot — they are NOT in the `environment:` block below). `bot.greenfield.env` is
+    # the reset-agnostic LIVE profile (see deploy/bot.greenfield.env.example); `bot.env` is the legacy
+    # profile. Listed last wins when both exist. With NEITHER present the bot comes up in DRY_RUN
+    # (no live SpaceTraders calls, no token needed) so `docker compose up` smoke-tests the stack.
+    #
+    # ⚠ For a LIVE run also pass the same file via `--env-file` so DRY_RUN=0 + the token resolve in
+    # the `environment:` block (which overrides env_file and defaults DRY_RUN→1 otherwise):
+    #     docker compose --env-file deploy/bot.greenfield.env up --build
     env_file:
       - path: ./deploy/bot.env
+        required: false
+      - path: ./deploy/bot.greenfield.env
         required: false
     environment:
       API_BASE_URL: ${API_BASE_URL:-http://api:3000}
       BOT_KEY: ${BOT_KEY:-}
-      SYSTEM: ${SYSTEM:-X1-PP30}
+      # SYSTEM is intentionally NOT set here so it stays sourced from the env_file (or host env).
+      # Left unset on a live run (DRY_RUN=0), the bot auto-detects home from the agent's HQ via
+      # resolveHome() — reset-agnostic, no hardcoded system. Pin SYSTEM in deploy/bot.env only to
+      # override auto-detect. (A compose `environment:` entry would clobber the env_file value.)
       # Default-on smoke mode. Set DRY_RUN=0 (and supply a token) in deploy/bot.env for a live run.
       DRY_RUN: ${DRY_RUN:-1}
       DRY_RUN_CREDITS: ${DRY_RUN_CREDITS:-250000}
