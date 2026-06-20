@@ -194,6 +194,12 @@ export interface BotState {
     covered: number;
     probesSaved: number;
     recheckDue: number;
+    /** Markets the brain WOULD redeploy a probe off (DEAD prune candidates) — dry-run signal. */
+    wouldPrune: number;
+    /** Of those, how many have a movable probe parked + a value destination → would actually move. */
+    wouldRedeploy: number;
+    /** Pure-observe baseline active (telemetry only, no fleet mutations). */
+    observe: boolean;
     adaptive: boolean;
     prune: boolean;
     updatedAt: number;

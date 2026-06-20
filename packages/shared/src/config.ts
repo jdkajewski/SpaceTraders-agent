@@ -119,6 +119,8 @@ const RawConfigSchema = z.object({
   // switches default OFF, so with defaults `fleet/scale` is byte-for-byte the legacy behaviour.
   FLEET_COVERAGE_ADAPTIVE: boolOff, // value-driven probe TARGET + PLACEMENT (non-mutating to existing probes)
   FLEET_COVERAGE_PRUNE: boolOff, // also redeploy probes off DEAD markets + cold re-visit (FLEET-MUTATING)
+  FLEET_COVERAGE_OBSERVE: boolOff, // pure-observe baseline: run the brain for TELEMETRY ONLY (wouldPrune/wouldRedeploy),
+  // legacy probe buys/placement unchanged, no redeploys — even if ADAPTIVE/PRUNE are set (OBSERVE forces observe).
   COVERAGE_HOT_MULT: num(2), // rel value ≥ 2× fleet mean ⇒ HOT
   COVERAGE_WARM_MULT: num(0.75), // rel ≥ 0.75× ⇒ WARM
   COVERAGE_COLD_MULT: num(0.2), // rel ≥ 0.2× ⇒ COLD; below ⇒ DEAD (never worth a parked probe)
