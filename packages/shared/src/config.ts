@@ -111,6 +111,10 @@ const RawConfigSchema = z.object({
   SCAN_VOL_FACTOR_MAX: num(4), // clamp on volFactor (churning market shortens interval)
   LANE_VALUE_ALPHA: num(0.3), // EWMA weight for realized net per lane
   LANE_VALUE_HALFLIFE_MS: num(1_800_000), // staleness half-life for a lane's realized value (30 min)
+  // LANE_VALUE_* validated on live UPRISING: realized net/lane was highly dispersed (median 21,980,
+  // p90 60,480, min −90,240, 15.5% negative) so a smoothing alpha 0.3 tames per-trip noise; lanes
+  // completed fleet-wide at ~0.8/min, for which a 30-min half-life keeps stale lanes fading without
+  // thrashing. Realized value concentrated in ~12 sinks/goods → TOPK 20 comfortably covers them.
   LANE_TOPK: num(20), // top-K lanes retained in the registry status block
 
   // ── value-driven coverage tiering + reversible pruning + cold re-check (issue #2, phases 4+7) ──
@@ -122,6 +126,10 @@ const RawConfigSchema = z.object({
   COVERAGE_HOT_MULT: num(2), // rel value ≥ 2× fleet mean ⇒ HOT
   COVERAGE_WARM_MULT: num(0.75), // rel ≥ 0.75× ⇒ WARM
   COVERAGE_COLD_MULT: num(0.2), // rel ≥ 0.2× ⇒ COLD; below ⇒ DEAD (never worth a parked probe)
+  // The DEAD cutoff (rel < 0.2× fleet mean) targets the genuinely-dead tail; live UPRISING showed a
+  // 15.5% negative-lane share — the empirical dead-market fraction the DEAD tier + scan de-prioritising
+  // should catch (see the replay calibration test, which asserts the cheap tier captures a comparable
+  // share of the real value distribution).
   COVERAGE_TARGET_BASE: num(3), // value-driven probe target floor before signal bonuses
   COVERAGE_LANE_BONUS: num(1), // +N covered markets per active lane (maturity → wider coverage)
   COVERAGE_FLEET_BONUS: num(0.5), // +N covered markets per ship in the fleet
@@ -136,7 +144,11 @@ const RawConfigSchema = z.object({
   // to a per-sweep budget that reserves headroom for trade/nav. Default OFF ⇒ legacy fetch-all-due.
   SCAN_BUDGET_ON: boolOff, // gate the priority scheduler; off ⇒ refreshDue fetches every due market in order
   SCAN_BUDGET_REQ_PER_SEC: num(2), // account request ceiling the budget is computed against (mirror the client)
-  SCAN_BUDGET_REQ_FRACTION: num(0.6), // fraction of sweep capacity scans may spend (rest reserved for trades)
+  // Calibrated from 13.45h of live UPRISING (.mjs) telemetry: observed request mix was scans 40.1% /
+  // actions 55.7% / price-reads 4.3%. 0.4 caps scans at their empirical share so actions keep their
+  // observed ~60% — matches Steer #2's action-protection intent. At the observed steady-state scan
+  // rate (5.74/min) this cap never binds; it only bounds a synchronized due-burst.
+  SCAN_BUDGET_REQ_FRACTION: num(0.4), // fraction of sweep capacity scans may spend (rest reserved for trades)
   SCAN_BUDGET_MAX_PER_SWEEP: num(0), // absolute hard cap on reads per sweep; 0 ⇒ fraction-derived only
 
   // ── phase / budget ──────────────────────────────────────────────────────
