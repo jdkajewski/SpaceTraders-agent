@@ -127,6 +127,11 @@ export function createGalaxyCrawler(deps: GalaxyCrawlerDeps): GalaxyCrawler {
   const edges = new Map<string, PathEdge & { fromGateWp: string | null; toGateWp: string | null }>(); // key `${from}->${to}`
   const queue: string[] = [];
   const queued = new Set<string>();
+  // systems already crawled in the CURRENT full pass — prevents the BFS from
+  // re-enqueuing nodes forever on the (bidirectional) gate graph. Reset at the
+  // start of each runFullPass; refresh/full-richness passes crawl directly and
+  // don't drain `queue`, so this guard never blocks them.
+  const crawledThisPass = new Set<string>();
 
   // dirty sets accumulate upserts between flushes
   const dirtySystems = new Set<string>();
@@ -176,7 +181,7 @@ export function createGalaxyCrawler(deps: GalaxyCrawlerDeps): GalaxyCrawler {
   }
 
   function enqueue(sym: string): void {
-    if (queued.has(sym)) return;
+    if (queued.has(sym) || crawledThisPass.has(sym)) return;
     queued.add(sym);
     queue.push(sym);
   }
@@ -230,6 +235,7 @@ export function createGalaxyCrawler(deps: GalaxyCrawlerDeps): GalaxyCrawler {
   // ── one system: counts-tier crawl ───────────────────────────────────────────
   async function crawlSystem(sym: string): Promise<void> {
     const n = node(sym);
+    crawledThisPass.add(sym);
 
     // universe coords (best-effort, for the visualization) + quick gate hint
     try {
@@ -507,6 +513,7 @@ export function createGalaxyCrawler(deps: GalaxyCrawlerDeps): GalaxyCrawler {
   // ── passes ────────────────────────────────────────────────────────────────────
   async function runFullPass(): Promise<CrawlSummary> {
     await loadFromDb();
+    crawledThisPass.clear();
     // seed frontier: never-crawled known systems first, then home
     const never = [...nodes.values()].filter((n) => n.lastCrawledAt === 0).map((n) => n.symbol);
     for (const s of never) enqueue(s);
@@ -539,6 +546,14 @@ export function createGalaxyCrawler(deps: GalaxyCrawlerDeps): GalaxyCrawler {
     for (const n of stale) {
       if (stopped) break;
       await crawlSystem(n.symbol);
+    }
+    // re-crawling can surface NEW systems (a gate that just finished now exposes
+    // connections) — drain that frontier so perpetual mapping keeps expanding.
+    while (queue.length && !stopped) {
+      const sym = queue.shift()!;
+      queued.delete(sym);
+      if (crawledThisPass.has(sym)) continue;
+      await crawlSystem(sym);
     }
     if (stale.length) {
       recomputeReach();
