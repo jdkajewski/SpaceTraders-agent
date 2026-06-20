@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { createMarketsService } from '../market/markets.js';
-import type { CoordsMap, Market } from '@st/shared';
-import type { PersistenceClient, SpaceTradersClient } from '../interfaces.js';
+import { loadConfig, type Config, type CoordsMap, type Market } from '@st/shared';
+import type { ApiEnvelope, PersistenceClient, SpaceTradersClient } from '../interfaces.js';
 
 const coords: CoordsMap = { A: [0, 0], B: [10, 0] };
 
@@ -45,5 +45,52 @@ describe('markets: updateBaselines', () => {
     m.updateBaselines(marketsWith(140)); // margin 40 → ema 80·0.8 + 40·0.2 = 72
     expect(m.goodEMA().get('X')).toBeCloseTo(72, 6);
     expect(m.lastMargins()['X']).toBe(40);
+  });
+});
+
+describe('markets: coveragePlan (issue #2 phases 4+7 wiring)', () => {
+  const cfg: Config = loadConfig({});
+
+  it('returns null without a config (legacy callers see no coverage controller)', () => {
+    expect(svc().coveragePlan(new Set(), { fleetSize: 1, marketCount: 2 })).toBeNull();
+  });
+
+  it('treats never-read markets as coverable at cold start (scan-once-to-classify)', async () => {
+    // Boot snapshot with two known markets, value budget enabled.
+    const boot = {
+      getMarkets: async () => marketsWith(180),
+      putMarkets: () => {},
+      appendMarketHistory: () => {},
+    } as unknown as PersistenceClient;
+    const m = createMarketsService({ client, persistence: boot, coords, maxd: 2000, cfg, marketWaypoints: ['A', 'B'] });
+    await m.loadSnapshot();
+    const plan = m.coveragePlan(new Set(), { fleetSize: 1, marketCount: 2 });
+    expect(plan).not.toBeNull();
+    // Neither market has been scanned yet → both are eligible (unknown), none pruned.
+    expect(plan!.shouldCover.sort()).toEqual(['A', 'B']);
+    expect(plan!.toPrune).toEqual([]);
+    expect(plan!.recheckDue.sort()).toEqual(['A', 'B']); // never read → re-check due
+  });
+});
+
+describe('markets: recheckScan (issue #2 phase 7)', () => {
+  const cfg: Config = loadConfig({});
+
+  it('returns null without a config', async () => {
+    expect(await svc().recheckScan('A')).toBeNull();
+  });
+
+  it('reads one market, merges it, and counts a request', async () => {
+    const fresh: Market = { symbol: 'A', tradeGoods: [{ symbol: 'X', purchasePrice: 50, sellPrice: 70 }] } as unknown as Market;
+    const oneShot = {
+      api: async (_method: string, path: string) =>
+        path.includes('/market') ? ({ data: fresh } as ApiEnvelope<Market>) : ({ data: {} } as ApiEnvelope<unknown>),
+    } as unknown as SpaceTradersClient;
+    const m = createMarketsService({ client: oneShot, persistence, coords, maxd: 2000, cfg, marketWaypoints: ['A', 'B'] });
+    const before = m.marketGets();
+    const got = await m.recheckScan('A');
+    expect(got).toEqual(fresh);
+    expect(m.marketGets()).toBe(before + 1); // spent exactly one GET /market
+    expect(m.scanStates().get('A')?.scans).toBe(1); // volatility/scan state updated
   });
 });

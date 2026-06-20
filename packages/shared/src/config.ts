@@ -111,6 +111,23 @@ const RawConfigSchema = z.object({
   LANE_VALUE_HALFLIFE_MS: num(1_800_000), // staleness half-life for a lane's realized value (30 min)
   LANE_TOPK: num(20), // top-K lanes retained in the registry status block
 
+  // ── value-driven coverage tiering + reversible pruning + cold re-check (issue #2, phases 4+7) ──
+  // Probes only yield live prices where a ship is present, so coverage is a budget too. These levers
+  // let probe placement follow VALUE instead of parking ~1 probe per market uniformly. Both master
+  // switches default OFF, so with defaults `fleet/scale` is byte-for-byte the legacy behaviour.
+  FLEET_COVERAGE_ADAPTIVE: boolOff, // value-driven probe TARGET + PLACEMENT (non-mutating to existing probes)
+  FLEET_COVERAGE_PRUNE: boolOff, // also redeploy probes off DEAD markets + cold re-visit (FLEET-MUTATING)
+  COVERAGE_HOT_MULT: num(2), // rel value ≥ 2× fleet mean ⇒ HOT
+  COVERAGE_WARM_MULT: num(0.75), // rel ≥ 0.75× ⇒ WARM
+  COVERAGE_COLD_MULT: num(0.2), // rel ≥ 0.2× ⇒ COLD; below ⇒ DEAD (never worth a parked probe)
+  COVERAGE_TARGET_BASE: num(3), // value-driven probe target floor before signal bonuses
+  COVERAGE_LANE_BONUS: num(1), // +N covered markets per active lane (maturity → wider coverage)
+  COVERAGE_FLEET_BONUS: num(0.5), // +N covered markets per ship in the fleet
+  COVERAGE_TARGET_MIN: num(3), // never cover fewer than this (keep the engine fed at cold start)
+  COVERAGE_RECHECK_BASE_MS: num(1_800_000), // base cold re-visit interval at rel = 1 (30 min)
+  COVERAGE_RECHECK_MIN_MS: num(600_000), // floor — promising uncovered market re-visited at most this often (10 min)
+  COVERAGE_RECHECK_MAX_MS: num(21_600_000), // ceiling — even a dead market is re-checked this often, never forgotten (6 h)
+
   // ── phase / budget ──────────────────────────────────────────────────────
   BOOTSTRAP_FLEET_MIN: num(2),
   CREDIT_TARGET: num(0),

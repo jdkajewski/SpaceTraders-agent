@@ -23,6 +23,14 @@ import { computeFuelPx } from '../routing/flight.js';
 import { createLaneRegistry, type LaneRegistry, type RankedLane } from '../trade/laneRegistry.js';
 import { scoreMarkets, type ValueWeights } from './value.js';
 import { createScanScheduler, type ScanScheduler, type MarketScanState } from './scanScheduler.js';
+import {
+  planCoverage,
+  coverageTarget,
+  type CoveragePlan,
+  type CoverageWeights,
+  type PhaseSignals,
+  type RecheckOptions,
+} from './coverage.js';
 import { logger } from '../core/logger.js';
 
 const log = logger.child({ mod: 'markets' });
@@ -62,6 +70,18 @@ export interface MarketsServiceExtra {
   scanStates(): Map<string, MarketScanState>;
   /** Top-K realized lanes by decayed value (diagnostics / metric). */
   topLanes(k: number): RankedLane[];
+  /**
+   * Value-driven coverage plan (issue #2, phases 4+7): which markets are worth a parked probe, which
+   * DEAD probes to redeploy, and which uncovered markets are re-check-due. `null` when the value
+   * budget is disabled (no cfg). Pure read — `fleet/scale` decides whether to act on it.
+   */
+  coveragePlan(covered: ReadonlySet<string>, signals: Omit<PhaseSignals, 'activeLanes'>, now?: number): CoveragePlan | null;
+  /**
+   * Deliberately re-read one market NOW (cold re-check). The caller MUST ensure a ship is present at
+   * `wp` (otherwise the API returns stale prices). Merges the read into the cache, updates volatility,
+   * and counts a request. Returns the fresh market, or null on a transient failure / when disabled.
+   */
+  recheckScan(wp: string, now?: number): Promise<Market | null>;
 }
 
 export function createMarketsService(opts: MarketsServiceOptions): MarketsService & MarketsServiceExtra {
@@ -103,6 +123,18 @@ export function createMarketsService(opts: MarketsServiceOptions): MarketsServic
   const sweepMs = cfg?.SCAN_SWEEP_MS ?? MARKET_TTL_MS;
   let marketGets = 0;
   let lastSweepAt = 0;
+
+  // ── value-driven coverage tiering + reversible pruning + cold re-check (issue #2, phases 4+7) ──
+  const coverageWeights: CoverageWeights = {
+    hotMult: cfg?.COVERAGE_HOT_MULT ?? 2,
+    warmMult: cfg?.COVERAGE_WARM_MULT ?? 0.75,
+    coldMult: cfg?.COVERAGE_COLD_MULT ?? 0.2,
+  };
+  const recheckOpts: RecheckOptions = {
+    baseMs: cfg?.COVERAGE_RECHECK_BASE_MS ?? 1_800_000,
+    minMs: cfg?.COVERAGE_RECHECK_MIN_MS ?? 600_000,
+    maxMs: cfg?.COVERAGE_RECHECK_MAX_MS ?? 21_600_000,
+  };
 
   function goodMargins(markets: Record<string, Market>): Record<string, number> {
     const goods: Record<string, Array<{ wp: string } & { purchasePrice: number; sellPrice: number }>> = {};
@@ -231,6 +263,67 @@ export function createMarketsService(opts: MarketsServiceOptions): MarketsServic
     return snap;
   }
 
+  /**
+   * Value-driven coverage plan (issue #2, phases 4+7). Scores every known market, normalises against
+   * the fleet mean, derives a phase-adaptive probe target from live signals (fleet size + active
+   * lanes), and asks {@link planCoverage} which markets are worth covering, which DEAD probes to
+   * redeploy, and which uncovered markets are re-check-due. Pure read — no fetch, no mutation.
+   * Returns `null` when the value budget is disabled (no cfg) so callers keep legacy behaviour.
+   */
+  function coveragePlan(
+    covered: ReadonlySet<string>,
+    signals: Omit<PhaseSignals, 'activeLanes'>,
+    at: number = now(),
+  ): CoveragePlan | null {
+    if (!scheduler || !registry || !cfg) return null;
+    const scored = scoreMarkets(marketCache.data, registry.marketRealizedValue(at), valueWeights);
+    const scoreByWp = new Map<string, number>();
+    for (const [wp, v] of scored) scoreByWp.set(wp, v.score);
+    // Ensure every known waypoint is represented (un-scored ⇒ 0 ⇒ DEAD until first read).
+    for (const wp of marketWps) if (!scoreByWp.has(wp)) scoreByWp.set(wp, 0);
+
+    const lastScanAtByWp = new Map<string, number>();
+    for (const [wp, st] of scheduler.states()) if (st.scans > 0) lastScanAtByWp.set(wp, st.lastScanAt);
+
+    const activeLanes = registry.topLanes(cfg.LANE_TOPK, at).filter((l) => l.value > 0).length;
+    const target = coverageTarget(
+      { fleetSize: signals.fleetSize, activeLanes, marketCount: signals.marketCount },
+      {
+        base: cfg.COVERAGE_TARGET_BASE,
+        laneBonus: cfg.COVERAGE_LANE_BONUS,
+        fleetBonus: cfg.COVERAGE_FLEET_BONUS,
+        min: cfg.COVERAGE_TARGET_MIN,
+        maxProbes: cfg.FLEET_MAX_PROBES,
+      },
+    );
+
+    return planCoverage({
+      scoreByWp,
+      valueRef: scheduler.valueRef(scoreByWp),
+      covered,
+      lastScanAtByWp,
+      now: at,
+      target,
+      weights: coverageWeights,
+      recheck: recheckOpts,
+    });
+  }
+
+  /**
+   * Cold re-check: deliberately re-read one market NOW and merge it into the cache (issue #2, phase 7).
+   * The caller MUST have a ship present at `wp`. Counts a request, updates volatility/history/baselines,
+   * and returns the fresh market (or null on a transient failure / when the value budget is disabled).
+   */
+  async function recheckScan(wp: string, at: number = now()): Promise<Market | null> {
+    if (!scheduler) return null;
+    const m = await fetchMarket(wp);
+    if (!m) return null;
+    const out: Record<string, Market> = { ...marketCache.data, [wp]: m };
+    scheduler.noteScan(wp, m, at);
+    finishSweep(out, new Set([wp]));
+    return m;
+  }
+
   return {
     getMarkets,
     getFuelPx: () => fuelPx,
@@ -243,5 +336,7 @@ export function createMarketsService(opts: MarketsServiceOptions): MarketsServic
     marketGets: () => marketGets,
     scanStates: () => scheduler?.states() ?? new Map<string, MarketScanState>(),
     topLanes: (k: number) => registry?.topLanes(k, now()) ?? [],
+    coveragePlan,
+    recheckScan,
   };
 }

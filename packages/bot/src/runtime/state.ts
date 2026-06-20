@@ -182,6 +182,22 @@ export interface BotState {
    * emits it in the snapshot's `scan` field. Left undefined in minimal builds.
    */
   scanStatus?: () => unknown;
+
+  /**
+   * Latest coverage summary (issue #2, phases 4+7), written by `fleet/scale` each tick when the
+   * value-driven coverage controller is enabled. Surfaced inside the `scan` status block so the
+   * tier distribution + probes-saved reduction is provable. Undefined until the first coverage tick.
+   */
+  coverage?: {
+    tierCounts: Record<string, number>;
+    target: number;
+    covered: number;
+    probesSaved: number;
+    recheckDue: number;
+    adaptive: boolean;
+    prune: boolean;
+    updatedAt: number;
+  };
 }
 
 export interface CreateStateOptions {

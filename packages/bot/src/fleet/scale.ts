@@ -202,7 +202,40 @@ export async function fleetScaleManager(deps: SubsystemDeps): Promise<void> {
       const probeCount = all.filter(isProbeHull).length;
       const cargoShips = all.filter((s) => !isProbeHull(s) && (s.cargo?.capacity ?? 0) >= 30).length;
       const haulers = all.filter((s) => !isProbeHull(s) && (s.cargo?.capacity ?? 0) >= 80).length;
-      const probeTarget = cappedProbeTarget(cargoShips, marketWps.length, cfg.FLEET_BASE_PROBES, cfg.FLEET_PROBE_RATIO, cfg.FLEET_MAX_PROBES);
+      const legacyProbeTarget = cappedProbeTarget(cargoShips, marketWps.length, cfg.FLEET_BASE_PROBES, cfg.FLEET_PROBE_RATIO, cfg.FLEET_MAX_PROBES);
+
+      // [issue #2 phases 4+7] Value-driven coverage controller (opt-in). When FLEET_COVERAGE_ADAPTIVE
+      // is on, probe TARGET + PLACEMENT follow live per-market value instead of ~1 probe per market.
+      // FLEET_COVERAGE_PRUNE additionally redeploys probes off markets we've read and found DEAD. Both
+      // default OFF → this whole block is inert and behaviour is byte-for-byte the legacy path.
+      const plan = cfg.FLEET_COVERAGE_ADAPTIVE
+        ? deps.markets.coveragePlan(covered, { fleetSize: all.length, marketCount: marketWps.length })
+        : null;
+      if (plan) {
+        state.coverage = {
+          tierCounts: plan.counts,
+          target: plan.shouldCover.length,
+          covered: marketWps.length - uncovered.length,
+          probesSaved: plan.probesSaved,
+          recheckDue: plan.recheckDue.length,
+          adaptive: cfg.FLEET_COVERAGE_ADAPTIVE,
+          prune: cfg.FLEET_COVERAGE_PRUNE,
+          updatedAt: Date.now(),
+        };
+      }
+      // Probe target: count of markets actually worth covering (value-driven), else the legacy 1:1 cap.
+      const probeTarget = plan ? plan.shouldCover.length : legacyProbeTarget;
+      // Placement order: highest-value uncovered first (value-driven), else legacy export-preferring + nearest.
+      const placeOrder = (): string[] =>
+        plan
+          ? [...plan.toCover, ...plan.recheckDue].filter((w, i, a) => a.indexOf(w) === i && !covered.has(w))
+          : uncovered
+              .slice()
+              .sort(
+                (a, b) =>
+                  (((markets[a]?.exports ?? []).length > 0 ? 0 : 1) - ((markets[b]?.exports ?? []).length > 0 ? 0 : 1)) ||
+                  deps.D(anchorYard, a) - deps.D(anchorYard, b),
+              );
 
       if (!atYard) {
         await sleep(cfg.FLEET_SCALE_MS);
@@ -218,11 +251,34 @@ export async function fleetScaleManager(deps: SubsystemDeps): Promise<void> {
       const haulPx = freshYards.SHIP_LIGHT_HAULER?.price ?? HAULER_PRICE_EST;
       const canAfford = (px: number): boolean => state.cachedCredits - state.committed - px >= Math.max(cfg.FLEET_SCALE_FLOOR, state.operatingReserve);
 
-      if (probeCount < probeTarget && uncovered.length && canAfford(probePx)) {
+      // [issue #2] Reversible prune: before buying, redeploy a probe parked on a read-DEAD market to the
+      // highest-value market needing coverage. The vacated market isn't forgotten — it re-enters the cold
+      // re-check schedule (recheckDue) and is promoted back if its lanes ever light up. FLEET_COVERAGE_PRUNE
+      // gated; only fires when there's somewhere strictly better to put the probe (no churn otherwise).
+      if (plan && cfg.FLEET_COVERAGE_PRUNE && plan.toPrune.length) {
+        const dest = placeOrder()[0];
+        const pruneWp = plan.toPrune[0];
+        if (dest && pruneWp) {
+          const probe = all.find(
+            (s) => isProbeHull(s) && s.symbol !== cfg.NEGOTIATOR && s.nav.status !== 'IN_TRANSIT' && s.nav.waypointSymbol === pruneWp,
+          );
+          if (probe) {
+            try {
+              if (probe.nav.status === 'DOCKED') await client.api('POST', `/my/ships/${probe.symbol}/orbit`);
+              await client.api('POST', `/my/ships/${probe.symbol}/navigate`, { waypointSymbol: dest });
+              log.info(`🛰 FLEET_SCALE redeploy ${probe.symbol.slice(-3)}: DEAD ${pruneWp.slice(-3)} → ${dest.slice(-3)} (reversible; ${pruneWp.slice(-3)} keeps re-check)`);
+              await sleep(cfg.FLEET_SCALE_MS);
+              continue;
+            } catch (e) {
+              log.warn(`🛰 redeploy ERR ${(e as Error).message}`);
+            }
+          }
+        }
+      }
+
+      if (probeCount < probeTarget && placeOrder().length && canAfford(probePx)) {
         const bought = await buyShip('SHIP_PROBE', anchorYard, deps);
-        const dest = uncovered
-          .slice()
-          .sort((a, b) => (((markets[a]?.exports ?? []).length > 0 ? 0 : 1) - ((markets[b]?.exports ?? []).length > 0 ? 0 : 1)) || (deps.D(anchorYard, a) - deps.D(anchorYard, b)))[0];
+        const dest = placeOrder()[0];
         if (bought && dest) {
           try {
             await client.api('POST', `/my/ships/${bought}/orbit`);
