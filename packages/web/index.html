@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>SpaceTraders — Galaxy Map</title>
+  </head>
+  <body>
+    <div id="app">
+      <header id="topbar">
+        <h1>Galaxy Map</h1>
+        <div id="controls">
+          <input id="search" type="search" placeholder="Find system…" autocomplete="off" />
+          <label><input id="toggle-unreachable" type="checkbox" checked /> Show unreachable</label>
+          <label><input id="toggle-hops" type="checkbox" /> Shade by hops</label>
+          <button id="reset-view" type="button">Reset view</button>
+        </div>
+      </header>
+      <main>
+        <div id="graph"></div>
+        <aside id="sidebar">
+          <section id="legend"></section>
+          <section id="detail">
+            <p class="muted">Click a system to inspect it.</p>
+          </section>
+          <section id="ranked">
+            <h2>Top systems</h2>
+            <ol id="ranked-list"></ol>
+          </section>
+        </aside>
+      </main>
+      <div id="status-banner" hidden></div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
