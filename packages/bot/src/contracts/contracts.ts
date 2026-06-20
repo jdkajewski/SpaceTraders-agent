@@ -393,7 +393,7 @@ export async function contractManager(deps: SubsystemDeps): Promise<void> {
           await client.api('POST', `/my/contracts/${pending.id}/accept`);
           const ci = toInfo(pending);
           if (ci) state.activeContractInfo = ci;
-        } else if (!state.contractWorkingId) {
+        } else if (!state.contractWorkingId && cfg.NEGOTIATOR) {
           try { await client.api('POST', `/my/ships/${cfg.NEGOTIATOR}/dock`); } catch {}
           const r = await client.api<{ data: { contract: Contract } }>('POST', `/my/ships/${cfg.NEGOTIATOR}/negotiate/contract`);
           const c = r.data.contract;

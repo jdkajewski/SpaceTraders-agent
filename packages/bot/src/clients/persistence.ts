@@ -239,14 +239,28 @@ export function createPersistenceClient(opts: PersistenceClientOptions = {}): Pe
     },
 
     // ── markets (latest snapshot) ─────────────────────────────────────────────
+    // The api stores each snapshot as a row `{ waypoint, data, updatedAt }` and the bulk
+    // endpoints speak `Array<{ waypoint, data }>` (see `MarketSnapshotSchema` / `BulkPutBody`
+    // in packages/api/src/routes/markets.ts). The bot caches markets as a `Record<wp, Market>`,
+    // so this client translates between the two shapes on every read/write. (issue #8: sending
+    // the bare Record 400s against `BulkPutBody`, and the write is fire-and-forget so it was
+    // silently dropped — no market snapshot ever persisted.)
     async getMarkets(): Promise<Record<string, Market>> {
-      return (await getJson<Record<string, Market>>('/markets')) ?? {};
+      const rows = (await getJson<Array<{ waypoint: string; data: Market }>>('/markets')) ?? [];
+      const out: Record<string, Market> = {};
+      for (const r of rows) out[r.waypoint] = r.data;
+      return out;
     },
     async getMarket(waypoint: string): Promise<Market | null> {
-      return getJson<Market>(`/markets/${waypoint}`);
+      // The snapshot row is `{ waypoint, data, updatedAt }`; note `unwrap` already strips a literal
+      // top-level `data` field, so tolerate either the unwrapped Market or the raw row.
+      const row = await getJson<{ data?: Market } & Partial<Market>>(`/markets/${waypoint}`);
+      if (!row) return null;
+      return (row.data ?? (row as Market));
     },
     putMarkets(markets: Record<string, Market>): void {
-      fireAndForget('PUT', '/markets', markets, 'markets');
+      const body = Object.entries(markets).map(([waypoint, data]) => ({ waypoint, data }));
+      fireAndForget('PUT', '/markets', body, 'markets');
     },
 
     // ── gate-levers (operator control) ────────────────────────────────────────

@@ -156,7 +156,11 @@ const RawConfigSchema = z.object({
   CONTRACT_RUNNER: csvSet,
   CONTRACT_FORCE: csvSet,
   DEBUG_CONTRACT: boolOff,
-  NEGOTIATOR: str('SPACEJAM-DK-2-15'),
+  // The ship that docks at a faction HQ to negotiate NEW contracts. Empty default ⇒ reset-agnostic
+  // (no hardcoded ship); pin to the command ship (e.g. `{AGENT}-1`) for sustained negotiation. When
+  // empty the bot still accepts already-offered/pending contracts, just doesn't auto-negotiate new
+  // ones (see contracts.ts — the negotiate call is guarded on a non-empty NEGOTIATOR).
+  NEGOTIATOR: str(''),
 
   // ── gate supply ─────────────────────────────────────────────────────────
   GATE_SUPPLY: boolOn,
