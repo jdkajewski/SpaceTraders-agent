@@ -69,7 +69,7 @@ export async function main(): Promise<void> {
   const marketHolder: { data: Record<string, Market> } = { data: {} };
   const marketsRef = (): Record<string, Market> => marketHolder.data;
 
-  const markets = createMarketsService({ client, persistence, coords, maxd: cfg.MAXD });
+  const markets = createMarketsService({ client, persistence, coords, maxd: cfg.MAXD, cfg });
   const router = createRouter({
     coords,
     getFuelPx: () => markets.getFuelPx(),
@@ -78,6 +78,29 @@ export async function main(): Promise<void> {
   });
   const actions = createShipActions(client);
   const state = createState(cfg, { marketsRef });
+
+  // [issue #2] Surface the value-weighted scan-budget metric in the status snapshot. credits-per-request
+  // is the headline lever: realized run net ÷ market GETs spent. Higher = scan budget better allocated.
+  state.scanStatus = (): unknown => {
+    const gets = markets.marketGets();
+    const states = markets.scanStates();
+    let dueCount = 0;
+    const tNow = Date.now();
+    for (const st of states.values()) if (tNow - st.lastScanAt >= st.intervalMs) dueCount += 1;
+    return {
+      marketGets: gets,
+      creditsPerRequest: gets > 0 ? Math.round(state.totalNet / gets) : 0,
+      marketsTracked: states.size,
+      dueNow: dueCount,
+      topLanes: markets.topLanes(cfg.LANE_TOPK).map((l) => ({
+        src: l.srcWp.slice(-4),
+        good: l.good,
+        sink: l.sinkWp.slice(-4),
+        value: Math.round(l.value),
+        trips: l.trips,
+      })),
+    };
+  };
 
   // [BOOT] load the last market snapshot + seed the router's fuel nodes from it.
   marketHolder.data = await markets.loadSnapshot();

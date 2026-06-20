@@ -76,4 +76,19 @@ describe('status snapshot shape == legacy bot-status.json (bot2.mjs:L2786)', () 
     expect(snap.credits).toBe(state.cachedCredits);
     expect(snap.data).toBe(data);
   });
+
+  it('omits the additive `scan` field unless the value-weighted budget is wired', () => {
+    expect('scan' in data).toBe(false); // legacy parity preserved when state.scanStatus is unset
+  });
+
+  it('emits an additive `scan` field when state.scanStatus is wired (issue #2 metric)', () => {
+    const s2 = createState(cfg);
+    s2.currentPhase = PHASES.PROFIT;
+    s2.scanStatus = () => ({ creditsPerRequest: 12.5, marketGets: 8, markets: 3, dueNow: 1 });
+    const snap2 = captureSnapshot(s2, cfg);
+    const data2 = snap2.data as Record<string, unknown>;
+    // legacy keys all still present, plus the new `scan` block
+    expect([...LEGACY_TOP].every((k) => k in data2)).toBe(true);
+    expect((data2.scan as Record<string, unknown>).creditsPerRequest).toBe(12.5);
+  });
 });

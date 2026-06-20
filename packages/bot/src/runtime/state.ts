@@ -176,6 +176,12 @@ export interface BotState {
    * undefined in the single-system live build, so the snapshot reports `{ enabled: false }`.
    */
   expansionStatus?: () => unknown;
+  /**
+   * Optional scan-budget status provider (issue #2). main sets this to a closure surfacing the
+   * value-weighted scan metric (credits-per-request, markets tracked, top lanes); `writeStatus`
+   * emits it in the snapshot's `scan` field. Left undefined in minimal builds.
+   */
+  scanStatus?: () => unknown;
 }
 
 export interface CreateStateOptions {
