@@ -203,6 +203,10 @@ export function createExpansion(ctx: ExpansionCtx): Expansion {
   const TRADER_PREF = cfg.EXPAND_TRADER_PREF.split(',')
     .map((s) => s.trim())
     .filter(Boolean);
+  // [FUELED-ENTRY SEED] put ONE fueled hull into every zero-presence outpost first (breaks the deep
+  // chicken-and-egg, fast cruise-in anchor). SEED_HULLS are tried cheapest-first.
+  const SEED_FUELED = cfg.EXPAND_SEED_FUELED;
+  const SEED_HULLS = cfg.EXPAND_SEED_HULLS;
   let boughtProbes = 0;
   let boughtTraders = 0;
   let lastBuyAt = 0;
@@ -1185,6 +1189,45 @@ export function createExpansion(ctx: ExpansionCtx): Expansion {
     return null;
   }
 
+  // The outpost's gate path walked BACKWARD (nearest-to-outpost → … → home), so a deep outpost buys at the
+  // NEAREST intermediate yard instead of always dragging from the 2-3× pricier home yard. The galaxy provider
+  // resolves the unbounded path; with no provider wired we fall back to home (legacy `[homeSystem]`).
+  async function pathBackFor(sys: string): Promise<string[]> {
+    const plan = await relayPlanFor(sys);
+    if (plan && plan.path.length > 1) return plan.path.slice(0, -1).reverse();
+    return [homeSystem];
+  }
+
+  // [LOCAL-BUY ANCHOR] Purchases need one of our ships AT the yard. When we want to buy `type` in `sys` but no
+  // ship is parked at a selling yard, divert the nearest idle in-system ship (prefer a probe) to that yard so
+  // the NEXT window's buy succeeds. Returns true if it dispatched/awaits an anchor. Throttled per yard.
+  const anchorSent = new Map<string, number>(); // yardWp -> epoch ms last dispatched
+  async function anchorBuy(type: string, sys: string, allShips: Ship[]): Promise<boolean> {
+    let list;
+    try {
+      list = await shipyardsIn(sys);
+    } catch {
+      return false;
+    }
+    const selling = list.filter((y) => y.sells.has(type));
+    if (!selling.length) return false;
+    const present = new Set(allShips.filter((s) => s.nav.status !== 'IN_TRANSIT').map((s) => s.nav.waypointSymbol));
+    if (selling.some((y) => present.has(y.wp))) return false; // already have a ship at a selling yard — pickBuy will use it
+    const yard = selling[0]!.wp;
+    if (now() - (anchorSent.get(yard) || 0) < 120_000) return true; // recently dispatched — give it time to arrive
+    const inSys = allShips.filter((s) => s.nav.systemSymbol === sys && s.nav.status !== 'IN_TRANSIT' && !cd(s.symbol));
+    const cand = inSys.find((s) => isProbe(s)) || inSys[0];
+    if (!cand) return false;
+    anchorSent.set(yard, now());
+    try {
+      await goToSys(cand.symbol, yard, outposts.get(sys)?.markets ?? {});
+      log(`🛒 anchoring ${id(cand.symbol)} → ${id(yard)} (so local ${type.replace('SHIP_', '')} buys work)`);
+    } catch (e) {
+      log(`🛒 anchor ${id(cand.symbol)} → ${id(yard)} FAILED: ${(e as Error).message}`);
+    }
+    return true;
+  }
+
   async function autoBuy(): Promise<void> {
     if (!AUTOBUY || !triggered || !outpostsReady) return;
     if (!buyShip) return; // ctx not wired
@@ -1212,14 +1255,17 @@ export function createExpansion(ctx: ExpansionCtx): Expansion {
     }
 
     // waypoints where we have a ship present right now (purchase needs a hull at the yard)
-    let shipWps: Set<string>;
+    let allShips: Ship[];
     try {
-      shipWps = new Set((await getAllShips()).filter((s) => s.nav.status !== 'IN_TRANSIT').map((s) => s.nav.waypointSymbol));
+      allShips = await getAllShips();
     } catch (e) {
       lastBuyAt = now();
       log(`🛒 AUTOBUY fleet read ERR ${(e as Error).message}`);
       return;
     }
+    const shipWps: Set<string> = new Set(
+      allShips.filter((s) => s.nav.status !== 'IN_TRANSIT').map((s) => s.nav.waypointSymbol),
+    );
 
     interface BuyAction {
       kind: 'trader' | 'probe';
@@ -1229,17 +1275,82 @@ export function createExpansion(ctx: ExpansionCtx): Expansion {
       price: number;
       sys: string;
       local: boolean;
+      entry?: boolean;
     }
     let action: BuyAction | null = null;
-    if (boughtTraders < MAX_BUY_TRADERS) {
+    // 0) FUELED-ENTRY — an outpost with NO crew yet (none assigned, none migrating) gets ONE fueled hull bought
+    //    at the NEAREST gate-path yard that sells one, assigned OUTLIGHT. It cruises in (fast), trades, and anchors
+    //    local buys. Skips home (already has presence). Respects BUY_FLOOR + MAX_BUY_TRADERS. (legacy L1283-1308)
+    if (!action && SEED_FUELED && boughtTraders < MAX_BUY_TRADERS) {
+      for (const sys of outposts.keys()) {
+        if (sys === homeSystem) continue; // home already has presence
+        if ((probeN[sys] ?? 0) > 0 || (traderN[sys] ?? 0) > 0) continue; // already has crew or a ship en route → not empty
+        const pathBack = await pathBackFor(sys);
+        const prefSys = [sys, ...pathBack]; // outpost-local first → nearest path yard → … → home
+        for (const t of SEED_HULLS) {
+          // cheap fueled hull first (shuttle, then hauler)
+          const loc = await pickBuy(t, prefSys, shipWps);
+          if (!loc) continue;
+          const px = loc.price || 150_000;
+          if (credits - px >= BUY_FLOOR) {
+            action = { kind: 'trader', role: 'OUTLIGHT', type: t, wp: loc.wp, price: px, sys, local: loc.local, entry: true };
+            break;
+          }
+        }
+        if (action) break;
+        // no path-yard with a ship present → anchor a ship at the nearest path-system that sells a seed hull
+        let anchored = false;
+        for (const cs of prefSys) {
+          let ys;
+          try {
+            ys = await shipyardsIn(cs);
+          } catch {
+            continue;
+          }
+          if (!SEED_HULLS.some((t) => ys.some((y) => y.sells.has(t)))) continue;
+          for (const t of SEED_HULLS) {
+            if (await anchorBuy(t, cs, allShips)) {
+              anchored = true;
+              break;
+            }
+          }
+          if (anchored) break;
+        }
+        if (anchored) break; // one entry attempt per window (anchor dispatched → wait for it to arrive)
+      }
+    }
+    if (!action && boughtTraders < MAX_BUY_TRADERS) {
       const starved = [...outposts.keys()].find((sys) => (traderN[sys] ?? 0) < OUTPOST_TRADERS);
       if (starved) {
+        const pathBack = await pathBackFor(starved);
+        const prefSys = [starved, ...pathBack]; // [LOCAL-FIRST] outpost yard → nearest path yard → … → home
         for (const t of TRADER_PREF) {
           // best hull first
-          const loc = await pickBuy(t, [starved, homeSystem], shipWps);
+          const loc = await pickBuy(t, prefSys, shipWps);
           if (loc && credits - (loc.price || 320_000) >= BUY_FLOOR) {
             action = { kind: 'trader', role: 'OUTLIGHT', type: t, wp: loc.wp, price: loc.price || 320_000, sys: starved, local: loc.local };
             break;
+          }
+        }
+        if (!action) {
+          // no path-yard with a ship parked → anchor one at the nearest path-system that sells a trader hull
+          for (const cs of prefSys) {
+            let ys;
+            try {
+              ys = await shipyardsIn(cs);
+            } catch {
+              continue;
+            }
+            const hulls = TRADER_PREF.filter((t) => ys.some((y) => y.sells.has(t)));
+            if (!hulls.length) continue;
+            let done = false;
+            for (const t of hulls) {
+              if (await anchorBuy(t, cs, allShips)) {
+                done = true;
+                break;
+              }
+            }
+            if (done) break;
           }
         }
       }
@@ -1259,10 +1370,25 @@ export function createExpansion(ctx: ExpansionCtx): Expansion {
         }
       }
       if (worst) {
-        const loc = await pickBuy('SHIP_PROBE', [worst, homeSystem], shipWps);
+        const pathBack = await pathBackFor(worst);
+        const srcSystems = [worst, ...pathBack]; // [NEAR-SEED] walk the gate path BACKWARD; home is the last-resort tail
+        const loc = await pickBuy('SHIP_PROBE', srcSystems, shipWps);
         const price = loc ? loc.price || 26_000 : 0;
         if (loc && credits - price >= BUY_FLOOR)
           action = { kind: 'probe', role: 'OUTPROBE', type: 'SHIP_PROBE', wp: loc.wp, price, sys: worst, local: loc.local };
+        else if (!loc) {
+          // no buyable yard with a ship present → anchor at the nearest path-system that sells probes (next window buys)
+          for (const cs of srcSystems) {
+            let ys;
+            try {
+              ys = await shipyardsIn(cs);
+            } catch {
+              continue;
+            }
+            if (!ys.some((y) => y.sells.has('SHIP_PROBE'))) continue; // this path-system can't sell probes — try next
+            if (await anchorBuy('SHIP_PROBE', cs, allShips)) break;
+          }
+        }
       }
     }
     if (!action) return;
@@ -1288,7 +1414,7 @@ export function createExpansion(ctx: ExpansionCtx): Expansion {
     if (action.kind === 'trader') {
       boughtTraders++;
       log(
-        `🛒 AUTOBUY trader ${action.type} ${id(bought)} @${id(action.wp)} (~${action.price.toLocaleString()}) → ${action.sys} [${where}; traders ${traderN[action.sys] ?? 0}→${(traderN[action.sys] ?? 0) + 1}/${OUTPOST_TRADERS}, bought ${boughtTraders}/${MAX_BUY_TRADERS}]`,
+        `🛒 AUTOBUY ${action.entry ? 'ENTRY-SEED ' : ''}trader ${action.type} ${id(bought)} @${id(action.wp)} (~${action.price.toLocaleString()}) → ${action.sys} [${where}; traders ${traderN[action.sys] ?? 0}→${(traderN[action.sys] ?? 0) + 1}/${OUTPOST_TRADERS}, bought ${boughtTraders}/${MAX_BUY_TRADERS}]`,
       );
     } else {
       boughtProbes++;

@@ -314,6 +314,16 @@ const RawConfigSchema = z.object({
   EXPAND_TRADER_PREF: str(
     'SHIP_HEAVY_FREIGHTER,SHIP_REFINING_FREIGHTER,SHIP_LIGHT_HAULER,SHIP_LIGHT_SHUTTLE,SHIP_COMMAND_FRIGATE',
   ),
+  // [FUELED-ENTRY SEED] A brand-new deep outpost has a chicken-and-egg: autobuy can't buy probes/traders
+  // LOCALLY (cheap) until one of our ships is physically present, but a 0-fuel PROBE migrated in can only
+  // DRIFT (brutally slow). Fix: seed each zero-presence outpost with ONE FUELED hull (shuttle/hauler) bought
+  // at the NEAREST gate-path yard — it CRUISEs in fast and becomes the local-buy anchor. Default ON.
+  EXPAND_SEED_FUELED: boolOn,
+  EXPAND_SEED_HULLS: z
+    .string()
+    .optional()
+    .default('SHIP_LIGHT_SHUTTLE,SHIP_LIGHT_HAULER')
+    .transform((v) => v.split(',').map((s) => s.trim()).filter(Boolean)),
 
   // ── galaxy crawler (home-rooted BFS map for AUTO_EXPAND; default OFF) ──────
   // When on, a gentle background crawler BFS-maps the jump-gate network from
