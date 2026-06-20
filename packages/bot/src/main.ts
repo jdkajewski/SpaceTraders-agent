@@ -26,6 +26,7 @@ import { makeSubsystemDeps, buildWorkerHooks, buildManagers } from './subsystems
 import { buyMiningShip } from './mining/expandMine.js';
 import { fleetTableManager } from './fleet/table.js';
 import { createExpansion, type Expansion, type ExpansionCtx } from './expansion/index.js';
+import { resolveHome } from './galaxy/home.js';
 import { buildLanes } from './trade/lanes.js';
 import { writeStatus } from './status.js';
 import type { DistFn } from './trade/lanes.js';
@@ -51,6 +52,20 @@ export async function main(): Promise<void> {
     ? createDryRunClient({ credits: cfg.DRY_RUN_CREDITS })
     : createSpaceTradersClient({ token: cfg.SPACETRADERS_PLAYER_AGENT_TOKEN });
   if (cfg.DRY_RUN) log.info('🧪 DRY_RUN: live SpaceTraders API disabled (no fetches, no mutations).');
+
+  // [HOME] Greenfield-safe home detection: when SYSTEM is not pinned, derive it from the live
+  // agent's HQ (/my/agent.headquarters) so the bot works from any fresh account across weekly
+  // resets — no hardcoded system symbol. Skipped under DRY_RUN (no live agent). A pinned SYSTEM
+  // always wins; a detection failure on an unpinned greenfield is fatal (we can't trade home-less).
+  if (!cfg.SYSTEM && !cfg.DRY_RUN) {
+    const home = await resolveHome((m, p) => client.api(m as 'GET', p));
+    if (!home) throw new Error('Home detection failed: /my/agent returned no headquarters and SYSTEM is unset');
+    cfg.SYSTEM = home.homeSystem;
+    log.info(`🏠 home auto-detected: ${home.homeSystem} (HQ ${home.hqWaypoint})`);
+  } else if (cfg.SYSTEM) {
+    log.info(`🏠 home system pinned: ${cfg.SYSTEM}`);
+  }
+
   const local = new FileLocalStore();
   const persistence = createPersistenceClient({ local, baseUrl: cfg.API_BASE_URL, botKey: cfg.BOT_KEY });
 

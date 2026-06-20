@@ -27,6 +27,11 @@ import type {
   MarketHistoryRow,
   TradeObservation,
   MineEvent,
+  GalaxyGraph,
+  RankedSystem,
+  GalaxySystemUpsert,
+  GateEdgeUpsert,
+  SystemRichnessUpsert,
 } from '@st/shared';
 import type { HttpMethod, LocalStore, PersistenceClient, Waypoint } from '../interfaces.js';
 import { logger } from '../core/logger.js';
@@ -267,6 +272,30 @@ export function createPersistenceClient(opts: PersistenceClientOptions = {}): Pe
     // ── static coords ─────────────────────────────────────────────────────────
     async getWaypoints(): Promise<Waypoint[]> {
       return (await getJson<Waypoint[]>('/waypoints')) ?? [];
+    },
+
+    // ── galaxy map (crawler graph + ranked rich systems) ──────────────────────
+    async getGalaxyGraph(): Promise<GalaxyGraph> {
+      return (await getJson<GalaxyGraph>('/galaxy/graph')) ?? { systems: [], edges: [] };
+    },
+    async getRankedSystems(limit = 50, reachableOnly = false): Promise<RankedSystem[]> {
+      const q = `?limit=${limit}${reachableOnly ? '&reachableOnly=true' : ''}`;
+      return (await getJson<RankedSystem[]>(`/galaxy/ranked${q}`)) ?? [];
+    },
+    async upsertSystems(systems: GalaxySystemUpsert[]): Promise<void> {
+      if (!systems.length) return;
+      const res = await request('PUT', '/galaxy/systems', systems);
+      if (!res.ok) throw new Error(`PUT /galaxy/systems -> ${res.status}`);
+    },
+    async upsertEdges(edges: GateEdgeUpsert[]): Promise<void> {
+      if (!edges.length) return;
+      const res = await request('PUT', '/galaxy/edges', edges);
+      if (!res.ok) throw new Error(`PUT /galaxy/edges -> ${res.status}`);
+    },
+    async upsertRichness(rows: SystemRichnessUpsert[]): Promise<void> {
+      if (!rows.length) return;
+      const res = await request('PUT', '/galaxy/richness', rows);
+      if (!res.ok) throw new Error(`PUT /galaxy/richness -> ${res.status}`);
     },
 
     // ── flush all batchers + pending writes ───────────────────────────────────

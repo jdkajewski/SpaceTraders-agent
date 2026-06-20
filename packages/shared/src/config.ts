@@ -68,7 +68,9 @@ const kvMap = z
 
 const RawConfigSchema = z.object({
   // ── core trade ──────────────────────────────────────────────────────────
-  SYSTEM: str('X1-PP30'),
+  // Home system. Default is EMPTY so the bot auto-detects it from /my/agent HQ at
+  // boot (greenfield-safe across weekly resets). Set SYSTEM explicitly to pin it.
+  SYSTEM: str(''),
   MAXD: num(2000),
   MIN_NET: num(4000),
   VALUE_OF_TIME: num(100),

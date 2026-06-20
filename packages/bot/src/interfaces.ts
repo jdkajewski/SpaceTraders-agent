@@ -19,6 +19,11 @@ import type {
   MarketHistoryRow,
   TradeObservation,
   MineEvent,
+  GalaxyGraph,
+  RankedSystem,
+  GalaxySystemUpsert,
+  GateEdgeUpsert,
+  SystemRichnessUpsert,
 } from '@st/shared';
 
 // ── SpaceTraders client (port of st.mjs) ─────────────────────────────────────
@@ -110,6 +115,18 @@ export interface PersistenceClient {
 
   // static coords
   getWaypoints(): Promise<Waypoint[]>;
+
+  // galaxy map (crawler graph + ranked rich systems)
+  /** Full galaxy graph (systems + gate edges) for pathfinder preload + viz. */
+  getGalaxyGraph(): Promise<GalaxyGraph>;
+  /** Ranked rich-market systems (AUTO_EXPAND target candidates). */
+  getRankedSystems(limit?: number, reachableOnly?: boolean): Promise<RankedSystem[]>;
+  /** Bulk upsert system nodes. */
+  upsertSystems(systems: GalaxySystemUpsert[]): Promise<void>;
+  /** Bulk upsert gate edges (`traversable` derived server-side). */
+  upsertEdges(edges: GateEdgeUpsert[]): Promise<void>;
+  /** Bulk upsert per-system richness. */
+  upsertRichness(rows: SystemRichnessUpsert[]): Promise<void>;
 
   /** Flush all internal append batchers + pending fire-and-forget writes. */
   flush(): Promise<void>;
