@@ -16,6 +16,13 @@ with a pointer to the implementing wave/file (#1, #3, #4, #5, #11).
 into the TS port — gate price hysteresis latch, `GATE_BUDGET_FRACTION`, hold packing, deliver-first,
 reserve-safe gate buys, second-level input feed, gate-critical ore priority. All `resolved`.
 
+**Post-Wave-6 — expansion port (Waves 7–12, in progress):** the next `origin/main` batch
+(`24cd54d..9fbc2d3`, 17 commits, +877 LOC in legacy `expansion.mjs`) is a major deep-system evolution
+— N-deep gate charting/BFS, frontier mining colonies (park-and-ferry), RECALL/RECALL_RELEASE modes,
+Chain-Feed cross-system feeder, API-budget reclaim, adaptive scan TTL. Too large for an atomic port;
+planned as Waves 7–12 (`rebuild/plans/expansion-port-MASTER.md` + `wave-7..12-*.md`) and handed to
+sub-sessions. DRIFT entries #39+ to be appended as each wave lands; this paragraph extended in W12.
+
 | # | Wave | Location (legacy) | Observation | Proposed action | Status |
 |---|------|-------------------|-------------|-----------------|--------|
 | 1 | plan | docs vs code | Docs describe ~2404-line bot; live is 3206. FLEET_SCALE, AUTO_EXPAND/expansion.mjs, REPAIR, mineMigrateManager, ship-purchase, TRADE_FIRST, CONTRACTS switch are in code but thin/absent in docs. | Port all (parity); refresh docs in W6. **W6 resolved:** all listed features ported across W0–W5 (FLEET_SCALE/ship-purchase in budget+main, expansion in `expansion/`, REPAIR+mineMigrate in `mining/`, TRADE_FIRST in `contracts/`, CONTRACTS in `contracts/`). Docs refreshed: `07-doc-drift.md` updated + new `09-ts-rebuild.md` describes the TS monorepo (docs 01–08 still describe the legacy `.mjs`). | resolved |
