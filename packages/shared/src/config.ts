@@ -68,7 +68,9 @@ const kvMap = z
 
 const RawConfigSchema = z.object({
   // ── core trade ──────────────────────────────────────────────────────────
-  SYSTEM: str('X1-PP30'),
+  // Home system. Default is EMPTY so the bot auto-detects it from /my/agent HQ at
+  // boot (greenfield-safe across weekly resets). Set SYSTEM explicitly to pin it.
+  SYSTEM: str(''),
   MAXD: num(2000),
   MIN_NET: num(4000),
   VALUE_OF_TIME: num(100),
@@ -294,6 +296,13 @@ const RawConfigSchema = z.object({
   EXPAND_OUTPOSTS: csvSet,
   EXPAND_OUTPOST_PROBES: num(2),
   EXPAND_OUTPOST_TRADERS: num(1),
+  // galaxy-driven outpost selection: when AUTO_EXPAND runs with the crawler
+  // (GALAXY_CRAWL) and EXPAND_OUTPOSTS is empty, seed the top-N ranked reachable
+  // systems as outposts instead of a hardcoded list.
+  EXPAND_OUTPOST_MAX: num(6),
+  // fueled-relay seeding hull (port of seed-relay.mjs): relay ONE fueled hull
+  // home→target via chained gate jumps, then buy probes/traders LOCALLY.
+  EXPAND_RELAY_HULL: str('SHIP_LIGHT_HAULER'),
   // fleet auto-buy (default OFF)
   EXPAND_AUTOBUY: boolOff,
   // 0 ⇒ derived at runtime (max(FLOOR+250_000, 700_000)); see createExpansion.
@@ -305,6 +314,33 @@ const RawConfigSchema = z.object({
   EXPAND_TRADER_PREF: str(
     'SHIP_HEAVY_FREIGHTER,SHIP_REFINING_FREIGHTER,SHIP_LIGHT_HAULER,SHIP_LIGHT_SHUTTLE,SHIP_COMMAND_FRIGATE',
   ),
+
+  // ── galaxy crawler (home-rooted BFS map for AUTO_EXPAND; default OFF) ──────
+  // When on, a gentle background crawler BFS-maps the jump-gate network from
+  // home, ranks rich markets, and persists the galaxy map (System/GateEdge/
+  // SystemRichness). AUTO_EXPAND consumes its ranked targets + gate graph.
+  GALAXY_CRAWL: boolOff,
+  // Min spacing between crawler API calls (ms) so trading ships keep priority
+  // on the shared 2 req/s account ceiling. ~1500–2000ms is gentle.
+  GALAXY_CRAWL_GAP_MS: num(1800),
+  // Systems persisted per batched upsert flush.
+  GALAXY_CRAWL_BATCH: num(25),
+  // Re-crawl a system for refresh once it is older than this (ms). Gates finish
+  // over time, so periodic re-checks keep build-state + richness fresh.
+  GALAXY_REFRESH_MS: num(3_600_000),
+  // Promote a ranked candidate to FULL-tier richness (per-market + shipyard
+  // reads) once it lands in the top-N by counts-tier score.
+  GALAXY_FULL_TOP_N: num(40),
+  // Ranking weights (score = Σ wᵢ·featureᵢ); marketplace count is primary.
+  GALAXY_W_MARKET: num(10),
+  GALAXY_W_IMPORT: num(3),
+  GALAXY_W_YARD: num(5),
+  GALAXY_W_PREMIUM: num(8),
+  // Stop the (already flag-guarded) mining manager once the gate is BUILT and
+  // expansion begins — lets mining colonies be abandoned post-gate. Default ON
+  // (preserves the legacy always-stop-after-gate behavior); set to 0 to keep
+  // mining running through and after expansion.
+  MINE_STOP_AFTER_GATE: boolOn,
 
   // ── dry-run / offline smoke (Wave 5 — not in legacy bot2.mjs) ─────────────
   // When DRY_RUN=1 the SpaceTraders game client is swapped for a no-op fixture

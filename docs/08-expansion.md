@@ -195,6 +195,61 @@ trade engine.
 
 ---
 
+## 5. Home-rooted galaxy crawler + dynamic AUTO_EXPAND (TS rewrite)
+
+The TS rewrite replaces the hand-fed inputs of the legacy expansion engine — a **hardcoded outpost list**
+(`EXPAND_OUTPOSTS` + a 34-system default) and a **hand-crawled `gate-graph.json`** — with a background
+crawler that auto-detects home and maps + ranks the reachable galaxy on its own. None of the hard-won
+single-system safety changes; the crawler is purely additive and gated by `GALAXY_CRAWL`.
+
+### 5.1 The crawler (`packages/bot/src/galaxy/`)
+- **Home detection** (`home.ts`): `resolveHome(api)` reads `/my/agent.headquarters` → home system. No
+  hardcoded `X1-…`; survives every weekly reset. When `cfg.SYSTEM` is empty the detected home is used
+  bot-wide.
+- **BFS mapper** (`crawler.ts`): from home, reads each system's waypoints (gate + build-state + market/
+  shipyard trait counts) and the gate's `connections[]`, enqueuing neighbors — mapping *ahead of physically
+  visiting* (the `jump-gate` endpoint returns connections for uncharted systems). Two richness tiers: a
+  cheap **counts** tier for every system, and a **full** tier (per-market imports + shipyard premium-ship
+  types) for the top-ranked candidates only. Gentle: every call goes through the shared 2 req/s client
+  **plus** an internal `GALAXY_CRAWL_GAP_MS` (~1.8s) min-gap so trading keeps priority. Incremental,
+  batched, resumable upserts; perpetual stalest-first refresh once the frontier drains.
+- **Unbounded pathfinder** (`pathfind.ts`): all-built `gatePath` BFS with **no node guard** — fixes the old
+  120-system cap that silently cut off 11–14-hop reachable targets in a 237+ system galaxy. "Traversable" =
+  both gate ends BUILT (you cannot jump out of, or into, an under-construction gate).
+- **Ranking** (`ranking.ts`): `score = w_market·marketplaceCount + w_import·importSiteCount +
+  w_yard·shipyardCount + w_premium·premiumShipCount`, marketplace count primary (the best system seen live
+  had 39 markets). Weights are `GALAXY_W_*` config.
+- **Persistence**: three normalized Prisma models — `System` (node), `GateEdge` (directional edge + built
+  flags, `traversable` derived server-side), `SystemRichness` (metrics + score) — served by
+  `/galaxy/*` routes for both the bot and the visualization.
+
+### 5.2 The tie-in (`expansion/expansion.ts`, when `ctx.galaxy` is wired)
+At PORTAL_OPEN the engine no longer reads the hardcoded list / `gate-graph.json`:
+1. **Dynamic targets** — `maybeTrigger` picks the hub + outposts from `galaxy.rankedTargets()` (richest
+   *reachable* systems) instead of the first home-gate connection + env list.
+2. **Graph-resolved gates + unbounded reach** — `setupOutposts` resolves each outpost's gate waypoint from
+   the preloaded graph and validates it with the unbounded `gatePath`, dropping the legacy "must be a direct
+   hub-gate connection" filter (which capped reach at 2 hops).
+3. **Fueled N-hop relay** — `stepOutpost` relays a **fueled** hull home → outpost over the full gate path
+   (`galaxyRelayStep`), one gate-jump per tick. Gate-to-gate jumps cost only auto-bought antimatter, no
+   fuel; only within-system positioning burns fuel — so a fueled `LIGHT_HAULER` cruises 3–4× faster than a
+   drifting probe **and** earns en route. On arrival, `autoBuy` purchases probes/traders **locally** at the
+   outpost yard (cheap ~27k local vs spiked ~90k home), honoring "relay fueled hulls, buy probes locally" —
+   no probe drift across the galaxy.
+
+### 5.3 Mining decoupling
+The crawler/expansion never touch mining. `MINE_STOP_AFTER_GATE` (default ON, preserving the legacy
+always-stop-after-gate behavior) lets mining colonies be abandoned once the gate is BUILT; set it to `0` to
+keep mining running through expansion. The crawler is independent of mining either way.
+
+### 5.4 Config
+`GALAXY_CRAWL` (master switch), `GALAXY_CRAWL_GAP_MS`, `GALAXY_CRAWL_BATCH`, `GALAXY_REFRESH_MS`,
+`GALAXY_FULL_TOP_N`, `GALAXY_W_{MARKET,IMPORT,YARD,PREMIUM}`; `EXPAND_OUTPOST_MAX`, `EXPAND_RELAY_HULL`;
+`MINE_STOP_AFTER_GATE`. A thin CLI (`pnpm --filter @st/bot galaxy [--watch|--refresh|--path A B]`) dumps/
+refreshes the map on demand.
+
+---
+
 ## Principles (carry into every new system)
 
 1. **Map before you trade** — probes give live prices; an unmapped system is flown blind.
@@ -203,3 +258,5 @@ trade engine.
 4. **Pin residency** — a relocated ship works its new system and never thrashes back across the gate.
 5. **The playbook recurses** — Phases 0–5 (doc 01) run identically in the new system; only the
    waypoints change.
+6. **Relay fueled hulls, buy probes locally** — time = money; a fueled hauler jump-relays in minutes and
+   earns en route, then seeds cheap local probes/traders at the target yard.

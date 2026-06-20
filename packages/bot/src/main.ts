@@ -26,6 +26,9 @@ import { makeSubsystemDeps, buildWorkerHooks, buildManagers } from './subsystems
 import { buyMiningShip } from './mining/expandMine.js';
 import { fleetTableManager } from './fleet/table.js';
 import { createExpansion, type Expansion, type ExpansionCtx } from './expansion/index.js';
+import { resolveHome } from './galaxy/home.js';
+import { createGalaxyCrawler, type GalaxyCrawler } from './galaxy/crawler.js';
+import { createGalaxyProvider } from './galaxy/provider.js';
 import { buildLanes } from './trade/lanes.js';
 import { writeStatus } from './status.js';
 import type { DistFn } from './trade/lanes.js';
@@ -51,6 +54,20 @@ export async function main(): Promise<void> {
     ? createDryRunClient({ credits: cfg.DRY_RUN_CREDITS })
     : createSpaceTradersClient({ token: cfg.SPACETRADERS_PLAYER_AGENT_TOKEN });
   if (cfg.DRY_RUN) log.info('🧪 DRY_RUN: live SpaceTraders API disabled (no fetches, no mutations).');
+
+  // [HOME] Greenfield-safe home detection: when SYSTEM is not pinned, derive it from the live
+  // agent's HQ (/my/agent.headquarters) so the bot works from any fresh account across weekly
+  // resets — no hardcoded system symbol. Skipped under DRY_RUN (no live agent). A pinned SYSTEM
+  // always wins; a detection failure on an unpinned greenfield is fatal (we can't trade home-less).
+  if (!cfg.SYSTEM && !cfg.DRY_RUN) {
+    const home = await resolveHome((m, p) => client.api(m as 'GET', p));
+    if (!home) throw new Error('Home detection failed: /my/agent returned no headquarters and SYSTEM is unset');
+    cfg.SYSTEM = home.homeSystem;
+    log.info(`🏠 home auto-detected: ${home.homeSystem} (HQ ${home.hqWaypoint})`);
+  } else if (cfg.SYSTEM) {
+    log.info(`🏠 home system pinned: ${cfg.SYSTEM}`);
+  }
+
   const local = new FileLocalStore();
   const persistence = createPersistenceClient({ local, baseUrl: cfg.API_BASE_URL, botKey: cfg.BOT_KEY });
 
@@ -212,6 +229,16 @@ export async function main(): Promise<void> {
       buyShip: (shipType, wp) => buyMiningShip(subDeps, shipType, wp),
       negotiator: () => cfg.NEGOTIATOR || null,
     };
+    // [GALAXY] When the crawler system is enabled, feed AUTO_EXPAND from the persisted
+    // galaxy map (ranked targets + unbounded gate paths + local-shipyard lookups) instead
+    // of the hardcoded EXPAND_OUTPOSTS list. Absent ⇒ legacy behavior.
+    if (cfg.GALAXY_CRAWL) {
+      ctx.galaxy = createGalaxyProvider({
+        api: (method, path, body) => client.api(method, path, body),
+        persistence,
+        now: () => Date.now(),
+      });
+    }
     expansion = createExpansion(ctx);
     // Surface the expansion status block in the persisted snapshot's `expand` field.
     state.expansionStatus = () => expansion!.statusBlock();
@@ -251,6 +278,27 @@ export async function main(): Promise<void> {
   const stopOpts: StopOptions = {};
   if (process.env['STOP_POLL'] === '1') stopOpts.poll = () => process.env['STOP'] === '1';
   const stopWatch = installStopHandlers(state, stopOpts);
+
+  // [GALAXY] Gentle background galaxy crawler — BFS-maps + ranks the reachable galaxy at a
+  // rate-limited pace (yields to trading on the shared 2 req/s ceiling), persisting incrementally
+  // so the map is already built + ranked by the time the gate opens and AUTO_EXPAND fires.
+  // Self-gated on GALAXY_CRAWL; never runs under DRY_RUN (no live game).
+  let galaxyCrawler: GalaxyCrawler | null = null;
+  if (cfg.GALAXY_CRAWL) {
+    const glog = logger.child({ mod: 'galaxy' });
+    galaxyCrawler = createGalaxyCrawler({
+      api: (method, path, body) => client.api(method, path, body),
+      persistence,
+      cfg,
+      log: (m) => glog.info(m),
+      sleep,
+      now: () => Date.now(),
+      homeSystem: cfg.SYSTEM,
+    });
+    galaxyCrawler.start();
+    log.info('🌌 galaxy crawler started (background, rate-limited).');
+  }
+
   const tasks = traders.map((s) => {
     launchedWorkers.add(s.symbol); // register so a manager never double-spawns an existing hull (bot2 L3200)
     return supervise(s.symbol, deps);
@@ -260,6 +308,7 @@ export async function main(): Promise<void> {
   tasks.push(...buildManagers(subDeps).map((m) => m()));
 
   await Promise.all([...tasks, stopWatch]);
+  if (galaxyCrawler) await galaxyCrawler.stop();
   await persistence.flush();
   log.info(`AUTOTRADER stopped. run net +${state.totalNet.toLocaleString()} over ${state.lanesRun} lanes`);
 }

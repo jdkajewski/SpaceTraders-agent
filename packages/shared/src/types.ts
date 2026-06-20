@@ -317,3 +317,107 @@ export interface WaypointDto {
   x: number;
   y: number;
 }
+
+// ── Galaxy map (home-rooted crawler output) ──────────────────────────────────
+// The crawler discovers the gate graph + per-system market richness; the bot
+// preloads it for unbounded gate-path pathfinding + ranked AUTO_EXPAND targets,
+// and the visualization reads it directly.
+
+/** A star-system node as stored/served by the API. */
+export interface GalaxySystemDto {
+  symbol: string;
+  x: number | null;
+  y: number | null;
+  hasGate: boolean;
+  gateWaypoint: string | null;
+  gateBuilt: boolean;
+  hopsFromHome: number | null;
+  reachable: boolean;
+  isHome: boolean;
+  firstSeenAt: string;
+  lastCrawledAt: string;
+  richnessRefreshedAt: string | null;
+}
+
+/** A directed jump-gate edge (built-state tracked per end). */
+export interface GateEdgeDto {
+  fromSystem: string;
+  toSystem: string;
+  fromGateWp: string | null;
+  toGateWp: string | null;
+  builtFrom: boolean;
+  builtTo: boolean;
+  traversable: boolean;
+}
+
+/** Per-system market richness metrics + computed rank. */
+export interface SystemRichnessDto {
+  systemSym: string;
+  marketplaceCount: number;
+  shipyardCount: number;
+  importSiteCount: number;
+  importGoodsTotal: number;
+  premiumShipTypes: string[];
+  premiumShipCount: number;
+  sellsFueledHull: boolean;
+  score: number;
+  detailLevel: string;
+}
+
+/** Compact graph payload for pathfinder preload + visualization. */
+export interface GalaxyGraph {
+  systems: GalaxySystemDto[];
+  edges: GateEdgeDto[];
+}
+
+/** A ranked rich-market system (AUTO_EXPAND target candidate). */
+export interface RankedSystem {
+  symbol: string;
+  score: number;
+  hopsFromHome: number | null;
+  reachable: boolean;
+  gateWaypoint: string | null;
+  marketplaceCount: number;
+  shipyardCount: number;
+  importSiteCount: number;
+  premiumShipTypes: string[];
+  sellsFueledHull: boolean;
+}
+
+/** Crawler → API upsert for a system node (timestamps + traversable derived server-side). */
+export interface GalaxySystemUpsert {
+  symbol: string;
+  x?: number | null;
+  y?: number | null;
+  hasGate?: boolean;
+  gateWaypoint?: string | null;
+  gateBuilt?: boolean;
+  hopsFromHome?: number | null;
+  reachable?: boolean;
+  isHome?: boolean;
+  richnessRefreshedAt?: string | null;
+}
+
+/** Crawler → API upsert for a gate edge (`traversable` derived server-side). */
+export interface GateEdgeUpsert {
+  fromSystem: string;
+  toSystem: string;
+  fromGateWp?: string | null;
+  toGateWp?: string | null;
+  builtFrom?: boolean;
+  builtTo?: boolean;
+}
+
+/** Crawler → API upsert for per-system richness. */
+export interface SystemRichnessUpsert {
+  systemSym: string;
+  marketplaceCount?: number;
+  shipyardCount?: number;
+  importSiteCount?: number;
+  importGoodsTotal?: number;
+  premiumShipTypes?: string[];
+  premiumShipCount?: number;
+  sellsFueledHull?: boolean;
+  score?: number;
+  detailLevel?: string;
+}

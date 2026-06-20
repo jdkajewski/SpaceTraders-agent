@@ -136,3 +136,70 @@ model FuelNode {
   systemSym String
   updatedAt DateTime @updatedAt
 }
+
+// ── Galaxy map: systems (nodes), gate edges, market richness ─────────────────
+// Produced by the home-rooted BFS galaxy crawler (packages/bot/src/galaxy). The
+// bot preloads this for an unbounded gate-path pathfinder + ranked AUTO_EXPAND
+// targets; the visualization reads it directly. Upserted incrementally so a crawl
+// is crash-resumable.
+
+/// A star system node in the gate graph. PK is the system symbol (e.g. "X1-DB23").
+model System {
+  symbol              String    @id
+  x                   Float? // system coords (when known)
+  y                   Float?
+  hasGate             Boolean   @default(false)
+  gateWaypoint        String? // the JUMP_GATE waypoint symbol, when present
+  gateBuilt           Boolean   @default(false) // !isUnderConstruction (can jump in/out)
+  hopsFromHome        Int? // BFS depth over traversable gates from home
+  reachable           Boolean   @default(false) // an all-built gate path exists from home
+  isHome              Boolean   @default(false)
+  firstSeenAt         DateTime  @default(now())
+  lastCrawledAt       DateTime  @updatedAt
+  richnessRefreshedAt DateTime? // last time the (expensive) full richness pass ran
+  edgesOut            GateEdge[] @relation("edgesOut")
+  edgesIn             GateEdge[] @relation("edgesIn")
+  richness            SystemRichness?
+
+  @@index([reachable])
+  @@index([hopsFromHome])
+  @@index([lastCrawledAt])
+}
+
+/// A directed jump-gate connection. Built-state is per-gate, so we track both ends.
+model GateEdge {
+  id          String   @id @default(cuid())
+  fromSystem  String
+  toSystem    String
+  fromGateWp  String?
+  toGateWp    String?
+  builtFrom   Boolean  @default(false) // source gate built (can jump OUT)
+  builtTo     Boolean  @default(false) // dest gate built (can jump IN)
+  traversable Boolean  @default(false) // builtFrom && builtTo
+  updatedAt   DateTime @updatedAt
+  from        System   @relation("edgesOut", fields: [fromSystem], references: [symbol], onDelete: Cascade)
+  to          System   @relation("edgesIn", fields: [toSystem], references: [symbol], onDelete: Cascade)
+
+  @@unique([fromSystem, toSystem])
+  @@index([fromSystem])
+  @@index([toSystem])
+  @@index([traversable])
+}
+
+/// Per-system market richness metrics + the computed expansion rank.
+model SystemRichness {
+  systemSym        String   @id
+  marketplaceCount Int      @default(0)
+  shipyardCount    Int      @default(0)
+  importSiteCount  Int      @default(0) // # markets importing tradeable goods
+  importGoodsTotal Int      @default(0) // total distinct import goods across markets
+  premiumShipTypes String[] // EXPLORER, HEAVY_FREIGHTER, REFINING_FREIGHTER, ORE_HOUND, COMMAND_FRIGATE, LIGHT_HAULER
+  premiumShipCount Int      @default(0)
+  sellsFueledHull  Boolean  @default(false) // a shipyard here sells a fueled hull (buy local vs relay)
+  score            Float    @default(0) // computed ranking score
+  detailLevel      String   @default("counts") // "counts" (cheap) | "full" (markets+shipyards read)
+  updatedAt        DateTime @updatedAt
+  system           System   @relation(fields: [systemSym], references: [symbol], onDelete: Cascade)
+
+  @@index([score])
+}

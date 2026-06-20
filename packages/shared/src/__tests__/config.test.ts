@@ -9,8 +9,8 @@ describe('loadConfig', () => {
   describe('empty env → code defaults', () => {
     const cfg = loadConfig({});
 
-    it('SYSTEM defaults to X1-PP30', () => {
-      expect(cfg.SYSTEM).toBe('X1-PP30');
+    it('SYSTEM defaults to empty (auto-detected from HQ at boot)', () => {
+      expect(cfg.SYSTEM).toBe('');
     });
 
     it('MAXD defaults to 2000', () => {
