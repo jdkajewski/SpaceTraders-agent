@@ -120,6 +120,10 @@ export function writeStatus(state: BotState, cfg: Config, persistence: Persisten
       state.expansionStatus !== undefined
         ? (state.expansionStatus() as Record<string, unknown>)
         : { enabled: cfg.AUTO_EXPAND },
+    // `scan` is an additive, opt-in extension (issue #2): only emitted when the value-weighted
+    // scan budget is wired (main.ts sets state.scanStatus). When absent the data block keeps its
+    // exact legacy bot-status.json shape, so existing monitors migrate unchanged.
+    ...(state.scanStatus !== undefined ? { scan: state.scanStatus() as Record<string, unknown> } : {}),
     ships,
   };
 

@@ -90,6 +90,27 @@ const RawConfigSchema = z.object({
   FILL_BIAS_EPS: num(0.10),
   GATE_DROPOFF_WEIGHT: num(0.5),
 
+  // ── value-weighted scan budgeting (issue #2) ────────────────────────────
+  // Every per-market `GET /market` spends against the shared 2 req/s ceiling, so scan budget is
+  // allocated by profit contribution rather than uniformly. Defaults keep the average market near
+  // the legacy 75s cadence while concentrating reads on high-value lanes and starving dead markets.
+  SCAN_BASE_MS: num(75_000), // base interval for an average-value, flat market (legacy MARKET_TTL_MS)
+  SCAN_MIN_MS: num(30_000), // hard floor — even the hottest market won't refresh faster than this
+  SCAN_MAX_MS: num(600_000), // hard ceiling — a dead market still gets a cheap re-check this often
+  SCAN_SWEEP_MS: num(10_000), // min wall-clock between due-checks (throttles getMarkets evaluation)
+  SCAN_VALUE_REALIZED_WEIGHT: num(1), // weight on realized lane-profit attribution
+  SCAN_VALUE_STRUCTURAL_WEIGHT: num(1), // weight on structural potential (Σ tradeVolume × margin)
+  SCAN_VALUE_VOLUME_WEIGHT: num(0), // weight on raw Σ tradeVolume (off by default; pure tie-breaker)
+  SCAN_VAL_FACTOR_MIN: num(0.1), // clamp on valueFactor = V/Vref (dead market floor)
+  SCAN_VAL_FACTOR_MAX: num(10), // clamp on valueFactor (hot market ceiling)
+  SCAN_VOL_ALPHA: num(0.3), // EWMA weight for per-market price-volatility updates
+  SCAN_VOL_GAIN: num(10), // maps relative price change → volatility multiplier
+  SCAN_VOL_FACTOR_MIN: num(0.5), // clamp on volFactor (flat market lengthens interval)
+  SCAN_VOL_FACTOR_MAX: num(4), // clamp on volFactor (churning market shortens interval)
+  LANE_VALUE_ALPHA: num(0.3), // EWMA weight for realized net per lane
+  LANE_VALUE_HALFLIFE_MS: num(1_800_000), // staleness half-life for a lane's realized value (30 min)
+  LANE_TOPK: num(20), // top-K lanes retained in the registry status block
+
   // ── phase / budget ──────────────────────────────────────────────────────
   BOOTSTRAP_FLEET_MIN: num(2),
   CREDIT_TARGET: num(0),

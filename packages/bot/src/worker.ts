@@ -293,6 +293,7 @@ export async function worker(shipSym: string, rawDeps: WorkerDeps): Promise<void
           sellPx: sellAvg,
         };
         persistence.appendTradeObservations([obs]);
+        marketsSvc.ingestTrade(obs); // [issue #2] feed realized lane value into the scan-budget registry
       }
     } catch (e) {
       log.warn(`${shipSym} lane ERR ${(e as Error).message}`);
