@@ -41,21 +41,29 @@ export function routeStr(ship: Ship, deps: Pick<SubsystemDeps, 'state' | 'cfg'>)
 
 /**
  * Background loop: every `FLEET_TABLE_MS`, snapshot each cargo hull's planned route into
- * `state.fleetRoutes` (keyed by the 3-char short id used across status). Inert when
- * `FLEET_TABLE` is off. (bot2 `fleetTable`)
+ * `state.fleetRoutes` (keyed by the 3-char short id used across status). When `SCAN_BUDGET_ON`, also
+ * refresh `state.coverageWps` (every ship's present + inbound waypoint) so the scan-budget scheduler
+ * can avoid spending reads on ship-absent markets. Inert when both `FLEET_TABLE` and `SCAN_BUDGET_ON`
+ * are off — reusing this existing poll avoids a second `getAllShips`. (bot2 `fleetTable`)
  */
 export async function fleetTableManager(deps: Pick<SubsystemDeps, 'state' | 'cfg' | 'client'>): Promise<void> {
   const { state, cfg, client } = deps;
-  if (!cfg.FLEET_TABLE) return;
+  if (!cfg.FLEET_TABLE && !cfg.SCAN_BUDGET_ON) return;
   while (!state.stop) {
     await sleep(cfg.FLEET_TABLE_MS);
     try {
       const all = await client.getAllShips();
+      const covered = new Set<string>();
       for (const s of all) {
-        if (s.cargo.capacity <= 0) continue;
+        // coverage presence: a market is scannable where a ship is present or inbound.
+        covered.add(s.nav.waypointSymbol);
+        const dest = s.nav.route?.destination?.symbol;
+        if (dest) covered.add(dest);
+        if (!cfg.FLEET_TABLE || s.cargo.capacity <= 0) continue;
         // [ROUTE] stash the ship's full multihop route for writeStatus()/the dashboard.
         state.fleetRoutes[s.symbol.slice(-3)] = routeStr(s, deps);
       }
+      if (cfg.SCAN_BUDGET_ON) state.coverageWps = covered;
     } catch (e) {
       log.info(`fleetTable: ${(e as Error).message}`);
     }

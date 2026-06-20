@@ -112,6 +112,48 @@ describe('markets: scan-budget priority scheduler (issue #2 phase 5 wiring)', ()
     expect(st!.granted).toBe(1);
     expect(st!.deferred).toBe(2);
   });
+
+  it('presence-gates: spends budget only on covered markets, counts the rest as uncovered', async () => {
+    // 3 due markets but only A has a ship present/inbound → B,C are price-blind, never granted.
+    const cfg = loadConfig({ SCAN_BUDGET_ON: '1' });
+    const { client: c, gets } = counting();
+    const m = createMarketsService({
+      client: c,
+      persistence,
+      coords,
+      maxd: 2000,
+      cfg,
+      marketWaypoints: ['A', 'B', 'C'],
+      coveredWps: () => new Set(['A']),
+    });
+    await m.getMarkets();
+    expect(gets()).toBe(1); // only the covered market was read — no budget leaked onto B/C
+    const st = m.scanBudgetStatus();
+    expect(st!.due).toBe(3);
+    expect(st!.granted).toBe(1);
+    expect(st!.uncovered).toBe(2);
+    expect(st!.deferred).toBe(0);
+  });
+
+  it('skips the gate when coverage is empty (cold start before the first fleet poll)', async () => {
+    // No coverage signal yet → ungated, behaves like today (all due markets eligible).
+    const cfg = loadConfig({ SCAN_BUDGET_ON: '1' });
+    const { client: c, gets } = counting();
+    const m = createMarketsService({
+      client: c,
+      persistence,
+      coords,
+      maxd: 2000,
+      cfg,
+      marketWaypoints: ['A', 'B', 'C'],
+      coveredWps: () => new Set(),
+    });
+    await m.getMarkets();
+    expect(gets()).toBe(3); // empty set → no gating
+    const st = m.scanBudgetStatus();
+    expect(st!.uncovered).toBe(0);
+    expect(st!.granted).toBe(3);
+  });
 });
 
 

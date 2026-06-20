@@ -99,6 +99,10 @@ export function scanBudgetPerSweep(opts: ScanBudgetOptions): number {
  * `scanPriority` desc (ties broken by higher overrun, so the longest-waiting goes first), grants the
  * top `budget`, defers the rest. Returns the granted/deferred split and a per-tier histogram of where
  * the budget was spent.
+ *
+ * Callers MUST pass only markets that are scannable right now (a ship present/inbound — a `GET /market`
+ * on an uncovered market returns no live prices, so budget there is wasted). Presence-gating is the
+ * caller's responsibility (see `markets.ts allocateDue`); this function is pure and presence-agnostic.
  */
 export function allocateScanBudget(candidates: readonly ScanCandidate[], budget: number): ScanAllocation {
   const ranked = [...candidates].sort((a, b) => {

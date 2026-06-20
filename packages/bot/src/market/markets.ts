@@ -62,6 +62,15 @@ export interface MarketsServiceOptions {
   marketWaypoints?: string[];
   /** Initial fuel price (defaults to 0.72). */
   fuelPxInit?: number;
+  /**
+   * Coverage-presence provider (issue #2, phase 5): the set of waypoints with a ship present or
+   * inbound right now. A `GET /market` only returns live prices where a ship is present, so the
+   * scan-budget scheduler grants reads ONLY to markets in this set — spending budget on an uncovered
+   * market is a wasted request. Supplied by `main` from `state.coverageWps` (the fleet poll).
+   * When omitted, or when it returns an empty set (cold start — before the first poll), the scheduler
+   * falls back to ungated allocation so behaviour matches today until coverage data exists.
+   */
+  coveredWps?: () => ReadonlySet<string>;
 }
 
 export interface MarketsServiceExtra {
@@ -99,6 +108,8 @@ export interface MarketsServiceExtra {
     due: number;
     granted: number;
     deferred: number;
+    /** DUE markets skipped because no ship is present/inbound (presence-gated, not budget-spent). */
+    uncovered: number;
     byTier: Record<ScanTier, number>;
   } | null;
 }
@@ -156,6 +167,7 @@ export function createMarketsService(opts: MarketsServiceOptions): MarketsServic
     due: number;
     granted: number;
     deferred: number;
+    uncovered: number;
     byTier: Record<ScanTier, number>;
   } | null = null;
 
@@ -276,10 +288,20 @@ export function createMarketsService(opts: MarketsServiceOptions): MarketsServic
    * Phase 5 allocation: rank the DUE markets by `value × staleness` and grant only the per-sweep
    * budget; the rest are deferred (their staleness keeps rising, so they win a later sweep — no
    * starvation). Records the split for the scan-budget metric. Returns the waypoints to fetch now.
+   *
+   * Presence-gate: a `GET /market` only returns live prices where a ship is present, so DUE markets
+   * with no ship present/inbound are dropped from candidacy BEFORE allocation — budget is never spent
+   * on a price-blind read. The cold re-check of uncovered markets stays a separate presence-gated
+   * single read (`recheckScan`), not part of this budget. The gate is skipped when no coverage signal
+   * exists yet (empty set — before the first fleet poll) so cold-start behaviour matches today.
    */
   function allocateDue(due: readonly string[], scoreByWp: Map<string, number>, t: number): string[] {
+    const covered = opts.coveredWps?.();
+    const gate = covered && covered.size > 0;
+    const scannable = gate ? due.filter((wp) => covered.has(wp)) : due;
+    const uncovered = due.length - scannable.length;
     const ref = scheduler!.valueRef(scoreByWp);
-    const candidates: ScanCandidate[] = due.map((wp) => {
+    const candidates: ScanCandidate[] = scannable.map((wp) => {
       const st = scheduler!.state(wp);
       const score = scoreByWp.get(wp) ?? 0;
       if (!st || st.scans === 0) {
@@ -303,6 +325,7 @@ export function createMarketsService(opts: MarketsServiceOptions): MarketsServic
       due: due.length,
       granted: alloc.granted.length,
       deferred: alloc.deferred.length,
+      uncovered,
       byTier: alloc.byTier,
     };
     return alloc.granted;
