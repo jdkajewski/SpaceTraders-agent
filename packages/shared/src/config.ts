@@ -270,6 +270,31 @@ const RawConfigSchema = z.object({
     'SHIP_HEAVY_FREIGHTER,SHIP_REFINING_FREIGHTER,SHIP_LIGHT_HAULER,SHIP_LIGHT_SHUTTLE,SHIP_COMMAND_FRIGATE',
   ),
 
+  // ── galaxy crawler (home-rooted BFS map for AUTO_EXPAND; default OFF) ──────
+  // When on, a gentle background crawler BFS-maps the jump-gate network from
+  // home, ranks rich markets, and persists the galaxy map (System/GateEdge/
+  // SystemRichness). AUTO_EXPAND consumes its ranked targets + gate graph.
+  GALAXY_CRAWL: boolOff,
+  // Min spacing between crawler API calls (ms) so trading ships keep priority
+  // on the shared 2 req/s account ceiling. ~1500–2000ms is gentle.
+  GALAXY_CRAWL_GAP_MS: num(1800),
+  // Systems persisted per batched upsert flush.
+  GALAXY_CRAWL_BATCH: num(25),
+  // Re-crawl a system for refresh once it is older than this (ms). Gates finish
+  // over time, so periodic re-checks keep build-state + richness fresh.
+  GALAXY_REFRESH_MS: num(3_600_000),
+  // Promote a ranked candidate to FULL-tier richness (per-market + shipyard
+  // reads) once it lands in the top-N by counts-tier score.
+  GALAXY_FULL_TOP_N: num(40),
+  // Ranking weights (score = Σ wᵢ·featureᵢ); marketplace count is primary.
+  GALAXY_W_MARKET: num(10),
+  GALAXY_W_IMPORT: num(3),
+  GALAXY_W_YARD: num(5),
+  GALAXY_W_PREMIUM: num(8),
+  // Stop the (already flag-guarded) mining manager once the gate is BUILT and
+  // expansion begins — lets mining colonies be abandoned post-gate.
+  MINE_STOP_AFTER_GATE: boolOff,
+
   // ── dry-run / offline smoke (Wave 5 — not in legacy bot2.mjs) ─────────────
   // When DRY_RUN=1 the SpaceTraders game client is swapped for a no-op fixture
   // client (no live game calls, no mutations); the bot still talks to the

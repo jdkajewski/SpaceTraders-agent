@@ -24,6 +24,7 @@
 
 import type { Config, Market, Ship } from '@st/shared';
 import type { ModeChoice } from '../interfaces.js';
+import type { GalaxyProvider } from '../galaxy/provider.js';
 import { partitionMarkets, sysOf } from './partition.js';
 
 const SLEEP_MS = 8000;
@@ -76,6 +77,13 @@ export interface ExpansionCtx {
   buyShip?: (shipType: string, wp: string) => Promise<string | null>;
   /** Resolve the contract negotiator so outposts never poach it. */
   negotiator?: () => string | null;
+  /**
+   * Galaxy provider (crawler-backed). When present, AUTO_EXPAND derives its
+   * outpost targets + unbounded gate paths + local-shipyard lookups from the
+   * persisted galaxy map instead of the hardcoded EXPAND_OUTPOSTS list + live
+   * per-call jump-gate reads. Absent ⇒ legacy behavior (back-compat).
+   */
+  galaxy?: GalaxyProvider;
 }
 
 type Role = 'HAULER' | 'LIGHT' | 'PROBE' | 'OUTPROBE' | 'OUTLIGHT';

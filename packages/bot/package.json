@@ -11,7 +11,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "clean": "rm -rf dist tsconfig.tsbuildinfo",
-    "start": "node dist/main.js"
+    "start": "node dist/main.js",
+    "galaxy": "node dist/galaxy/cli.js"
   },
   "dependencies": {
     "@st/shared": "workspace:*",
