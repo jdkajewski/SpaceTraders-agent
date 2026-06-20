@@ -99,6 +99,7 @@ export async function main(): Promise<void> {
         value: Math.round(l.value),
         trips: l.trips,
       })),
+      ...(state.coverage !== undefined ? { coverage: state.coverage } : {}),
     };
   };
 
