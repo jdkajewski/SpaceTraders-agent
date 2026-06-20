@@ -60,7 +60,7 @@ export async function main(): Promise<void> {
   // resets — no hardcoded system symbol. Skipped under DRY_RUN (no live agent). A pinned SYSTEM
   // always wins; a detection failure on an unpinned greenfield is fatal (we can't trade home-less).
   if (!cfg.SYSTEM && !cfg.DRY_RUN) {
-    const home = await resolveHome((m, p) => client.api(m as 'GET', p));
+    const home = await resolveHome((m, p) => client.api(m, p));
     if (!home) throw new Error('Home detection failed: /my/agent returned no headquarters and SYSTEM is unset');
     cfg.SYSTEM = home.homeSystem;
     log.info(`🏠 home auto-detected: ${home.homeSystem} (HQ ${home.hqWaypoint})`);
@@ -238,6 +238,15 @@ export async function main(): Promise<void> {
         persistence,
         now: () => Date.now(),
       });
+    } else {
+      // [GALAXY GUARD] Without the galaxy provider, expansion falls back to the rigid 2-hop
+      // home→hub→outer migration, so any frontier beyond 2 gate-hops is unreachable and deep
+      // outposts never get staffed. Make the cap loud so a live deep run isn't silently capped.
+      log.warn(
+        '🪐⚠ AUTO_EXPAND is ON but the galaxy provider is NOT wired (GALAXY_CRAWL off) — deep ' +
+          'expansion is capped at the rigid 2-hop home→hub→outer migration. Enable GALAXY_CRAWL for ' +
+          'unbounded gate-path frontier expansion.',
+      );
     }
     expansion = createExpansion(ctx);
     // Surface the expansion status block in the persisted snapshot's `expand` field.
