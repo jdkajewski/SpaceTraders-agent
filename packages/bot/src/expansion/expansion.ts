@@ -22,7 +22,7 @@
  * runtime state (members/outposts/caches) lives in this closure, as in the legacy module.
  */
 
-import type { Config, Market, Ship } from '@st/shared';
+import type { Config, Market, Ship, RankedSystem } from '@st/shared';
 import type { ModeChoice } from '../interfaces.js';
 import type { GalaxyProvider } from '../galaxy/provider.js';
 import { partitionMarkets, sysOf } from './partition.js';
@@ -159,6 +159,7 @@ export function createExpansion(ctx: ExpansionCtx): Expansion {
     launchWorker,
     buyShip,
     negotiator,
+    galaxy,
   } = ctx;
 
   const AUTO = cfg.AUTO_EXPAND;
@@ -176,11 +177,21 @@ export function createExpansion(ctx: ExpansionCtx): Expansion {
   const OP_OVERHEAD_MIN = cfg.EXPAND_OP_OVERHEAD_MIN; // buy+sell market handling baked into every lane
 
   // ---- OUTPOST FAN-OUT (default OFF) -----------------------------------------
-  const OUTPOSTS = [...toSet(cfg.EXPAND_OUTPOSTS)];
+  // OUTPOSTS is mutable: when the galaxy crawler is wired in and EXPAND_OUTPOSTS
+  // is empty, it's populated from the ranked rich-market list at trigger time,
+  // replacing the legacy hardcoded outpost list.
+  let OUTPOSTS = [...toSet(cfg.EXPAND_OUTPOSTS)];
+  const OUTPOST_MAX = cfg.EXPAND_OUTPOST_MAX; // # ranked systems to seed when galaxy-driven
   const OUTPOST_PROBES = cfg.EXPAND_OUTPOST_PROBES;
   const OUTPOST_TRADERS = cfg.EXPAND_OUTPOST_TRADERS;
   const outposts = new Map<string, Outpost>();
   let outpostsReady = false;
+  // galaxy fueled-relay plans: dest system → unbounded gate path + per-system gate wp
+  interface RelayPlan {
+    path: string[];
+    gateOf: Map<string, string>;
+  }
+  const relayPlans = new Map<string, RelayPlan | null>();
 
   // ---- AUTO-BUY (default OFF) -------------------------------------------------
   const AUTOBUY = cfg.EXPAND_AUTOBUY;
@@ -548,6 +559,60 @@ export function createExpansion(ctx: ExpansionCtx): Expansion {
     }
   }
 
+  // ---- galaxy fueled-relay: home → dest via the UNBOUNDED gate path ----------
+  // Resolve (and cache) the all-built gate path home→dest plus each system's gate
+  // waypoint, so a fueled hull can jump gate→gate across N systems (the old engine
+  // capped at a rigid 2-hop home→hub→outer migration).
+  async function relayPlanFor(destSys: string): Promise<RelayPlan | null> {
+    if (relayPlans.has(destSys)) return relayPlans.get(destSys) ?? null;
+    if (!galaxy) {
+      relayPlans.set(destSys, null);
+      return null;
+    }
+    let plan: RelayPlan | null = null;
+    try {
+      const path = await galaxy.gatePath(homeSystem, destSys);
+      if (path && path.length) {
+        const g = await galaxy.graph();
+        const gateOf = new Map<string, string>();
+        for (const s of g.systems) if (s.gateWaypoint) gateOf.set(s.symbol, s.gateWaypoint);
+        plan = { path, gateOf };
+      }
+    } catch (e) {
+      log(`🛰 relay path ERR ${destSys}: ${(e as Error).message}`);
+    }
+    relayPlans.set(destSys, plan);
+    return plan;
+  }
+
+  // advance ONE gate-jump toward op.sys along the preloaded path (per-tick, like jumpVia).
+  async function galaxyRelayStep(sym: string, ship: Ship, m: Member, op: Outpost): Promise<void> {
+    const plan = await relayPlanFor(op.sys);
+    if (!plan) {
+      m.last = `no gate path → ${op.sys}`;
+      await sleep(SLEEP_MS);
+      return;
+    }
+    const cur = sysOf(ship.nav.waypointSymbol);
+    const idx = plan.path.indexOf(cur);
+    if (idx < 0) {
+      m.last = `stray in ${cur} (relay)`;
+      await sleep(SLEEP_MS);
+      return;
+    }
+    if (idx >= plan.path.length - 1) return; // arrived → resident branch handles it
+    const nextSys = plan.path[idx + 1]!;
+    const fromGate = cur === homeSystem ? gateWp() : (plan.gateOf.get(cur) ?? null);
+    const toGate = plan.gateOf.get(nextSys) ?? (nextSys === op.sys ? op.gateWp : null);
+    if (!fromGate || !toGate) {
+      m.last = `await gate wp (${id(cur)}→${id(nextSys)})`;
+      await sleep(SLEEP_MS);
+      return;
+    }
+    m.last = `relay ${id(cur)}→${id(nextSys)} (${idx + 1}/${plan.path.length - 1})`;
+    await jumpVia(sym, ship, fromGate, toGate, cur === homeSystem ? homeMarkets() : {});
+  }
+
   // drive one outpost member: 2-hop migrate (home→hub→outer) then trade/scan PURELY LOCAL in the outer system.
   async function stepOutpost(sym: string, ship: Ship): Promise<void> {
     const m = members.get(sym);
@@ -642,6 +707,13 @@ export function createExpansion(ctx: ExpansionCtx): Expansion {
     }
 
     // ---- migration: home → hub (hop 1), then hub → outpost (hop 2) ----
+    // Galaxy mode: relay the fueled hull home → outpost over the UNBOUNDED gate
+    // path (no rigid 2-hop / direct-connection cap); probes/traders are then
+    // bought LOCALLY at the outpost yard by autoBuy once a hull is resident.
+    if (galaxy) {
+      await galaxyRelayStep(sym, ship, m, op);
+      return;
+    }
     if (!hubGate || !hubSys) {
       m.last = 'await hub';
       await sleep(SLEEP_MS);
@@ -920,18 +992,24 @@ export function createExpansion(ctx: ExpansionCtx): Expansion {
   // assign small resident crews to each configured outer system (drawn from idle ships not used by the hub).
   async function setupOutposts(): Promise<void> {
     if (!OUTPOSTS.length || outpostsReady || !target) return;
+    // Legacy mode resolves outpost gates from the hub gate's direct connections.
+    // Galaxy mode resolves them from the preloaded graph + an UNBOUNDED reachability
+    // check, so deep (N-hop) ranked targets are no longer skipped for not being a
+    // direct hub neighbour.
     let conns: string[] = [];
-    try {
-      conns =
-        (await api<{ data?: { connections?: string[] } }>('GET', `/systems/${target.sys}/waypoints/${target.gateWp}/jump-gate`)).data
-          ?.connections || [];
-    } catch (e) {
-      log(`🛰 outpost gate read ERR ${(e as Error).message} — will retry`);
-      return;
-    }
-    if (!conns.length) {
-      log('🛰 hub gate has no connections yet — will retry outposts');
-      return;
+    if (!galaxy) {
+      try {
+        conns =
+          (await api<{ data?: { connections?: string[] } }>('GET', `/systems/${target.sys}/waypoints/${target.gateWp}/jump-gate`)).data
+            ?.connections || [];
+      } catch (e) {
+        log(`🛰 outpost gate read ERR ${(e as Error).message} — will retry`);
+        return;
+      }
+      if (!conns.length) {
+        log('🛰 hub gate has no connections yet — will retry outposts');
+        return;
+      }
     }
     let all: Ship[];
     try {
@@ -975,10 +1053,31 @@ export function createExpansion(ctx: ExpansionCtx): Expansion {
     };
 
     for (const sys of OUTPOSTS) {
-      const gw = conns.find((c) => sysOf(c) === sys);
-      if (!gw) {
-        log(`🛰 outpost ${sys} not among hub connections [${conns.map(sysOf).join(', ')}] — skip`);
-        continue;
+      let gw: string | undefined;
+      if (galaxy) {
+        // resolve gate wp from the graph; validate reachability via unbounded BFS.
+        try {
+          const g = await galaxy.graph();
+          gw = g.systems.find((s) => s.symbol === sys)?.gateWaypoint ?? undefined;
+        } catch (e) {
+          log(`🛰 outpost ${sys} graph read ERR ${(e as Error).message} — skip`);
+          continue;
+        }
+        if (!gw) {
+          log(`🛰 outpost ${sys} has no known gate waypoint yet — skip`);
+          continue;
+        }
+        const path = await galaxy.gatePath(homeSystem, sys);
+        if (!path) {
+          log(`🛰 outpost ${sys} unreachable (no all-built gate path) — skip`);
+          continue;
+        }
+      } else {
+        gw = conns.find((c) => sysOf(c) === sys);
+        if (!gw) {
+          log(`🛰 outpost ${sys} not among hub connections [${conns.map(sysOf).join(', ')}] — skip`);
+          continue;
+        }
       }
       outposts.set(sys, { sys, gateWp: gw, markets: {}, marketWps: [], loaded: false });
     }
@@ -1208,6 +1307,68 @@ export function createExpansion(ctx: ExpansionCtx): Expansion {
       return;
     }
     if (!gateBuilt()) return;
+
+    // ── Galaxy-driven trigger: dynamic ranked outposts + unbounded fueled relay ──
+    // Replaces the hardcoded outpost list + first-connection hub. The background
+    // crawler has been mapping + ranking the reachable galaxy during PROFIT/GATE,
+    // so at PORTAL_OPEN we pick the richest reachable systems and seed each via a
+    // fueled N-hop relay, then buy probes/traders LOCALLY at each yard.
+    if (galaxy) {
+      let ranked: RankedSystem[];
+      try {
+        ranked = await galaxy.rankedTargets(OUTPOST_MAX + 4);
+      } catch (e) {
+        if (!triggerLogged) {
+          log(`🪐 galaxy ranked read ERR ${(e as Error).message} — will retry`);
+          triggerLogged = true;
+        }
+        return;
+      }
+      let reach = ranked.filter((r) => r.reachable && r.gateWaypoint && r.symbol !== homeSystem);
+      if (WANT_TARGET) {
+        const pin = reach.find((r) => r.symbol === WANT_TARGET);
+        if (pin) reach = [pin, ...reach.filter((r) => r.symbol !== WANT_TARGET)];
+        else log(`🪐 EXPAND_TARGET_SYSTEM=${WANT_TARGET} not reachable/ranked yet — using ranked order`);
+      }
+      if (!reach.length) {
+        if (!triggerLogged) {
+          log('🪐 galaxy: no reachable ranked targets yet — crawler still mapping; will retry');
+          triggerLogged = true;
+        }
+        return;
+      }
+      const chosen = reach.slice(0, Math.max(1, OUTPOST_MAX));
+      const hubSys = OUTPOSTS.length ? OUTPOSTS[0]! : chosen[0]!.symbol;
+      let hubGate: string | null = null;
+      try {
+        const g = await galaxy.graph();
+        hubGate = g.systems.find((s) => s.symbol === hubSys)?.gateWaypoint ?? null;
+      } catch (e) {
+        if (!triggerLogged) {
+          log(`🪐 galaxy graph read ERR ${(e as Error).message} — will retry`);
+          triggerLogged = true;
+        }
+        return;
+      }
+      if (!hubGate) {
+        if (!triggerLogged) {
+          log(`🪐 galaxy: hub ${hubSys} gate waypoint unknown yet — will retry`);
+          triggerLogged = true;
+        }
+        return;
+      }
+      target = { sys: hubSys, gateWp: hubGate };
+      if (!OUTPOSTS.length) OUTPOSTS = chosen.map((r) => r.symbol);
+      await loadTargetSystem(target.sys);
+      triggered = true;
+      log(
+        `🪐🚀 AUTO-EXPAND TRIGGERED (galaxy) → hub ${target.sys}; outposts [${OUTPOSTS.join(', ')}]. ` +
+          `Fueled-relay seeding (idle traders relay N-hop), local buys at each yard. Floor=${FLOOR.toLocaleString()}.`,
+      );
+      await setupOutposts();
+      return;
+    }
+
     const gw = gateWp();
     if (!gw) return;
     // resolve the target gate from the home gate's connections
@@ -1253,6 +1414,7 @@ export function createExpansion(ctx: ExpansionCtx): Expansion {
     return {
       enabled: AUTO,
       triggered,
+      galaxy: !!galaxy,
       target: target ? target.sys : WANT_TARGET || 'auto',
       floor: FLOOR,
       antimatterPx,

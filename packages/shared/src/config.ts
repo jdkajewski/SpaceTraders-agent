@@ -258,6 +258,13 @@ const RawConfigSchema = z.object({
   EXPAND_OUTPOSTS: csvSet,
   EXPAND_OUTPOST_PROBES: num(2),
   EXPAND_OUTPOST_TRADERS: num(1),
+  // galaxy-driven outpost selection: when AUTO_EXPAND runs with the crawler
+  // (GALAXY_CRAWL) and EXPAND_OUTPOSTS is empty, seed the top-N ranked reachable
+  // systems as outposts instead of a hardcoded list.
+  EXPAND_OUTPOST_MAX: num(6),
+  // fueled-relay seeding hull (port of seed-relay.mjs): relay ONE fueled hull
+  // home→target via chained gate jumps, then buy probes/traders LOCALLY.
+  EXPAND_RELAY_HULL: str('SHIP_LIGHT_HAULER'),
   // fleet auto-buy (default OFF)
   EXPAND_AUTOBUY: boolOff,
   // 0 ⇒ derived at runtime (max(FLOOR+250_000, 700_000)); see createExpansion.
@@ -292,8 +299,10 @@ const RawConfigSchema = z.object({
   GALAXY_W_YARD: num(5),
   GALAXY_W_PREMIUM: num(8),
   // Stop the (already flag-guarded) mining manager once the gate is BUILT and
-  // expansion begins — lets mining colonies be abandoned post-gate.
-  MINE_STOP_AFTER_GATE: boolOff,
+  // expansion begins — lets mining colonies be abandoned post-gate. Default ON
+  // (preserves the legacy always-stop-after-gate behavior); set to 0 to keep
+  // mining running through and after expansion.
+  MINE_STOP_AFTER_GATE: boolOn,
 
   // ── dry-run / offline smoke (Wave 5 — not in legacy bot2.mjs) ─────────────
   // When DRY_RUN=1 the SpaceTraders game client is swapped for a no-op fixture

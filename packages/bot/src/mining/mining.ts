@@ -105,7 +105,9 @@ export function pickMineTender(all: Ship[], opts: { transportPins?: readonly str
 function mineCfg(deps: SubsystemDeps): RoleOptions {
   return {
     mineFeed: deps.cfg.MINE_FEED,
-    gateBuilt: deps.state.gateCache.built,
+    // abandon mining once the gate is BUILT — but only when the lever is set
+    // (default ON). With MINE_STOP_AFTER_GATE=0 mining persists through expansion.
+    gateBuilt: deps.state.gateCache.built && deps.cfg.MINE_STOP_AFTER_GATE,
     funnelSyms: deps.cfg.MINE_FUNNEL,
     transportSyms: deps.cfg.MINE_TRANSPORT,
     tenderSym: deps.state.mining.tenderSym,
