@@ -132,20 +132,29 @@ async function buyShip(shipType: string, waypointSymbol: string, deps: Pick<Subs
   }
 }
 
-function pickAnchorYards(yards: Record<string, ShipyardOffer>): { probeYard: string | null; cargoYard: string | null; anchorYard: string | null } {
+// Picks the yards to buy probes and cargo ships from. Takes the FULL per-yard type map
+// (type → every waypoint selling it) rather than the price-collapsed offer map: a yard that
+// sells a type only counts if its waypoint appears here, and the offer map keeps just the
+// cheapest waypoint per type, which can hide that a single yard sells BOTH probes and cargo.
+function pickAnchorYards(yardTypes: Record<string, string[]>): { probeYard: string | null; cargoYard: string | null; anchorYard: string | null } {
   const byWp = new Map<string, Set<string>>();
-  for (const [type, offer] of Object.entries(yards)) {
-    const set = byWp.get(offer.wp) ?? new Set<string>();
-    set.add(type);
-    byWp.set(offer.wp, set);
+  for (const [type, wps] of Object.entries(yardTypes)) {
+    for (const wp of wps) {
+      if (!wp) continue;
+      const set = byWp.get(wp) ?? new Set<string>();
+      set.add(type);
+      byWp.set(wp, set);
+    }
   }
   const entries = [...byWp.entries()];
   const hasProbe = ([, types]: [string, Set<string>]) => types.has('SHIP_PROBE');
   const hasCargo = ([, types]: [string, Set<string>]) => types.has('SHIP_LIGHT_HAULER') || types.has('SHIP_LIGHT_SHUTTLE');
-  const anchorYard = entries.find((e) => hasProbe(e) && hasCargo(e))?.[0] ?? null;
-  const probeYard = anchorYard ?? entries.find(hasProbe)?.[0] ?? null;
-  const cargoYard = anchorYard ?? entries.find(hasCargo)?.[0] ?? null;
-  return { probeYard, cargoYard, anchorYard: anchorYard ?? probeYard };
+  // Prefer a single yard that sells BOTH probes and cargo ships so one anchored probe can buy
+  // everything. Only fall back to separate probe/cargo yards when no combined yard exists.
+  const combined = entries.find((e) => hasProbe(e) && hasCargo(e))?.[0] ?? null;
+  const probeYard = combined ?? entries.find(hasProbe)?.[0] ?? null;
+  const cargoYard = combined ?? entries.find(hasCargo)?.[0] ?? null;
+  return { probeYard, cargoYard, anchorYard: combined ?? probeYard };
 }
 
 export async function fleetScaleManager(deps: SubsystemDeps): Promise<void> {
@@ -153,15 +162,21 @@ export async function fleetScaleManager(deps: SubsystemDeps): Promise<void> {
   if (!cfg.FLEET_SCALE) return;
   await sleep(STARTUP_DELAY_MS);
 
-  const yards = await getShipyards(deps, true);
-  const { probeYard, cargoYard, anchorYard } = pickAnchorYards(yards);
+  // Populate the per-yard shipyard cache (state.fleet.shipyards), then pick anchor yards from the
+  // full type→waypoints map so a yard selling both probes and cargo is detected even when a cheaper
+  // probe exists elsewhere.
+  await getShipyards(deps, true);
+  const { probeYard, cargoYard, anchorYard } = pickAnchorYards(state.fleet.shipyards ?? {});
   if (!probeYard || !anchorYard) {
     log.info('🛰 FLEET_SCALE: no probe-selling shipyard found — disabled');
     return;
   }
   log.info(`🛰 FLEET_SCALE armed — anchorYard ${anchorYard.slice(-3)} (probe ${probeYard.slice(-3)}, cargo ${cargoYard?.slice(-3) ?? 'none'}), floor ${cfg.FLEET_SCALE_FLOOR.toLocaleString()}`);
 
-  let anchorSent = false;
+  // Yards we must keep a docked ship at so buys can fire. When one combined yard sells everything
+  // these collapse to a single entry; otherwise we anchor a probe at both the probe and cargo yard.
+  const buyYards = [...new Set([probeYard, cargoYard, anchorYard].filter(Boolean) as string[])];
+  const anchored = new Set<string>();
   while (!state.stop) {
     try {
       if (state.gateCache.built) {
@@ -171,21 +186,27 @@ export async function fleetScaleManager(deps: SubsystemDeps): Promise<void> {
       const markets = await deps.markets.getMarkets();
       const marketWps = Object.keys(markets);
       const all = await client.getAllShips();
-      const atYard = all.find((s) => s.nav.waypointSymbol === anchorYard && s.nav.status !== 'IN_TRANSIT');
-      const headingYard = all.find((s) => s.nav.status === 'IN_TRANSIT' && s.nav.route?.destination?.symbol === anchorYard);
-      if (!atYard && !headingYard && !anchorSent) {
-        const freeProbe = all.find((s) => isProbeHull(s) && s.symbol !== cfg.NEGOTIATOR && s.nav.status !== 'IN_TRANSIT');
+      const shipReadyAt = (yard: string) => all.find((s) => s.nav.waypointSymbol === yard && s.nav.status !== 'IN_TRANSIT');
+      const shipHeadingTo = (yard: string) => all.find((s) => s.nav.status === 'IN_TRANSIT' && s.nav.route?.destination?.symbol === yard);
+      // Keep a non-negotiator probe parked at each buy yard so purchases can fire there. Don't pull
+      // a probe that's already sitting on one of the buy yards (it may be anchoring a different one).
+      for (const yard of buyYards) {
+        if (shipReadyAt(yard) || shipHeadingTo(yard) || anchored.has(yard)) continue;
+        const freeProbe = all.find(
+          (s) => isProbeHull(s) && s.symbol !== cfg.NEGOTIATOR && s.nav.status !== 'IN_TRANSIT' && !buyYards.includes(s.nav.waypointSymbol),
+        );
         if (freeProbe) {
           try {
             if (freeProbe.nav.status === 'DOCKED') await client.api('POST', `/my/ships/${freeProbe.symbol}/orbit`);
-            await client.api('POST', `/my/ships/${freeProbe.symbol}/navigate`, { waypointSymbol: anchorYard });
-            anchorSent = true;
-            log.info(`🛰 FLEET_SCALE: anchoring ${freeProbe.symbol.slice(-3)} → ${anchorYard.slice(-3)} for buys`);
+            await client.api('POST', `/my/ships/${freeProbe.symbol}/navigate`, { waypointSymbol: yard });
+            anchored.add(yard);
+            log.info(`🛰 FLEET_SCALE: anchoring ${freeProbe.symbol.slice(-3)} → ${yard.slice(-3)} for buys`);
           } catch (e) {
             log.warn(`🛰 anchor ERR ${(e as Error).message}`);
           }
         }
       }
+      const atYard = shipReadyAt(anchorYard);
 
       if (growthBudget(state) < 1000 || state.cachedCredits < cfg.FLEET_SCALE_FLOOR) {
         await sleep(cfg.FLEET_SCALE_MS);
@@ -244,6 +265,17 @@ export async function fleetScaleManager(deps: SubsystemDeps): Promise<void> {
       if (atYard.nav.status !== 'DOCKED') {
         try { await client.api('POST', `/my/ships/${atYard.symbol}/dock`); } catch {}
       }
+      // Ensure a ship is docked at an arbitrary buy yard (used when the cargo yard differs from the
+      // probe anchor yard). Returns false when no ship is parked there yet — the anchor loop above
+      // will route one over on a later tick.
+      const ensureDockedAt = async (yard: string): Promise<boolean> => {
+        const s = shipReadyAt(yard);
+        if (!s) return false;
+        if (s.nav.status !== 'DOCKED') {
+          try { await client.api('POST', `/my/ships/${s.symbol}/dock`); } catch {}
+        }
+        return true;
+      };
 
       const freshYards = await getShipyards(deps, true);
       const probePx = freshYards.SHIP_PROBE?.price ?? PROBE_PRICE_EST;
@@ -291,8 +323,12 @@ export async function fleetScaleManager(deps: SubsystemDeps): Promise<void> {
           continue;
         }
       }
-      if (cargoShips < cfg.FLEET_TARGET_TRADERS && state.cachedCredits >= cfg.FLEET_SHUTTLE_MIN && canAfford(shuttlePx)) {
-        const bought = await buyShip('SHIP_LIGHT_SHUTTLE', anchorYard, deps);
+      // Cargo ships (traders) are bought at the cargo yard, which may differ from the probe anchor
+      // yard — buying SHIP_LIGHT_SHUTTLE at a probe-only yard returns a 400. Require a docked ship
+      // there first.
+      const cargoReady = cargoYard ? (cargoYard === anchorYard ? true : await ensureDockedAt(cargoYard)) : false;
+      if (cargoYard && cargoReady && cargoShips < cfg.FLEET_TARGET_TRADERS && state.cachedCredits >= cfg.FLEET_SHUTTLE_MIN && canAfford(shuttlePx)) {
+        const bought = await buyShip('SHIP_LIGHT_SHUTTLE', cargoYard, deps);
         if (bought) {
           log.info(`🛰 FLEET_SCALE bought LIGHT_SHUTTLE ${bought.slice(-3)} @ ${shuttlePx.toLocaleString()} → trade pool (cargo ships ${cargoShips + 1})`);
           deps.launchWorker(bought); // bought trader joins the supervised pool (bot2 L3062)
@@ -300,8 +336,8 @@ export async function fleetScaleManager(deps: SubsystemDeps): Promise<void> {
         await sleep(cfg.FLEET_SCALE_MS);
         continue;
       }
-      if (cargoShips < cfg.FLEET_TARGET_TRADERS && state.cachedCredits >= cfg.FLEET_HAULER_MIN && haulers < cfg.FLEET_MAX_HAULERS && canAfford(haulPx)) {
-        const bought = await buyShip('SHIP_LIGHT_HAULER', anchorYard, deps);
+      if (cargoYard && cargoReady && cargoShips < cfg.FLEET_TARGET_TRADERS && state.cachedCredits >= cfg.FLEET_HAULER_MIN && haulers < cfg.FLEET_MAX_HAULERS && canAfford(haulPx)) {
+        const bought = await buyShip('SHIP_LIGHT_HAULER', cargoYard, deps);
         if (bought) {
           log.info(`🛰 FLEET_SCALE bought LIGHT_HAULER ${bought.slice(-3)} @ ${haulPx.toLocaleString()} → trade pool (cargo ships ${cargoShips + 1})`);
           deps.launchWorker(bought); // bought trader joins the supervised pool (bot2 L3062)
@@ -316,4 +352,4 @@ export async function fleetScaleManager(deps: SubsystemDeps): Promise<void> {
   }
 }
 
-export const __test = { SHIPYARD_TTL_MS, STARTUP_DELAY_MS };
+export const __test = { SHIPYARD_TTL_MS, STARTUP_DELAY_MS, pickAnchorYards };

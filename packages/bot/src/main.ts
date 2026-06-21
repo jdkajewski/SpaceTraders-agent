@@ -82,6 +82,40 @@ export async function main(): Promise<void> {
   );
   const D: DistFn = (a, b) => distance(a, b, coords);
 
+  // [GREENFIELD] Eager home-system coordinates. On a fresh reset the persistence waypoint table is
+  // empty, so D() has no coords → every candidate lane fails the MAXD distance gate → buildLanes()
+  // returns nothing → the bot can never trade (sole starter ship parks forever). Pull the home
+  // system's waypoints straight from the game API and populate the coords map so routing + lane
+  // building work from the first tick. Idempotent: skipped once home coords are already present
+  // (established runs load them from persistence). (issues #16/#17)
+  if (!cfg.DRY_RUN && cfg.SYSTEM) {
+    const haveHomeCoords = Object.keys(coords).some((k) => k.startsWith(`${cfg.SYSTEM}-`));
+    if (!haveHomeCoords) {
+      try {
+        let page = 1;
+        let total = Infinity;
+        let added = 0;
+        while ((page - 1) * 20 < total) {
+          const env = await client.api<{ data: Array<{ symbol: string; x?: number; y?: number }>; meta?: { total?: number } }>(
+            'GET',
+            `/systems/${cfg.SYSTEM}/waypoints?limit=20&page=${page}`,
+          );
+          total = env.meta?.total ?? env.data.length;
+          for (const w of env.data)
+            if (typeof w.x === 'number' && typeof w.y === 'number') {
+              coords[w.symbol] = [w.x, w.y] as const;
+              added += 1;
+            }
+          if (!env.data.length) break;
+          page += 1;
+        }
+        log.info(`🗺  eager home coords: loaded ${added} ${cfg.SYSTEM} waypoint coordinate(s) for routing`);
+      } catch (e) {
+        log.warn(`eager home coords failed (${(e as Error).message}) — routing may stall until the crawler maps home`);
+      }
+    }
+  }
+
   // one shared, synchronously-readable market snapshot (mirrors bot2's marketCache.data).
   const marketHolder: { data: Record<string, Market> } = { data: {} };
   const marketsRef = (): Record<string, Market> => marketHolder.data;
