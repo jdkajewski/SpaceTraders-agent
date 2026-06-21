@@ -283,11 +283,19 @@ export interface ClaimDeps {
 export function selectLane(ship: Ship, lanes: Lane[], markets: Record<string, Market>, deps: ClaimDeps): ClaimResult {
   const { state, cfg, router } = deps;
   const cand: Array<{ l: Lane; score: number; estCost: number; net: number; bias?: number }> = [];
-  for (const l of lanes) {
-    const st = gs(state, l.sym);
+  for (const l0 of lanes) {
+    const st = gs(state, l0.sym);
     if (st.lockedBy || now() < st.cooldownUntil) continue; // locked or cooling down
-    const estCost = Math.ceil(l.units * l.buy * 1.1); // buy cost + slippage headroom
-    if (estCost > availableForWork(state)) continue; // would breach operating reserve
+    // [GREENFIELD/CAPITAL] Scale the lot to what we can actually afford instead of rejecting the whole
+    // lane when the full tradeVolume lot exceeds the working budget. A capital-constrained bot (fresh
+    // reset, tiny starting credits) must still trade high-value goods by buying fewer units — the old
+    // hard reject (estCost > available → continue) left the sole starter ship parked despite real lanes.
+    const unitCost = l0.buy * 1.1; // per-unit buy cost + slippage headroom
+    const affordableUnits = unitCost > 0 ? Math.floor(availableForWork(state) / unitCost) : 0;
+    const units = Math.min(l0.units, affordableUnits);
+    if (units < 1) continue; // can't afford even one unit → skip this lane
+    const l: Lane = units === l0.units ? l0 : { ...l0, units, gross: l0.margin * units };
+    const estCost = Math.ceil(l.units * l.buy * 1.1);
     const repo = router.routeCost(ship.nav.waypointSymbol, l.buyWp, ship);
     const haul = router.routeCost(l.buyWp, l.sellWp, ship);
     const fuelCr = repo.fuelCr + haul.fuelCr;

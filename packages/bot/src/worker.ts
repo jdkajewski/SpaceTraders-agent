@@ -17,7 +17,7 @@ import type { MarketsServiceExtra } from './market/markets.js';
 import type { DistFn } from './trade/lanes.js';
 import { buildLanes, claimLane, planRideAlongs, cooldownFor } from './trade/lanes.js';
 import { gs } from './runtime/state.js';
-import { commit, uncommit, growthBudget } from './budget/budget.js';
+import { commit, uncommit, growthBudget, availableForWork } from './budget/budget.js';
 import { record } from './status.js';
 import { saveIntent, clearIntent, reconcileHeldCargo, type StoredRideAlong } from './recovery.js';
 import { logger } from './core/logger.js';
@@ -204,6 +204,11 @@ export async function worker(shipSym: string, rawDeps: WorkerDeps): Promise<void
     const lanes = buildLanes(markets, state, cfg, deps.D);
     const claim = claimLane(ship, lanes, markets, { state, cfg, router, D: deps.D });
     if (!claim) {
+      // [DEBUG-GF] one-line visibility into why a ship parks (markets priced / lanes built / budget)
+      const priced = Object.values(markets).filter((m) => (m.tradeGoods?.length ?? 0) > 0).length;
+      log.info(
+        `🔎 ${shipSym.slice(-3)} no-claim @${ship.nav.waypointSymbol.slice(-4)}: markets=${Object.keys(markets).length} priced=${priced} lanes=${lanes.length} avail=${Math.round(availableForWork(state))} top=${lanes[0] ? `${lanes[0].sym} ${lanes[0].buyWp.slice(-4)}→${lanes[0].sellWp.slice(-4)} buy${lanes[0].buy} u${lanes[0].units}` : 'none'}`,
+      );
       if (await hooks.inputFeedTrip(shipSym, ship, markets)) continue; // [INPUT_FEED] no lane → profitable feed
       if (await hooks.gateSupplyTrip(shipSym, ship, markets)) continue; // [GATE] still no work → supply the gate ($0)
       state.perShip[shipSym].last = 'PARKED (no profitable lane)';
