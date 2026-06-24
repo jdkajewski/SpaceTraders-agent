@@ -1,6 +1,7 @@
 import type { ApiEnvelope } from '../interfaces.js';
 import type { SubsystemDeps } from '../subsystems/deps.js';
 import type { Ship } from '@st/shared';
+import type { CoveragePlan } from '../market/coverage.js';
 import { growthBudget } from '../budget/budget.js';
 import { logger } from '../core/logger.js';
 
@@ -42,6 +43,84 @@ export function probeTargetFor(cargoShipCount: number, base: number, ratio: numb
 export function cappedProbeTarget(cargoShipCount: number, marketCount: number, base: number, ratio: number, maxProbes = 0): number {
   const probeCap = maxProbes > 0 ? Math.min(maxProbes, marketCount) : marketCount;
   return Math.min(probeCap, probeTargetFor(cargoShipCount, base, ratio));
+}
+
+/** Coverage telemetry surfaced in `state.coverage` (issue #2 phases 4+7, observe baseline). */
+export interface CoverageTelemetry {
+  tierCounts: Record<string, number>;
+  target: number;
+  covered: number;
+  probesSaved: number;
+  recheckDue: number;
+  wouldPrune: number;
+  wouldRedeploy: number;
+  observe: boolean;
+  adaptive: boolean;
+  prune: boolean;
+  updatedAt: number;
+}
+
+export interface CoverageModeInput {
+  /** Brain output for this tick, or null when the brain didn't run (no OBSERVE/ADAPTIVE). */
+  plan: CoveragePlan | null;
+  observe: boolean;
+  adaptive: boolean;
+  prune: boolean;
+  /** Legacy 1:1 probe target used when the value-driven target isn't enacted. */
+  legacyProbeTarget: number;
+  /** Waypoints with a movable probe parked (excludes the negotiator + in-transit ships). */
+  parkedProbeWps: ReadonlySet<string>;
+  /** Whether a value-driven placement destination exists this tick (valuePlaceOrder non-empty). */
+  hasValueDest: boolean;
+  /** Markets currently covered (for the telemetry `covered` count). */
+  coveredCount: number;
+  now: number;
+}
+
+export interface CoverageMode {
+  /** Use the value-driven probe TARGET + PLACEMENT this tick (false in pure-observe / legacy). */
+  enactAdaptive: boolean;
+  /** Allowed to redeploy a probe off a DEAD market this tick (false in pure-observe / legacy). */
+  enactPrune: boolean;
+  /** Effective probe target: value-driven when enacting, else legacy. */
+  probeTarget: number;
+  /** Coverage telemetry for `state.coverage`; null when the brain didn't run. */
+  telemetry: CoverageTelemetry | null;
+}
+
+/**
+ * Resolve the coverage controller mode for one tick (issue #2 phases 4+7 + observe baseline).
+ *
+ * Precedence — **OBSERVE forces a pure-observe baseline**: when `observe` is set the brain runs for
+ * TELEMETRY ONLY (probe target/placement stay legacy, nothing is redeployed) even if `adaptive`/`prune`
+ * are also set. Flip OBSERVE off and ADAPTIVE/PRUNE on to ENACT. With all three off the brain never
+ * runs (`plan === null`) and this returns the legacy target with no telemetry — byte-for-byte legacy.
+ *
+ * `wouldPrune`/`wouldRedeploy` are dry-run signals computed whenever the brain ran (observe OR adaptive):
+ * the DEAD prune candidates, and the subset that has a movable probe parked AND a value destination —
+ * i.e. what enacting WOULD actually move — so the observe pass shows the redeploys it would make.
+ */
+export function coverageMode(input: CoverageModeInput): CoverageMode {
+  const { plan, observe, adaptive, prune, legacyProbeTarget, parkedProbeWps, hasValueDest, coveredCount, now } = input;
+  const enactAdaptive = !!plan && adaptive && !observe;
+  const enactPrune = !!plan && adaptive && prune && !observe;
+  const probeTarget = enactAdaptive && plan ? plan.shouldCover.length : legacyProbeTarget;
+  if (!plan) return { enactAdaptive, enactPrune, probeTarget, telemetry: null };
+  const redeployable = plan.toPrune.filter((wp) => parkedProbeWps.has(wp)).length;
+  const telemetry: CoverageTelemetry = {
+    tierCounts: plan.counts,
+    target: plan.shouldCover.length,
+    covered: coveredCount,
+    probesSaved: plan.probesSaved,
+    recheckDue: plan.recheckDue.length,
+    wouldPrune: plan.toPrune.length,
+    wouldRedeploy: hasValueDest ? redeployable : 0,
+    observe,
+    adaptive,
+    prune,
+    updatedAt: now,
+  };
+  return { enactAdaptive, enactPrune, probeTarget, telemetry };
 }
 
 export function shipyardWps(yards: Record<string, ShipyardOffer>): string[] {
@@ -204,31 +283,40 @@ export async function fleetScaleManager(deps: SubsystemDeps): Promise<void> {
       const haulers = all.filter((s) => !isProbeHull(s) && (s.cargo?.capacity ?? 0) >= 80).length;
       const legacyProbeTarget = cappedProbeTarget(cargoShips, marketWps.length, cfg.FLEET_BASE_PROBES, cfg.FLEET_PROBE_RATIO, cfg.FLEET_MAX_PROBES);
 
-      // [issue #2 phases 4+7] Value-driven coverage controller (opt-in). When FLEET_COVERAGE_ADAPTIVE
-      // is on, probe TARGET + PLACEMENT follow live per-market value instead of ~1 probe per market.
-      // FLEET_COVERAGE_PRUNE additionally redeploys probes off markets we've read and found DEAD. Both
-      // default OFF → this whole block is inert and behaviour is byte-for-byte the legacy path.
-      const plan = cfg.FLEET_COVERAGE_ADAPTIVE
+      // [issue #2 phases 4+7 + observe baseline] Value-driven coverage controller (opt-in). The brain
+      // runs when OBSERVE or ADAPTIVE is set. OBSERVE forces a pure-observe baseline (telemetry only,
+      // legacy buys/placement, no redeploys) even if ADAPTIVE/PRUNE are set; flip OBSERVE off +
+      // ADAPTIVE/PRUNE on to enact. All three off → brain inert → byte-for-byte legacy.
+      const runBrain = cfg.FLEET_COVERAGE_OBSERVE || cfg.FLEET_COVERAGE_ADAPTIVE;
+      const plan = runBrain
         ? deps.markets.coveragePlan(covered, { fleetSize: all.length, marketCount: marketWps.length })
         : null;
-      if (plan) {
-        state.coverage = {
-          tierCounts: plan.counts,
-          target: plan.shouldCover.length,
-          covered: marketWps.length - uncovered.length,
-          probesSaved: plan.probesSaved,
-          recheckDue: plan.recheckDue.length,
-          adaptive: cfg.FLEET_COVERAGE_ADAPTIVE,
-          prune: cfg.FLEET_COVERAGE_PRUNE,
-          updatedAt: Date.now(),
-        };
-      }
-      // Probe target: count of markets actually worth covering (value-driven), else the legacy 1:1 cap.
-      const probeTarget = plan ? plan.shouldCover.length : legacyProbeTarget;
-      // Placement order: highest-value uncovered first (value-driven), else legacy export-preferring + nearest.
+      const valuePlaceOrder = plan
+        ? [...plan.toCover, ...plan.recheckDue].filter((w, i, a) => a.indexOf(w) === i && !covered.has(w))
+        : [];
+      const parkedProbeWps = new Set(
+        all
+          .filter((s) => isProbeHull(s) && s.symbol !== cfg.NEGOTIATOR && s.nav.status !== 'IN_TRANSIT')
+          .map((s) => s.nav.waypointSymbol),
+      );
+      const mode = coverageMode({
+        plan,
+        observe: cfg.FLEET_COVERAGE_OBSERVE,
+        adaptive: cfg.FLEET_COVERAGE_ADAPTIVE,
+        prune: cfg.FLEET_COVERAGE_PRUNE,
+        legacyProbeTarget,
+        parkedProbeWps,
+        hasValueDest: valuePlaceOrder.length > 0,
+        coveredCount: marketWps.length - uncovered.length,
+        now: Date.now(),
+      });
+      if (mode.telemetry) state.coverage = mode.telemetry;
+      // Probe target: value-driven count when enacting, else the legacy 1:1 cap.
+      const probeTarget = mode.probeTarget;
+      // Placement order: highest-value uncovered first only when enacting adaptive; else legacy export-preferring + nearest.
       const placeOrder = (): string[] =>
-        plan
-          ? [...plan.toCover, ...plan.recheckDue].filter((w, i, a) => a.indexOf(w) === i && !covered.has(w))
+        mode.enactAdaptive && plan
+          ? valuePlaceOrder.filter((w) => !covered.has(w))
           : uncovered
               .slice()
               .sort(
@@ -255,7 +343,7 @@ export async function fleetScaleManager(deps: SubsystemDeps): Promise<void> {
       // highest-value market needing coverage. The vacated market isn't forgotten — it re-enters the cold
       // re-check schedule (recheckDue) and is promoted back if its lanes ever light up. FLEET_COVERAGE_PRUNE
       // gated; only fires when there's somewhere strictly better to put the probe (no churn otherwise).
-      if (plan && cfg.FLEET_COVERAGE_PRUNE && plan.toPrune.length) {
+      if (plan && mode.enactPrune && plan.toPrune.length) {
         const dest = placeOrder()[0];
         const pruneWp = plan.toPrune[0];
         if (dest && pruneWp) {
