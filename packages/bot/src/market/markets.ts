@@ -24,6 +24,13 @@ import { createLaneRegistry, type LaneRegistry, type RankedLane } from '../trade
 import { scoreMarkets, type ValueWeights } from './value.js';
 import { createScanScheduler, type ScanScheduler, type MarketScanState } from './scanScheduler.js';
 import {
+  scanBudgetPerSweep,
+  allocateScanBudget,
+  COLD_START_OVERRUN,
+  type ScanCandidate,
+  type ScanTier,
+} from './scanBudget.js';
+import {
   planCoverage,
   coverageTarget,
   type CoveragePlan,
@@ -55,6 +62,15 @@ export interface MarketsServiceOptions {
   marketWaypoints?: string[];
   /** Initial fuel price (defaults to 0.72). */
   fuelPxInit?: number;
+  /**
+   * Coverage-presence provider (issue #2, phase 5): the set of waypoints with a ship present or
+   * inbound right now. A `GET /market` only returns live prices where a ship is present, so the
+   * scan-budget scheduler grants reads ONLY to markets in this set — spending budget on an uncovered
+   * market is a wasted request. Supplied by `main` from `state.coverageWps` (the fleet poll).
+   * When omitted, or when it returns an empty set (cold start — before the first poll), the scheduler
+   * falls back to ungated allocation so behaviour matches today until coverage data exists.
+   */
+  coveredWps?: () => ReadonlySet<string>;
 }
 
 export interface MarketsServiceExtra {
@@ -82,6 +98,20 @@ export interface MarketsServiceExtra {
    * and counts a request. Returns the fresh market, or null on a transient failure / when disabled.
    */
   recheckScan(wp: string, now?: number): Promise<Market | null>;
+  /**
+   * Last global scan-budget allocation (issue #2, phase 5): per-sweep budget, how many markets were
+   * due, how many were granted vs deferred, and a per-tier histogram of the granted reads. `null` when
+   * the scheduler is off (`SCAN_BUDGET_ON` unset) or no sweep has allocated yet. Metric-only.
+   */
+  scanBudgetStatus(): {
+    perSweep: number;
+    due: number;
+    granted: number;
+    deferred: number;
+    /** DUE markets skipped because no ship is present/inbound (presence-gated, not budget-spent). */
+    uncovered: number;
+    byTier: Record<ScanTier, number>;
+  } | null;
 }
 
 export function createMarketsService(opts: MarketsServiceOptions): MarketsService & MarketsServiceExtra {
@@ -123,6 +153,23 @@ export function createMarketsService(opts: MarketsServiceOptions): MarketsServic
   const sweepMs = cfg?.SCAN_SWEEP_MS ?? MARKET_TTL_MS;
   let marketGets = 0;
   let lastSweepAt = 0;
+
+  // ── global scan-budget priority scheduler (issue #2, phase 5) ──────────────────────────────────
+  // When SCAN_BUDGET_ON, a due-burst is granted highest value×staleness first up to a per-sweep budget
+  // (rest deferred to a later sweep, where rising staleness floats them up — no starvation). OFF ⇒ the
+  // legacy path fetches every due market in scheduler order.
+  const scanBudgetOn = cfg?.SCAN_BUDGET_ON ?? false;
+  const scanBudgetReqPerSec = cfg?.SCAN_BUDGET_REQ_PER_SEC ?? 2;
+  const scanBudgetFraction = cfg?.SCAN_BUDGET_REQ_FRACTION ?? 0.6;
+  const scanBudgetMaxPerSweep = cfg?.SCAN_BUDGET_MAX_PER_SWEEP ?? 0;
+  let lastScanBudget: {
+    perSweep: number;
+    due: number;
+    granted: number;
+    deferred: number;
+    uncovered: number;
+    byTier: Record<ScanTier, number>;
+  } | null = null;
 
   // ── value-driven coverage tiering + reversible pruning + cold re-check (issue #2, phases 4+7) ──
   const coverageWeights: CoverageWeights = {
@@ -219,9 +266,12 @@ export function createMarketsService(opts: MarketsServiceOptions): MarketsServic
     const scoreByWp = new Map<string, number>();
     for (const [wp, v] of scored) scoreByWp.set(wp, v.score);
     const due = scheduler!.selectDue(scoreByWp, marketWps, t);
+    // Phase 5: when enabled, spend the limited per-sweep budget on the highest value×staleness markets
+    // first instead of fetching every due market FIFO. Deferred markets ride the next sweep.
+    const toFetch = scanBudgetOn ? allocateDue(due, scoreByWp, t) : due;
     const out: Record<string, Market> = { ...marketCache.data }; // keep un-refreshed markets warm
     const scanned = new Set<string>();
-    for (const wp of due) {
+    for (const wp of toFetch) {
       const m = await fetchMarket(wp);
       if (!m) continue;
       out[wp] = m;
@@ -232,6 +282,53 @@ export function createMarketsService(opts: MarketsServiceOptions): MarketsServic
       log.info(`scan sweep: refreshed ${scanned.size}/${marketWps.length} due market(s) (${marketGets} gets total)`);
     finishSweep(out, scanned);
     return out;
+  }
+
+  /**
+   * Phase 5 allocation: rank the DUE markets by `value × staleness` and grant only the per-sweep
+   * budget; the rest are deferred (their staleness keeps rising, so they win a later sweep — no
+   * starvation). Records the split for the scan-budget metric. Returns the waypoints to fetch now.
+   *
+   * Presence-gate: a `GET /market` only returns live prices where a ship is present, so DUE markets
+   * with no ship present/inbound are dropped from candidacy BEFORE allocation — budget is never spent
+   * on a price-blind read. The cold re-check of uncovered markets stays a separate presence-gated
+   * single read (`recheckScan`), not part of this budget. The gate is skipped when no coverage signal
+   * exists yet (empty set — before the first fleet poll) so cold-start behaviour matches today.
+   */
+  function allocateDue(due: readonly string[], scoreByWp: Map<string, number>, t: number): string[] {
+    const covered = opts.coveredWps?.();
+    const gate = covered && covered.size > 0;
+    const scannable = gate ? due.filter((wp) => covered.has(wp)) : due;
+    const uncovered = due.length - scannable.length;
+    const ref = scheduler!.valueRef(scoreByWp);
+    const candidates: ScanCandidate[] = scannable.map((wp) => {
+      const st = scheduler!.state(wp);
+      const score = scoreByWp.get(wp) ?? 0;
+      if (!st || st.scans === 0) {
+        // never scanned — unknown ≠ dead: seed at ≥ mean value and a cold-start staleness so it is
+        // classified promptly rather than divided by a zero clock.
+        return { wp, relValue: Math.max(score / ref, 1), overrun: COLD_START_OVERRUN };
+      }
+      const interval = scheduler!.intervalFor(score, ref, st.volatility);
+      const overrun = interval > 0 ? (t - st.lastScanAt) / interval : COLD_START_OVERRUN;
+      return { wp, relValue: score / ref, overrun };
+    });
+    const budget = scanBudgetPerSweep({
+      reqPerSec: scanBudgetReqPerSec,
+      sweepMs,
+      fraction: scanBudgetFraction,
+      maxPerSweep: scanBudgetMaxPerSweep,
+    });
+    const alloc = allocateScanBudget(candidates, budget);
+    lastScanBudget = {
+      perSweep: budget,
+      due: due.length,
+      granted: alloc.granted.length,
+      deferred: alloc.deferred.length,
+      uncovered,
+      byTier: alloc.byTier,
+    };
+    return alloc.granted;
   }
 
   async function getMarkets(): Promise<Record<string, Market>> {
@@ -338,5 +435,6 @@ export function createMarketsService(opts: MarketsServiceOptions): MarketsServic
     topLanes: (k: number) => registry?.topLanes(k, now()) ?? [],
     coveragePlan,
     recheckScan,
+    scanBudgetStatus: () => lastScanBudget,
   };
 }

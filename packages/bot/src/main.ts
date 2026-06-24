@@ -36,6 +36,8 @@ import type { SpaceTradersClient } from './interfaces.js';
 
 const log = logger.child({ mod: 'main' });
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+/** Shared empty coverage set for the cold-start window (before the first fleet poll). */
+const EMPTY_WPS: ReadonlySet<string> = new Set<string>();
 
 async function refreshCredits(state: BotState, client: SpaceTradersClient): Promise<void> {
   try {
@@ -86,7 +88,18 @@ export async function main(): Promise<void> {
   const marketHolder: { data: Record<string, Market> } = { data: {} };
   const marketsRef = (): Record<string, Market> => marketHolder.data;
 
-  const markets = createMarketsService({ client, persistence, coords, maxd: cfg.MAXD, cfg });
+  const state = createState(cfg, { marketsRef });
+
+  const markets = createMarketsService({
+    client,
+    persistence,
+    coords,
+    maxd: cfg.MAXD,
+    cfg,
+    // presence-gate scan-budget reads to markets with a ship present/inbound (state.coverageWps is
+    // refreshed by the fleet poll). Empty/undefined before the first poll → scheduler stays ungated.
+    coveredWps: () => state.coverageWps ?? EMPTY_WPS,
+  });
   const router = createRouter({
     coords,
     getFuelPx: () => markets.getFuelPx(),
@@ -94,7 +107,6 @@ export async function main(): Promise<void> {
     marketsRef,
   });
   const actions = createShipActions(client);
-  const state = createState(cfg, { marketsRef });
 
   // [issue #2] Surface the value-weighted scan-budget metric in the status snapshot. credits-per-request
   // is the headline lever: realized run net ÷ market GETs spent. Higher = scan budget better allocated.
@@ -117,6 +129,7 @@ export async function main(): Promise<void> {
         trips: l.trips,
       })),
       ...(state.coverage !== undefined ? { coverage: state.coverage } : {}),
+      ...(markets.scanBudgetStatus() !== null ? { scanBudget: markets.scanBudgetStatus() } : {}),
     };
   };
 

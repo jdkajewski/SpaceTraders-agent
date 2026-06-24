@@ -216,6 +216,14 @@ export interface BotState {
     prune: boolean;
     updatedAt: number;
   };
+
+  /**
+   * Waypoints with a ship present or inbound (coverage presence), refreshed by the fleet poll
+   * (`fleetTableManager`) when `SCAN_BUDGET_ON`. The scan-budget scheduler reads this to avoid
+   * granting `GET /market` reads on ship-absent markets, which return no live prices (wasted budget).
+   * Undefined until the first poll → the scheduler falls back to ungated (legacy) behaviour.
+   */
+  coverageWps?: ReadonlySet<string>;
 }
 
 export interface CreateStateOptions {
